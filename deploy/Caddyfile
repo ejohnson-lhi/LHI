@@ -1,0 +1,24 @@
+# Iris backend reverse proxy.
+# Caddy auto-provisions a Let's Encrypt cert on first HTTPS request and renews
+# automatically. No further TLS config needed.
+
+iris.lighthouseinn-florence.com {
+	reverse_proxy 127.0.0.1:8000
+
+	# Reasonable security headers.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# Iris produces verbose logs; keep them off Caddy's hot path. The
+	# uvicorn process logs go to journald via systemd; this is just access
+	# logging on the proxy edge.
+	log {
+		output file /var/log/caddy/iris-access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}

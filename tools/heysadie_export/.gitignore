@@ -1,0 +1,8 @@
+.env
+session.json
+exports/
+__pycache__/
+*.pyc
+.venv/
+venv/
+auth_debug.png

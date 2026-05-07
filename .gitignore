@@ -1,0 +1,40 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# --- Secrets and local state ---
+backend/.env
+.env
+backend/data/
+
+# --- Local-only Windows binaries ---
+backend/cloudflared-windows-amd64.exe
+
+# --- HeySadie exported data (large, not deployed; kept locally only) ---
+tools/heysadie_export/exports/
+tools/heysadie_export/.venv/
+tools/heysadie_export/session.json
+tools/heysadie_export/.last_export_dir
+
+# --- Imported HeySadie reference data (large media + dump) ---
+HeySadie Data/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Twilio compliance / status exports (filenames contain Account SID,
+# triggering GitHub push protection; not source anyway) ---
+SMS-AC*.csv

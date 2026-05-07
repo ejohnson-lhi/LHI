@@ -1,0 +1,24 @@
+[Unit]
+Description=Iris (Lighthouse Inn AI reservation agent backend)
+After=network.target
+
+[Service]
+Type=simple
+User=iris
+Group=iris
+WorkingDirectory=/opt/iris-backend/backend
+EnvironmentFile=/opt/iris-backend/backend/.env
+ExecStart=/opt/iris-backend/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/iris-backend/backend/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
