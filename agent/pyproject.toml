@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-reservation-agent-worker"
+version = "0.1.0"
+description = "LiveKit Agents worker for the Lighthouse Inn AI Reservation Agent (Iris)"
+requires-python = ">=3.10"
+dependencies = [
+    # Core agents framework + the plugins we use:
+    #   deepgram for STT (and currently TTS until Kokoro is wired)
+    #   silero for VAD
+    #   turn-detector for end-of-utterance detection
+    "livekit-agents[deepgram,silero,turn-detector]~=1.5",
+    "livekit-plugins-anthropic~=1.5",
+    "python-dotenv>=1.0.0",
+    # For calling Iris's FastAPI tools from inside the agent (future use):
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
