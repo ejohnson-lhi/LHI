@@ -9,12 +9,11 @@
     },
     "roomConfig": {
       "egress": {
-        "room": {
-          "audioOnly": true,
+        "participant": {
           "fileOutputs": [
             {
               "fileType": "OGG",
-              "filepath": "/out/{room_name}-{time}.ogg"
+              "filepath": "/out/{room_name}_{publisher_identity}_{time}.ogg"
             }
           ]
         }
