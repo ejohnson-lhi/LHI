@@ -1,14 +1,16 @@
 # Self-hosted LiveKit stack for Iris (Lighthouse Inn AI receptionist).
 #
 # Services:
-#   redis           — coordination for LiveKit Server, SIP, and Egress
+#   redis           — coordination for LiveKit Server, SIP, and Egress.
+#                     Persisted to /opt/iris-backend/redis-data so SIP trunks
+#                     and dispatch rules survive container restarts.
 #   livekit-server  — WebRTC SFU. Host networking required for RTC media on
 #                     UDP 50000-50100 to traverse the host firewall cleanly.
 #   livekit-sip     — SIP gateway. Host networking required so UDP 5060 SIP
 #                     and the RTP media range (10000-20000) reach Twilio.
 #   egress          — audio-only OGG recording per call, written to
-#                     /opt/iris-backend/recordings/ via volume mount. Bridge
-#                     networking with host.docker.internal lookups.
+#                     /opt/iris-backend/recordings/ via volume mount. Host
+#                     networking so it can reach Redis on 127.0.0.1.
 #
 # Run from this directory:
 #   docker compose up -d
@@ -18,16 +20,26 @@
 #   livekit.yaml
 #   sip.yaml
 #   egress.yaml
+#
+# One-time host setup before first `up`:
+#   sudo mkdir -p /opt/iris-backend/redis-data
+#   sudo chown 999:999 /opt/iris-backend/redis-data   # redis user inside container
 
 services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # AOF (append-only file) gives durability per-write; combined with the
+    # default RDB snapshots that means trunks/dispatch rules survive a
+    # container restart instead of vanishing into ephemeral memory.
+    command: redis-server --appendonly yes
     ports:
-      # Expose to 127.0.0.1 only — reachable from livekit-server and
-      # livekit-sip (which use host networking) and from egress (which
-      # uses bridge networking + host.docker.internal). NOT exposed publicly.
+      # Expose to 127.0.0.1 only — reachable from all four services
+      # (livekit-server, livekit-sip, and egress all use host networking).
+      # NOT exposed publicly.
       - "127.0.0.1:6379:6379"
+    volumes:
+      - /opt/iris-backend/redis-data:/data
 
   livekit-server:
     image: livekit/livekit-server:latest
