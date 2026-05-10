@@ -135,7 +135,13 @@ class IrisAgent(Agent):
         await self.session.say(FIRST_MESSAGE)
 
     # -------------------------------------------------------------------------
-    # Tools — JSON return values, all proxied to backend's existing handlers
+    # Tools — TEMPORARILY reduced to ONE for diagnostic. Anthropic was
+    # rejecting our 7-tool schema as "too complex for compilation" even
+    # with one-line docstrings and ctx:RunContext removed. If 1 tool works,
+    # the issue is cumulative complexity and we restructure (collapse some
+    # tools, use raw_schema, etc.). If 1 tool also fails, deeper digging.
+    # The other 6 tools are kept as comments below — uncomment once we
+    # solve the schema issue.
     # -------------------------------------------------------------------------
 
     @function_tool
@@ -155,104 +161,55 @@ class IrisAgent(Agent):
         }
         return json.dumps(await _call_backend_tool("lookup_reservation", args, self._caller_phone))
 
-    @function_tool
-    async def check_availability(
-        self,
-        check_in: str,
-        check_out: str,
-        adults: int = 2,
-        children: int = 0,
-        rooms: int = 1,
-    ) -> str:
-        """Check available rooms and rates for a date range (YYYY-MM-DD)."""
-        args = {
-            "check_in": check_in,
-            "check_out": check_out,
-            "adults": adults,
-            "children": children,
-            "rooms": rooms,
-        }
-        return json.dumps(await _call_backend_tool("check_availability", args, self._caller_phone))
-
-    @function_tool
-    async def create_reservation(
-        self,
-        first_name: str,
-        last_name: str,
-        email: str,
-        check_in: str,
-        check_out: str,
-        room_type_id: str,
-        adults: int = 2,
-        children: int = 0,
-        estimated_arrival_time: str = "",
-        zip_code: str = "",
-    ) -> str:
-        """Create a Cloudbeds reservation using room_type_id from check_availability."""
-        args = {
-            "first_name": first_name,
-            "last_name": last_name,
-            "email": email,
-            "check_in": check_in,
-            "check_out": check_out,
-            "room_type_id": room_type_id,
-            "adults": adults,
-            "children": children,
-        }
-        if estimated_arrival_time:
-            args["estimated_arrival_time"] = estimated_arrival_time
-        if zip_code:
-            args["zip_code"] = zip_code
-        return json.dumps(await _call_backend_tool("create_reservation", args, self._caller_phone))
-
-    @function_tool
-    async def add_reservation_note(
-        self,
-        reservation_id: str,
-        note: str,
-    ) -> str:
-        """Append a note to an existing reservation."""
-        args = {"reservation_id": reservation_id, "note": note}
-        return json.dumps(await _call_backend_tool("add_reservation_note", args, self._caller_phone))
-
-    @function_tool
-    async def modify_reservation(
-        self,
-        reservation_id: str,
-        new_check_out: str = "",
-        estimated_arrival_time: str = "",
-    ) -> str:
-        """Update check-out date or arrival time on a direct-booking reservation."""
-        args: dict = {"reservation_id": reservation_id}
-        if new_check_out:
-            args["new_check_out"] = new_check_out
-        if estimated_arrival_time:
-            args["estimated_arrival_time"] = estimated_arrival_time
-        return json.dumps(await _call_backend_tool("modify_reservation", args, self._caller_phone))
-
-    @function_tool
-    async def send_door_code(
-        self,
-        reservation_id: str,
-        phone_number: str = "",
-    ) -> str:
-        """SMS the guest their room name and door code (defaults to caller-ID number)."""
-        args: dict = {"reservation_id": reservation_id}
-        if phone_number:
-            args["phone_number"] = phone_number
-        return json.dumps(await _call_backend_tool("send_door_code", args, self._caller_phone))
-
-    @function_tool
-    async def cancel_reservation(
-        self,
-        reservation_id: str,
-        reason: str = "",
-    ) -> str:
-        """Cancel a direct-booking reservation in Cloudbeds (irreversible)."""
-        args: dict = {"reservation_id": reservation_id}
-        if reason:
-            args["reason"] = reason
-        return json.dumps(await _call_backend_tool("cancel_reservation", args, self._caller_phone))
+    # @function_tool
+    # async def check_availability(self, check_in: str, check_out: str,
+    #                              adults: int = 2, children: int = 0, rooms: int = 1) -> str:
+    #     """Check available rooms and rates for a date range (YYYY-MM-DD)."""
+    #     args = {"check_in": check_in, "check_out": check_out,
+    #             "adults": adults, "children": children, "rooms": rooms}
+    #     return json.dumps(await _call_backend_tool("check_availability", args, self._caller_phone))
+    #
+    # @function_tool
+    # async def create_reservation(self, first_name: str, last_name: str, email: str,
+    #                              check_in: str, check_out: str, room_type_id: str,
+    #                              adults: int = 2, children: int = 0,
+    #                              estimated_arrival_time: str = "", zip_code: str = "") -> str:
+    #     """Create a Cloudbeds reservation using room_type_id from check_availability."""
+    #     args = {"first_name": first_name, "last_name": last_name, "email": email,
+    #             "check_in": check_in, "check_out": check_out, "room_type_id": room_type_id,
+    #             "adults": adults, "children": children}
+    #     if estimated_arrival_time: args["estimated_arrival_time"] = estimated_arrival_time
+    #     if zip_code: args["zip_code"] = zip_code
+    #     return json.dumps(await _call_backend_tool("create_reservation", args, self._caller_phone))
+    #
+    # @function_tool
+    # async def add_reservation_note(self, reservation_id: str, note: str) -> str:
+    #     """Append a note to an existing reservation."""
+    #     args = {"reservation_id": reservation_id, "note": note}
+    #     return json.dumps(await _call_backend_tool("add_reservation_note", args, self._caller_phone))
+    #
+    # @function_tool
+    # async def modify_reservation(self, reservation_id: str,
+    #                              new_check_out: str = "", estimated_arrival_time: str = "") -> str:
+    #     """Update check-out date or arrival time on a direct-booking reservation."""
+    #     args: dict = {"reservation_id": reservation_id}
+    #     if new_check_out: args["new_check_out"] = new_check_out
+    #     if estimated_arrival_time: args["estimated_arrival_time"] = estimated_arrival_time
+    #     return json.dumps(await _call_backend_tool("modify_reservation", args, self._caller_phone))
+    #
+    # @function_tool
+    # async def send_door_code(self, reservation_id: str, phone_number: str = "") -> str:
+    #     """SMS the guest their room name and door code (defaults to caller-ID number)."""
+    #     args: dict = {"reservation_id": reservation_id}
+    #     if phone_number: args["phone_number"] = phone_number
+    #     return json.dumps(await _call_backend_tool("send_door_code", args, self._caller_phone))
+    #
+    # @function_tool
+    # async def cancel_reservation(self, reservation_id: str, reason: str = "") -> str:
+    #     """Cancel a direct-booking reservation in Cloudbeds (irreversible)."""
+    #     args: dict = {"reservation_id": reservation_id}
+    #     if reason: args["reason"] = reason
+    #     return json.dumps(await _call_backend_tool("cancel_reservation", args, self._caller_phone))
 
 
 # =============================================================================
