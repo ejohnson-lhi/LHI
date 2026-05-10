@@ -32,7 +32,7 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, JobContext, RunContext, function_tool
+from livekit.agents import Agent, AgentSession, JobContext, function_tool
 from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
 from livekit.plugins import anthropic, deepgram, silero
 
@@ -141,7 +141,6 @@ class IrisAgent(Agent):
     @function_tool
     async def lookup_reservation(
         self,
-        ctx: RunContext,
         phone_number: str = "",
         source_reservation_id: str = "",
         last_name: str = "",
@@ -159,7 +158,6 @@ class IrisAgent(Agent):
     @function_tool
     async def check_availability(
         self,
-        ctx: RunContext,
         check_in: str,
         check_out: str,
         adults: int = 2,
@@ -179,7 +177,6 @@ class IrisAgent(Agent):
     @function_tool
     async def create_reservation(
         self,
-        ctx: RunContext,
         first_name: str,
         last_name: str,
         email: str,
@@ -211,7 +208,6 @@ class IrisAgent(Agent):
     @function_tool
     async def add_reservation_note(
         self,
-        ctx: RunContext,
         reservation_id: str,
         note: str,
     ) -> str:
@@ -222,7 +218,6 @@ class IrisAgent(Agent):
     @function_tool
     async def modify_reservation(
         self,
-        ctx: RunContext,
         reservation_id: str,
         new_check_out: str = "",
         estimated_arrival_time: str = "",
@@ -238,7 +233,6 @@ class IrisAgent(Agent):
     @function_tool
     async def send_door_code(
         self,
-        ctx: RunContext,
         reservation_id: str,
         phone_number: str = "",
     ) -> str:
@@ -251,7 +245,6 @@ class IrisAgent(Agent):
     @function_tool
     async def cancel_reservation(
         self,
-        ctx: RunContext,
         reservation_id: str,
         reason: str = "",
     ) -> str:
