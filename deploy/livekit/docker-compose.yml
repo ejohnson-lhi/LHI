@@ -53,6 +53,11 @@ services:
   egress:
     image: livekit/egress:v1.9.0
     restart: unless-stopped
+    # Host networking: same reason as livekit-server and livekit-sip. Bridge
+    # mode + host.docker.internal would resolve to the docker0 bridge IP
+    # (172.17.0.1), but Redis is bound only to 127.0.0.1, so the bridge IP
+    # can't reach it. Easier to put egress on host networking too.
+    network_mode: host
     cap_add:
       - SYS_ADMIN  # required by egress's bundled Chrome (even for audio-only)
     environment:
@@ -63,10 +68,6 @@ services:
       # Inside the container, egress writes to /out (referenced by filepath
       # in the dispatch-rule auto-egress config).
       - /opt/iris-backend/recordings:/out
-    extra_hosts:
-      # Reach Redis (127.0.0.1:6379 on host) and livekit-server (host
-      # networking on port 7880) from this bridge-networked container.
-      - "host.docker.internal:host-gateway"
     depends_on:
       - redis
       - livekit-server
