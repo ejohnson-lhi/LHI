@@ -142,29 +142,26 @@ class IrisAgent(Agent):
     async def lookup_reservation(
         self,
         ctx: RunContext,
-        phone_number: str | None = None,
-        source_reservation_id: str | None = None,
-        last_name: str | None = None,
+        phone_number: str = "",
+        source_reservation_id: str = "",
+        last_name: str = "",
     ) -> str:
         """Look up an existing reservation. Tries identifiers in order of
         specificity: source_reservation_id (OTA confirmation number from
         Expedia, Booking.com, etc.) > phone_number > last_name. If none
-        provided, uses the caller's number from caller-ID. Returns dates,
-        room, door code, source, is_direct_booking, and stay_phase
-        (future / arriving_today / in_house / in_house_departing_tomorrow /
-        departing_today / past).
+        provided, uses the caller's number from caller-ID.
 
         Args:
-            phone_number: E.164 phone (e.g., +15417295563). Optional.
-            source_reservation_id: OTA confirmation number. Use whenever the caller mentions one.
-            last_name: Last name fallback.
+            phone_number: E.164 phone, empty string to use caller-ID.
+            source_reservation_id: OTA confirmation number, empty if none.
+            last_name: Last name fallback, empty if not provided.
         """
         args = {
             k: v for k, v in {
                 "phone_number": phone_number,
                 "source_reservation_id": source_reservation_id,
                 "last_name": last_name,
-            }.items() if v is not None
+            }.items() if v
         }
         return json.dumps(await _call_backend_tool("lookup_reservation", args, self._caller_phone))
 
@@ -210,24 +207,23 @@ class IrisAgent(Agent):
         room_type_id: str,
         adults: int = 2,
         children: int = 0,
-        estimated_arrival_time: str | None = None,
-        zip_code: str | None = None,
+        estimated_arrival_time: str = "",
+        zip_code: str = "",
     ) -> str:
         """Create a new reservation in Cloudbeds. Use the room_type_id from
-        a prior check_availability call. Returns reservation_id, status, and
-        grand_total on success.
+        a prior check_availability call.
 
         Args:
             first_name: Guest's first name.
             last_name: Guest's last name.
-            email: Use 'none@test.com' if guest declines to provide one.
+            email: Use 'none@test.com' if guest declines.
             check_in: ISO date YYYY-MM-DD.
             check_out: ISO date YYYY-MM-DD.
             room_type_id: From check_availability response.
             adults: Defaults to 2.
             children: Defaults to 0.
-            estimated_arrival_time: 24h format e.g. '20:00'. Optional.
-            zip_code: Optional.
+            estimated_arrival_time: 24h format e.g. '20:00', empty if unknown.
+            zip_code: Empty if not provided.
         """
         args = {
             "first_name": first_name,
@@ -267,20 +263,19 @@ class IrisAgent(Agent):
         self,
         ctx: RunContext,
         reservation_id: str,
-        new_check_out: str | None = None,
-        estimated_arrival_time: str | None = None,
+        new_check_out: str = "",
+        estimated_arrival_time: str = "",
     ) -> str:
-        """Modify an existing direct-booking reservation. v1 supports
-        extending/shortening the stay and updating estimated arrival time.
-        CRITICAL: only call for direct bookings (lookup_reservation must
-        show is_direct_booking=true). For OTA reservations, redirect to the
-        OTA. For check-IN date changes or room type changes, transfer to
-        the front desk instead — this tool can't help.
+        """Modify an existing direct-booking reservation. CRITICAL: only call
+        for direct bookings (lookup_reservation must show
+        is_direct_booking=true). For OTA reservations, redirect to the OTA.
+        For check-IN date changes or room type changes, transfer to the
+        front desk instead.
 
         Args:
-            reservation_id: Cloudbeds reservation ID from a prior lookup_reservation.
-            new_check_out: New check-out date in ISO YYYY-MM-DD. For extending or shortening the stay.
-            estimated_arrival_time: Updated ETA in 24-hour HH:MM format (e.g. '20:00').
+            reservation_id: Cloudbeds reservation ID.
+            new_check_out: New check-out date YYYY-MM-DD, empty to keep current.
+            estimated_arrival_time: Updated ETA HH:MM 24h, empty to keep current.
         """
         args: dict = {"reservation_id": reservation_id}
         if new_check_out:
@@ -294,18 +289,17 @@ class IrisAgent(Agent):
         self,
         ctx: RunContext,
         reservation_id: str,
-        phone_number: str | None = None,
+        phone_number: str = "",
     ) -> str:
         """Send the guest their room name + door code via SMS. ONLY call
         AFTER the lockout self-service two-factor auth (caller-ID match +
         verbal room-number confirmation) has succeeded — see [Lockout
         self-service] in the prompt. By default sends to the caller's
-        number; override only if the caller asks to send to a different
-        verified number on the reservation.
+        number.
 
         Args:
             reservation_id: Cloudbeds reservation ID.
-            phone_number: Optional override. Defaults to caller's number.
+            phone_number: Override destination, empty for caller's number.
         """
         args: dict = {"reservation_id": reservation_id}
         if phone_number:
@@ -317,18 +311,17 @@ class IrisAgent(Agent):
         self,
         ctx: RunContext,
         reservation_id: str,
-        reason: str | None = None,
+        reason: str = "",
     ) -> str:
         """Cancel a reservation in Cloudbeds. CRITICAL: only call for DIRECT
         bookings — first call lookup_reservation and verify
         is_direct_booking=true. For OTA reservations (Expedia, Booking.com,
         Hotels.com), DO NOT call this — instead tell the caller to contact
-        the OTA directly. Cancellations are irreversible. Always confirm
-        with the caller before calling.
+        the OTA. Cancellations are irreversible. Always confirm first.
 
         Args:
             reservation_id: Cloudbeds reservation ID.
-            reason: Optional cancellation reason; saved as a note for audit.
+            reason: Cancellation reason for audit note, empty if none given.
         """
         args: dict = {"reservation_id": reservation_id}
         if reason:
