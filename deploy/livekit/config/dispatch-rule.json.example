@@ -9,13 +9,8 @@
     },
     "roomConfig": {
       "egress": {
-        "participant": {
-          "fileOutputs": [
-            {
-              "fileType": "OGG",
-              "filepath": "/out/{room_name}_{publisher_identity}_{time}.ogg"
-            }
-          ]
+        "tracks": {
+          "filepath": "/out/{room_name}-{track_id}-{time}.ogg"
         }
       }
     }
