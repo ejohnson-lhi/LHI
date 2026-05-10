@@ -1,21 +1,23 @@
 {
-  "name": "iris-dispatch",
-  "trunkIds": ["ST_REPLACE_WITH_REAL_TRUNK_ID"],
-  "rule": {
-    "dispatchRuleIndividual": {
-      "roomPrefix": "iris-call-"
-    }
-  },
-  "roomConfig": {
-    "egress": {
-      "room": {
-        "audioOnly": true,
-        "fileOutputs": [
-          {
-            "fileType": "OGG",
-            "filepath": "/out/{room_name}-{time}.ogg"
-          }
-        ]
+  "dispatchRule": {
+    "name": "iris-dispatch",
+    "trunkIds": ["ST_REPLACE_WITH_REAL_TRUNK_ID"],
+    "rule": {
+      "dispatchRuleIndividual": {
+        "roomPrefix": "iris-call-"
+      }
+    },
+    "roomConfig": {
+      "egress": {
+        "room": {
+          "audioOnly": true,
+          "fileOutputs": [
+            {
+              "fileType": "OGG",
+              "filepath": "/out/{room_name}-{time}.ogg"
+            }
+          ]
+        }
       }
     }
   }
