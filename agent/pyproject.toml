@@ -33,7 +33,7 @@ dev = [
 # scripts. Tell setuptools so it doesn't try to auto-discover and complain
 # about ambiguous flat-layout.
 [tool.setuptools]
-py-modules = ["hello_agent", "kokoro_tts"]
+py-modules = ["hello_agent", "iris_agent", "iris_prompt", "kokoro_tts"]
 
 [tool.ruff]
 line-length = 100

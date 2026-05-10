@@ -14,7 +14,7 @@ WorkingDirectory=/opt/iris-backend/agent
 EnvironmentFile=/opt/iris-backend/agent/.env
 # Run via the venv's interpreter so we don't need to source activate.
 # `start` (not `dev`) skips the file-watcher reload that `dev` enables.
-ExecStart=/opt/iris-backend/agent/.venv/bin/python /opt/iris-backend/agent/hello_agent.py start
+ExecStart=/opt/iris-backend/agent/.venv/bin/python /opt/iris-backend/agent/iris_agent.py start
 Restart=always
 RestartSec=3
 StandardOutput=journal
