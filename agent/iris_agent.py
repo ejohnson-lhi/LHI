@@ -29,6 +29,7 @@ import os
 import uuid
 from pathlib import Path
 
+import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
 import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc
@@ -135,13 +136,10 @@ class IrisAgent(Agent):
         await self.session.say(FIRST_MESSAGE)
 
     # -------------------------------------------------------------------------
-    # Tools — TEMPORARILY reduced to ONE for diagnostic. Anthropic was
-    # rejecting our 7-tool schema as "too complex for compilation" even
-    # with one-line docstrings and ctx:RunContext removed. If 1 tool works,
-    # the issue is cumulative complexity and we restructure (collapse some
-    # tools, use raw_schema, etc.). If 1 tool also fails, deeper digging.
-    # The other 6 tools are kept as comments below — uncomment once we
-    # solve the schema issue.
+    # Tools — JSON return values, all proxied to backend's existing handlers.
+    # Schema complexity tolerated via `_strict_tool_schema=False` on the LLM
+    # (see comment at session construction). With strict mode off, Anthropic's
+    # 24-optional-param-across-all-tools limit doesn't apply.
     # -------------------------------------------------------------------------
 
     @function_tool
@@ -161,55 +159,104 @@ class IrisAgent(Agent):
         }
         return json.dumps(await _call_backend_tool("lookup_reservation", args, self._caller_phone))
 
-    # @function_tool
-    # async def check_availability(self, check_in: str, check_out: str,
-    #                              adults: int = 2, children: int = 0, rooms: int = 1) -> str:
-    #     """Check available rooms and rates for a date range (YYYY-MM-DD)."""
-    #     args = {"check_in": check_in, "check_out": check_out,
-    #             "adults": adults, "children": children, "rooms": rooms}
-    #     return json.dumps(await _call_backend_tool("check_availability", args, self._caller_phone))
-    #
-    # @function_tool
-    # async def create_reservation(self, first_name: str, last_name: str, email: str,
-    #                              check_in: str, check_out: str, room_type_id: str,
-    #                              adults: int = 2, children: int = 0,
-    #                              estimated_arrival_time: str = "", zip_code: str = "") -> str:
-    #     """Create a Cloudbeds reservation using room_type_id from check_availability."""
-    #     args = {"first_name": first_name, "last_name": last_name, "email": email,
-    #             "check_in": check_in, "check_out": check_out, "room_type_id": room_type_id,
-    #             "adults": adults, "children": children}
-    #     if estimated_arrival_time: args["estimated_arrival_time"] = estimated_arrival_time
-    #     if zip_code: args["zip_code"] = zip_code
-    #     return json.dumps(await _call_backend_tool("create_reservation", args, self._caller_phone))
-    #
-    # @function_tool
-    # async def add_reservation_note(self, reservation_id: str, note: str) -> str:
-    #     """Append a note to an existing reservation."""
-    #     args = {"reservation_id": reservation_id, "note": note}
-    #     return json.dumps(await _call_backend_tool("add_reservation_note", args, self._caller_phone))
-    #
-    # @function_tool
-    # async def modify_reservation(self, reservation_id: str,
-    #                              new_check_out: str = "", estimated_arrival_time: str = "") -> str:
-    #     """Update check-out date or arrival time on a direct-booking reservation."""
-    #     args: dict = {"reservation_id": reservation_id}
-    #     if new_check_out: args["new_check_out"] = new_check_out
-    #     if estimated_arrival_time: args["estimated_arrival_time"] = estimated_arrival_time
-    #     return json.dumps(await _call_backend_tool("modify_reservation", args, self._caller_phone))
-    #
-    # @function_tool
-    # async def send_door_code(self, reservation_id: str, phone_number: str = "") -> str:
-    #     """SMS the guest their room name and door code (defaults to caller-ID number)."""
-    #     args: dict = {"reservation_id": reservation_id}
-    #     if phone_number: args["phone_number"] = phone_number
-    #     return json.dumps(await _call_backend_tool("send_door_code", args, self._caller_phone))
-    #
-    # @function_tool
-    # async def cancel_reservation(self, reservation_id: str, reason: str = "") -> str:
-    #     """Cancel a direct-booking reservation in Cloudbeds (irreversible)."""
-    #     args: dict = {"reservation_id": reservation_id}
-    #     if reason: args["reason"] = reason
-    #     return json.dumps(await _call_backend_tool("cancel_reservation", args, self._caller_phone))
+    @function_tool
+    async def check_availability(
+        self,
+        check_in: str,
+        check_out: str,
+        adults: int = 2,
+        children: int = 0,
+        rooms: int = 1,
+    ) -> str:
+        """Check available rooms and rates for a date range (YYYY-MM-DD)."""
+        args = {
+            "check_in": check_in,
+            "check_out": check_out,
+            "adults": adults,
+            "children": children,
+            "rooms": rooms,
+        }
+        return json.dumps(await _call_backend_tool("check_availability", args, self._caller_phone))
+
+    @function_tool
+    async def create_reservation(
+        self,
+        first_name: str,
+        last_name: str,
+        email: str,
+        check_in: str,
+        check_out: str,
+        room_type_id: str,
+        adults: int = 2,
+        children: int = 0,
+        estimated_arrival_time: str = "",
+        zip_code: str = "",
+    ) -> str:
+        """Create a Cloudbeds reservation using room_type_id from check_availability."""
+        args = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "check_in": check_in,
+            "check_out": check_out,
+            "room_type_id": room_type_id,
+            "adults": adults,
+            "children": children,
+        }
+        if estimated_arrival_time:
+            args["estimated_arrival_time"] = estimated_arrival_time
+        if zip_code:
+            args["zip_code"] = zip_code
+        return json.dumps(await _call_backend_tool("create_reservation", args, self._caller_phone))
+
+    @function_tool
+    async def add_reservation_note(
+        self,
+        reservation_id: str,
+        note: str,
+    ) -> str:
+        """Append a note to an existing reservation."""
+        args = {"reservation_id": reservation_id, "note": note}
+        return json.dumps(await _call_backend_tool("add_reservation_note", args, self._caller_phone))
+
+    @function_tool
+    async def modify_reservation(
+        self,
+        reservation_id: str,
+        new_check_out: str = "",
+        estimated_arrival_time: str = "",
+    ) -> str:
+        """Update check-out date or arrival time on a direct-booking reservation."""
+        args: dict = {"reservation_id": reservation_id}
+        if new_check_out:
+            args["new_check_out"] = new_check_out
+        if estimated_arrival_time:
+            args["estimated_arrival_time"] = estimated_arrival_time
+        return json.dumps(await _call_backend_tool("modify_reservation", args, self._caller_phone))
+
+    @function_tool
+    async def send_door_code(
+        self,
+        reservation_id: str,
+        phone_number: str = "",
+    ) -> str:
+        """SMS the guest their room name and door code (defaults to caller-ID number)."""
+        args: dict = {"reservation_id": reservation_id}
+        if phone_number:
+            args["phone_number"] = phone_number
+        return json.dumps(await _call_backend_tool("send_door_code", args, self._caller_phone))
+
+    @function_tool
+    async def cancel_reservation(
+        self,
+        reservation_id: str,
+        reason: str = "",
+    ) -> str:
+        """Cancel a direct-booking reservation in Cloudbeds (irreversible)."""
+        args: dict = {"reservation_id": reservation_id}
+        if reason:
+            args["reason"] = reason
+        return json.dumps(await _call_backend_tool("cancel_reservation", args, self._caller_phone))
 
 
 # =============================================================================
@@ -234,10 +281,47 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(model="nova-3"),
-        # Sonnet 4.5 per quality requirement. Caching off for now — its
-        # interaction with the tool block produced silent hangs; safe to
-        # re-enable later once we land on stable tool schemas.
-        llm=anthropic.LLM(model="claude-sonnet-4-5"),
+        # Sonnet 4.5 with three workarounds for known livekit-plugins-anthropic
+        # bugs (see research notes / GitHub issues):
+        #
+        # (1) `client=` with relaxed timeouts.
+        #     The plugin hardcodes `httpx.AsyncClient(timeout=5.0)` — a 5-sec
+        #     flat budget that includes per-chunk SSE read. Sonnet thinking
+        #     phases routinely exceed this. Filed as livekit/agents#5508,
+        #     PR #5529 unmerged. Workaround: build our own client with a
+        #     60-sec read timeout via the public `client=` parameter
+        #     (livekit/agents#4129 / PR #4143 made this work in 1.5.x).
+        #
+        # (2) `_strict_tool_schema=False`.
+        #     Plugin defaults to strict-mode tool schemas (livekit/agents#5162
+        #     since 1.5.2). Strict mode triggers Anthropic's grammar compiler,
+        #     which has a documented hard limit of 24 optional parameters
+        #     across all tool schemas per request. We have ~28 across 7 tools,
+        #     so every API call returns "Schema is too complex for compilation".
+        #     Disabling strict gives us back the looser type validation —
+        #     fine for Sonnet, which adheres to types reliably.
+        #
+        # (3) `caching="ephemeral"`.
+        #     Marks the system prompt + tool block with cache_control. With
+        #     our 30K-token prompt, this is roughly a 3x cost reduction after
+        #     the first cache write per call (which itself is ~1.25x base).
+        llm=anthropic.LLM(
+            model="claude-sonnet-4-5",
+            client=anthropic_sdk.AsyncClient(
+                api_key=os.environ["ANTHROPIC_API_KEY"],
+                http_client=httpx.AsyncClient(
+                    timeout=httpx.Timeout(5.0, read=60.0, write=10.0, pool=10.0),
+                    follow_redirects=True,
+                    limits=httpx.Limits(
+                        max_connections=1000,
+                        max_keepalive_connections=100,
+                        keepalive_expiry=120,
+                    ),
+                ),
+            ),
+            caching="ephemeral",
+            _strict_tool_schema=False,
+        ),
         tts=KokoroTTS(
             model_path=str(KOKORO_MODEL),
             voices_path=str(KOKORO_VOICES),
