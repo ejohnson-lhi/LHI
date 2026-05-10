@@ -1,0 +1,31 @@
+[Unit]
+Description=Iris LiveKit agent worker
+# Wait for the LiveKit server containers to be up before starting; if the
+# agent starts first, it'll just retry until LiveKit responds, but waiting
+# avoids restart-loop noise on droplet reboot.
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=iris
+Group=iris
+WorkingDirectory=/opt/iris-backend/agent
+EnvironmentFile=/opt/iris-backend/agent/.env
+# Run via the venv's interpreter so we don't need to source activate.
+# `start` (not `dev`) skips the file-watcher reload that `dev` enables.
+ExecStart=/opt/iris-backend/agent/.venv/bin/python /opt/iris-backend/agent/hello_agent.py start
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (matches iris-backend.service)
+NoNewPrivileges=true
+ProtectSystem=strict
+# Agent needs to read model cache + write Hugging Face downloads
+ReadWritePaths=/home/iris/.cache /opt/iris-backend/agent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

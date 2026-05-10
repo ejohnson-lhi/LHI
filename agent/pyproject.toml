@@ -15,6 +15,11 @@ dependencies = [
     "livekit-agents[deepgram,silero,turn-detector]~=1.5",
     "livekit-plugins-anthropic~=1.5",
     "python-dotenv>=1.0.0",
+    # Self-hosted TTS (kokoro-v1.0 via ONNX Runtime). Numpy is already a
+    # transitive dependency, listed explicitly here for the kokoro_tts.py
+    # adapter's float-to-int16 conversion.
+    "kokoro-onnx>=0.4.0",
+    "numpy>=1.26.0",
     # For calling Iris's FastAPI tools from inside the agent (future use):
     "httpx>=0.27.0",
 ]

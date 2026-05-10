@@ -17,6 +17,9 @@ backend/data/
 # --- Local-only Windows binaries ---
 backend/cloudflared-windows-amd64.exe
 
+# --- Kokoro TTS model files (large, downloaded on each environment) ---
+agent/models/
+
 # --- HeySadie exported data (large, not deployed; kept locally only) ---
 tools/heysadie_export/exports/
 tools/heysadie_export/.venv/
