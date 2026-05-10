@@ -351,10 +351,11 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(model="nova-3"),
-        # Sonnet (not Haiku) per quality requirement. caching="ephemeral"
-        # marks the (large, static) system prompt with cache_control so
-        # subsequent turns hit the prompt cache (~10x cheaper input tokens).
-        llm=anthropic.LLM(model="claude-sonnet-4-5", caching="ephemeral"),
+        # Sonnet (not Haiku) per quality requirement. Caching disabled for
+        # now — combined with our 7 tools, ephemeral cache_control on the
+        # tool block was causing silent LLM hangs. Re-enable once we
+        # diagnose the interaction (worth ~3x cost reduction).
+        llm=anthropic.LLM(model="claude-sonnet-4-5"),
         tts=KokoroTTS(
             model_path=str(KOKORO_MODEL),
             voices_path=str(KOKORO_VOICES),
