@@ -1,0 +1,72 @@
+# Self-hosted LiveKit stack for Iris (Lighthouse Inn AI receptionist).
+#
+# Services:
+#   redis           — coordination for LiveKit Server, SIP, and Egress
+#   livekit-server  — WebRTC SFU. Host networking required for RTC media on
+#                     UDP 50000-50100 to traverse the host firewall cleanly.
+#   livekit-sip     — SIP gateway. Host networking required so UDP 5060 SIP
+#                     and the RTP media range (10000-20000) reach Twilio.
+#   egress          — audio-only OGG recording per call, written to
+#                     /opt/iris-backend/recordings/ via volume mount. Bridge
+#                     networking with host.docker.internal lookups.
+#
+# Run from this directory:
+#   docker compose up -d
+#
+# Required adjacent files (gitignored — copy from *.example and fill in
+# secrets):
+#   livekit.yaml
+#   sip.yaml
+#   egress.yaml
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      # Expose to 127.0.0.1 only — reachable from livekit-server and
+      # livekit-sip (which use host networking) and from egress (which
+      # uses bridge networking + host.docker.internal). NOT exposed publicly.
+      - "127.0.0.1:6379:6379"
+
+  livekit-server:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      - redis
+
+  livekit-sip:
+    image: livekit/sip:latest
+    restart: unless-stopped
+    command: --config /etc/sip.yaml
+    network_mode: host
+    volumes:
+      - ./sip.yaml:/etc/sip.yaml:ro
+    depends_on:
+      - redis
+      - livekit-server
+
+  egress:
+    image: livekit/egress:v1.9.0
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN  # required by egress's bundled Chrome (even for audio-only)
+    environment:
+      EGRESS_CONFIG_FILE: /etc/egress.yaml
+    volumes:
+      - ./egress.yaml:/etc/egress.yaml:ro
+      # Recordings live alongside transcripts at /opt/iris-backend/recordings/.
+      # Inside the container, egress writes to /out (referenced by filepath
+      # in the dispatch-rule auto-egress config).
+      - /opt/iris-backend/recordings:/out
+    extra_hosts:
+      # Reach Redis (127.0.0.1:6379 on host) and livekit-server (host
+      # networking on port 7880) from this bridge-networked container.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+      - livekit-server

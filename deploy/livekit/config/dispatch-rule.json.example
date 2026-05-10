@@ -1,0 +1,23 @@
+{
+  "_comment": "LiveKit SIP dispatch rule with auto-egress for audio recording. Copy to dispatch-rule.json (gitignored), substitute the real trunk_id, and apply with: lk sip dispatch create config/dispatch-rule.json",
+  "name": "iris-dispatch",
+  "trunk_ids": ["ST_REPLACE_WITH_REAL_TRUNK_ID"],
+  "rule": {
+    "dispatchRuleIndividual": {
+      "roomPrefix": "iris-call-"
+    }
+  },
+  "roomConfig": {
+    "egress": {
+      "room": {
+        "audio_only": true,
+        "file_outputs": [
+          {
+            "file_type": "OGG",
+            "filepath": "/out/{room_name}-{time}.ogg"
+          }
+        ]
+      }
+    }
+  }
+}

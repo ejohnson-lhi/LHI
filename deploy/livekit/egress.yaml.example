@@ -1,0 +1,21 @@
+# Copy to egress.yaml and fill in real values. egress.yaml is gitignored.
+#
+# api_key/api_secret must match the entry in livekit.yaml's `keys:` map.
+# Use host.docker.internal (mapped to host-gateway in docker-compose.yml)
+# so this bridge-networked container can reach Redis + LiveKit on the host.
+
+api_key: APIxxxxxxxxxxxxxx
+api_secret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ws_url: ws://host.docker.internal:7880
+insecure: true  # because we use ws:// not wss:// for the local LiveKit
+
+redis:
+  address: host.docker.internal:6379
+
+log_level: info
+
+# Intentionally NOT setting a `storage:` block — that triggers cloud upload
+# (S3/GCP/Azure). Omitting it = local-disk-only mode. Egress writes directly
+# to the path passed in `RoomCompositeEgressRequest.file_outputs[].filepath`,
+# which is `/out/...` per our SIP dispatch rule. `/out` is volume-mounted to
+# /opt/iris-backend/recordings on the host (see docker-compose.yml).

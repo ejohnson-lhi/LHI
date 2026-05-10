@@ -1,0 +1,25 @@
+# Copy to sip.yaml and fill in real values. sip.yaml is gitignored.
+#
+# api_key/api_secret must match the entry in livekit.yaml's `keys:` map.
+
+api_key: APIxxxxxxxxxxxxxx
+api_secret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ws_url: ws://127.0.0.1:7880
+
+redis:
+  address: 127.0.0.1:6379
+
+# SIP signaling port. Twilio Elastic SIP Trunking sends INVITEs here.
+sip_port: 5060
+sip_port_listen: 5060
+
+# RTP media port range. Each call uses two ports (RTP + RTCP).
+rtp_port: 10000-20000
+
+# Use the public WAN IP in SDP so Twilio's media response routes back through
+# our NAT. Without this, livekit-sip puts the docker bridge IP in SDP and
+# audio breaks.
+use_external_ip: true
+
+logging:
+  level: info

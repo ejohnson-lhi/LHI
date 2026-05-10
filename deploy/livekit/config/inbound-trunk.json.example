@@ -1,0 +1,10 @@
+{
+  "_comment": "LiveKit SIP inbound trunk config. Copy to inbound-trunk.json (gitignored). Apply with: lk sip inbound create config/inbound-trunk.json",
+  "trunk": {
+    "name": "lighthouse-inbound",
+    "allowed_addresses": [
+      "54.172.60.0/30",
+      "54.244.51.0/30"
+    ]
+  }
+}

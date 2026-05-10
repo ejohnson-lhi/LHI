@@ -15,6 +15,14 @@ agent/.env
 backend/data/
 recordings/
 
+# --- LiveKit stack: real configs and trunk/dispatch JSON have secrets or
+# environment-specific IDs. Templates (*.example) are checked in.
+deploy/livekit/livekit.yaml
+deploy/livekit/sip.yaml
+deploy/livekit/egress.yaml
+deploy/livekit/config/inbound-trunk.json
+deploy/livekit/config/dispatch-rule.json
+
 # --- Local-only Windows binaries ---
 backend/cloudflared-windows-amd64.exe
 
