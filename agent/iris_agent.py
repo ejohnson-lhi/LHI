@@ -146,16 +146,7 @@ class IrisAgent(Agent):
         source_reservation_id: str = "",
         last_name: str = "",
     ) -> str:
-        """Look up an existing reservation. Tries identifiers in order of
-        specificity: source_reservation_id (OTA confirmation number from
-        Expedia, Booking.com, etc.) > phone_number > last_name. If none
-        provided, uses the caller's number from caller-ID.
-
-        Args:
-            phone_number: E.164 phone, empty string to use caller-ID.
-            source_reservation_id: OTA confirmation number, empty if none.
-            last_name: Last name fallback, empty if not provided.
-        """
+        """Look up an existing reservation by OTA ID, phone, or last name."""
         args = {
             k: v for k, v in {
                 "phone_number": phone_number,
@@ -175,17 +166,7 @@ class IrisAgent(Agent):
         children: int = 0,
         rooms: int = 1,
     ) -> str:
-        """Check available room types and rates for a date range. Returns a
-        list of room types with rate plans sorted cheapest-first; quote
-        rate_plans[0] for the best deal.
-
-        Args:
-            check_in: ISO date YYYY-MM-DD.
-            check_out: ISO date YYYY-MM-DD.
-            adults: Defaults to 2.
-            children: Defaults to 0.
-            rooms: Defaults to 1.
-        """
+        """Check available rooms and rates for a date range (YYYY-MM-DD)."""
         args = {
             "check_in": check_in,
             "check_out": check_out,
@@ -210,21 +191,7 @@ class IrisAgent(Agent):
         estimated_arrival_time: str = "",
         zip_code: str = "",
     ) -> str:
-        """Create a new reservation in Cloudbeds. Use the room_type_id from
-        a prior check_availability call.
-
-        Args:
-            first_name: Guest's first name.
-            last_name: Guest's last name.
-            email: Use 'none@test.com' if guest declines.
-            check_in: ISO date YYYY-MM-DD.
-            check_out: ISO date YYYY-MM-DD.
-            room_type_id: From check_availability response.
-            adults: Defaults to 2.
-            children: Defaults to 0.
-            estimated_arrival_time: 24h format e.g. '20:00', empty if unknown.
-            zip_code: Empty if not provided.
-        """
+        """Create a Cloudbeds reservation using room_type_id from check_availability."""
         args = {
             "first_name": first_name,
             "last_name": last_name,
@@ -248,13 +215,7 @@ class IrisAgent(Agent):
         reservation_id: str,
         note: str,
     ) -> str:
-        """Append a note to an existing reservation (special requests, late
-        arrival info, etc.). Notes are attributed to the Iris Agent user.
-
-        Args:
-            reservation_id: Cloudbeds reservation ID.
-            note: The note text to add.
-        """
+        """Append a note to an existing reservation."""
         args = {"reservation_id": reservation_id, "note": note}
         return json.dumps(await _call_backend_tool("add_reservation_note", args, self._caller_phone))
 
@@ -266,17 +227,7 @@ class IrisAgent(Agent):
         new_check_out: str = "",
         estimated_arrival_time: str = "",
     ) -> str:
-        """Modify an existing direct-booking reservation. CRITICAL: only call
-        for direct bookings (lookup_reservation must show
-        is_direct_booking=true). For OTA reservations, redirect to the OTA.
-        For check-IN date changes or room type changes, transfer to the
-        front desk instead.
-
-        Args:
-            reservation_id: Cloudbeds reservation ID.
-            new_check_out: New check-out date YYYY-MM-DD, empty to keep current.
-            estimated_arrival_time: Updated ETA HH:MM 24h, empty to keep current.
-        """
+        """Update check-out date or arrival time on a direct-booking reservation."""
         args: dict = {"reservation_id": reservation_id}
         if new_check_out:
             args["new_check_out"] = new_check_out
@@ -291,16 +242,7 @@ class IrisAgent(Agent):
         reservation_id: str,
         phone_number: str = "",
     ) -> str:
-        """Send the guest their room name + door code via SMS. ONLY call
-        AFTER the lockout self-service two-factor auth (caller-ID match +
-        verbal room-number confirmation) has succeeded — see [Lockout
-        self-service] in the prompt. By default sends to the caller's
-        number.
-
-        Args:
-            reservation_id: Cloudbeds reservation ID.
-            phone_number: Override destination, empty for caller's number.
-        """
+        """SMS the guest their room name and door code (defaults to caller-ID number)."""
         args: dict = {"reservation_id": reservation_id}
         if phone_number:
             args["phone_number"] = phone_number
@@ -313,16 +255,7 @@ class IrisAgent(Agent):
         reservation_id: str,
         reason: str = "",
     ) -> str:
-        """Cancel a reservation in Cloudbeds. CRITICAL: only call for DIRECT
-        bookings — first call lookup_reservation and verify
-        is_direct_booking=true. For OTA reservations (Expedia, Booking.com,
-        Hotels.com), DO NOT call this — instead tell the caller to contact
-        the OTA. Cancellations are irreversible. Always confirm first.
-
-        Args:
-            reservation_id: Cloudbeds reservation ID.
-            reason: Cancellation reason for audit note, empty if none given.
-        """
+        """Cancel a direct-booking reservation in Cloudbeds (irreversible)."""
         args: dict = {"reservation_id": reservation_id}
         if reason:
             args["reason"] = reason
@@ -351,12 +284,10 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(model="nova-3"),
-        # TEMP: Haiku for debugging. Sonnet was hanging silently — isolating
-        # whether the issue is model-specific (Sonnet TTFT with our 30K-token
-        # prompt + 7 tools) or pipeline-wide. If Haiku responds, we know it's
-        # Sonnet-specific and can dig in. Switch back to Sonnet once
-        # diagnosed.
-        llm=anthropic.LLM(model="claude-haiku-4-5"),
+        # Sonnet 4.5 per quality requirement. Caching off for now — its
+        # interaction with the tool block produced silent hangs; safe to
+        # re-enable later once we land on stable tool schemas.
+        llm=anthropic.LLM(model="claude-sonnet-4-5"),
         tts=KokoroTTS(
             model_path=str(KOKORO_MODEL),
             voices_path=str(KOKORO_VOICES),
