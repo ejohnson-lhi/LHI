@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
@@ -51,6 +52,13 @@ KOKORO_VOICES = HERE / "models" / "voices-v1.0.bin"
 BACKEND_URL = os.environ.get("IRIS_BACKEND_URL", "http://127.0.0.1:8000")
 BACKEND_TIMEOUT_S = 15.0
 
+# Where to write per-call transcripts. Gitignored. Each call gets a single
+# JSON file with the full chat history + timestamps so we can investigate
+# latency, prompt issues, and tool-call failures after the fact.
+TRANSCRIPTS_DIR = Path(os.environ.get(
+    "IRIS_TRANSCRIPTS_DIR", "/opt/iris-backend/recordings"
+))
+
 # First message text. Same wording the previous Vapi setup used. Spoken
 # verbatim (not LLM-generated) so the greeting is consistent across calls.
 FIRST_MESSAGE = "Lighthouse Inn, this is Iris, the AI assistant. How may I help you?"
@@ -74,9 +82,11 @@ async def _call_backend_tool(
     """
     payload = {
         "message": {
+            "type": "tool-calls",  # required by backend's VapiToolCallMessage model
             "toolCallList": [
                 {
                     "id": f"agent_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
                     "function": {"name": name, "arguments": args},
                 }
             ],
@@ -333,6 +343,56 @@ async def entrypoint(ctx: JobContext) -> None:
             interruption=InterruptionOptions(mode="vad"),
         ),
     )
+
+    started_at = datetime.now()
+
+    async def write_transcript() -> None:
+        """On shutdown, dump session.history to JSON for after-the-fact review.
+
+        Captures full chat context (system prompt + every user/assistant turn
+        + tool calls + tool results) plus timestamps. Useful for debugging
+        latency, prompt regressions, and tool-call failures.
+        """
+        try:
+            TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = started_at.strftime("%Y%m%d_%H%M%S")
+            phone_safe = (caller_phone or "unknown").lstrip("+") or "unknown"
+            out = TRANSCRIPTS_DIR / f"transcript_{ts}_{phone_safe}.json"
+
+            # session.history is a ChatContext; .items is the list of turns.
+            items = []
+            for item in session.history.items:
+                # ChatContext items vary by class (ChatMessage, FunctionCall,
+                # FunctionCallOutput); serialize whatever attrs we find.
+                d: dict = {"type": type(item).__name__}
+                for attr in ("id", "role", "content", "name", "arguments",
+                             "call_id", "output", "interrupted", "created_at"):
+                    if hasattr(item, attr):
+                        v = getattr(item, attr)
+                        # Content is often a list of text blocks; flatten to str.
+                        if attr == "content" and isinstance(v, list):
+                            v = " ".join(
+                                getattr(b, "text", str(b)) for b in v
+                            )
+                        d[attr] = v
+                items.append(d)
+
+            transcript = {
+                "room": ctx.room.name,
+                "caller_phone": caller_phone,
+                "started_at": started_at.isoformat(),
+                "ended_at": datetime.now().isoformat(),
+                "duration_seconds": (datetime.now() - started_at).total_seconds(),
+                "item_count": len(items),
+                "items": items,
+            }
+            out.write_text(json.dumps(transcript, indent=2, default=str))
+            log.info("Transcript written: %s (%d items)", out, len(items))
+        except Exception:
+            # Never let transcript writing crash session shutdown.
+            log.exception("Failed to write transcript")
+
+    ctx.add_shutdown_callback(write_transcript)
 
     await session.start(room=ctx.room, agent=IrisAgent(caller_phone=caller_phone))
 
