@@ -29,6 +29,12 @@ dev = [
     "ruff>=0.4.0",
 ]
 
+# The agent isn't a "package" in the import sense — it's two top-level
+# scripts. Tell setuptools so it doesn't try to auto-discover and complain
+# about ambiguous flat-layout.
+[tool.setuptools]
+py-modules = ["hello_agent", "kokoro_tts"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
