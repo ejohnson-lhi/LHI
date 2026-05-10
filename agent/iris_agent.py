@@ -23,6 +23,7 @@ Required env (in agent/.env):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -140,8 +141,12 @@ class IrisAgent(Agent):
         self._caller_phone = caller_phone
 
     async def on_enter(self) -> None:
-        # Speak the canonical greeting verbatim (not LLM-generated). Adds to
-        # chat history by default so the LLM has context for the response.
+        # Wait briefly for the audio path between LiveKit and the SIP gateway
+        # to settle. Without this, on_enter fires the moment Kokoro finishes
+        # loading — before livekit-sip has fully bridged audio with the
+        # caller — and the greeting plays into a void. Caller experience:
+        # call connects with no ringback, then silence.
+        await asyncio.sleep(1.5)
         log.info("Agent on_enter: speaking first message")
         await self.session.say(FIRST_MESSAGE)
 
@@ -342,7 +347,35 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_handling=TurnHandlingOptions(
             interruption=InterruptionOptions(mode="vad"),
         ),
+        # Disable preemptive generation to avoid wasted LLM calls when STT
+        # finalization shifts. With our 30K-token prompt, each restarted
+        # generation is expensive. Trade-off: ~200ms extra latency at end of
+        # user utterance, in exchange for not double-paying for restarts.
+        preemptive_generation=False,
     )
+
+    # Log LLM metrics after each turn so we can verify prompt caching is
+    # actually hitting (cache_read_input_tokens should be high relative to
+    # input_tokens). Helps diagnose whether the 12-sec post-tool latency is
+    # cache-miss or just Sonnet being slow.
+    @session.on("metrics_collected")
+    def _on_metrics(ev) -> None:
+        m = getattr(ev, "metrics", None)
+        if m is None:
+            return
+        # LLMMetrics, STTMetrics, TTSMetrics — log a compact one-liner
+        # with whatever attrs are present.
+        kind = type(m).__name__
+        attrs = {}
+        for k in ("ttft", "duration", "prompt_tokens", "completion_tokens",
+                  "cache_creation_input_tokens", "cache_read_input_tokens",
+                  "input_tokens", "output_tokens", "audio_duration",
+                  "characters_count", "tokens_per_second"):
+            v = getattr(m, k, None)
+            if v is not None:
+                attrs[k] = round(v, 3) if isinstance(v, float) else v
+        if attrs:
+            log.info("metrics %s: %s", kind, attrs)
 
     started_at = datetime.now()
 
