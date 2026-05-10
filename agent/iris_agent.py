@@ -351,11 +351,12 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(model="nova-3"),
-        # Sonnet (not Haiku) per quality requirement. Caching disabled for
-        # now — combined with our 7 tools, ephemeral cache_control on the
-        # tool block was causing silent LLM hangs. Re-enable once we
-        # diagnose the interaction (worth ~3x cost reduction).
-        llm=anthropic.LLM(model="claude-sonnet-4-5"),
+        # TEMP: Haiku for debugging. Sonnet was hanging silently — isolating
+        # whether the issue is model-specific (Sonnet TTFT with our 30K-token
+        # prompt + 7 tools) or pipeline-wide. If Haiku responds, we know it's
+        # Sonnet-specific and can dig in. Switch back to Sonnet once
+        # diagnosed.
+        llm=anthropic.LLM(model="claude-haiku-4-5"),
         tts=KokoroTTS(
             model_path=str(KOKORO_MODEL),
             voices_path=str(KOKORO_VOICES),
