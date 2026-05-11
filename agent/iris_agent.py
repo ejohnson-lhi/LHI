@@ -35,7 +35,7 @@ import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
 import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession, JobContext, function_tool
+from livekit.agents import Agent, AgentSession, JobContext, JobProcess, function_tool
 from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
 from livekit.plugins import anthropic, deepgram, silero
 
@@ -275,6 +275,24 @@ class IrisAgent(Agent):
 
 
 # =============================================================================
+# Worker subprocess prewarm — runs once when each worker child starts, BEFORE
+# any call arrives. Loading Kokoro here (instead of inside entrypoint) means
+# the 325 MB ONNX model is in memory when a job lands — the first response
+# of every call is ~3-5s faster.
+# =============================================================================
+
+
+def prewarm(proc: JobProcess) -> None:
+    log.info("Prewarming Kokoro TTS model...")
+    proc.userdata["kokoro_tts"] = KokoroTTS(
+        model_path=str(KOKORO_MODEL),
+        voices_path=str(KOKORO_VOICES),
+        voice="af_sarah",
+    )
+    log.info("Kokoro TTS prewarmed and ready.")
+
+
+# =============================================================================
 # Entrypoint — wired up at worker registration time
 # =============================================================================
 
@@ -337,11 +355,9 @@ async def entrypoint(ctx: JobContext) -> None:
             caching="ephemeral",
             _strict_tool_schema=False,
         ),
-        tts=KokoroTTS(
-            model_path=str(KOKORO_MODEL),
-            voices_path=str(KOKORO_VOICES),
-            voice="af_sarah",
-        ),
+        # Reuse the KokoroTTS instance prewarmed at worker subprocess start
+        # (see prewarm() above). Avoids the 3-5s per-call model-load cost.
+        tts=ctx.proc.userdata["kokoro_tts"],
         # Skip LiveKit Cloud's adaptive interruption (cloud-only feature
         # that 401s on self-hosted). VAD-based interruption works fine.
         turn_handling=TurnHandlingOptions(
@@ -498,4 +514,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+    # num_idle_processes=1: only one warm worker subprocess pre-loaded with
+    # Kokoro. Concurrent calls (rare at Lighthouse Inn) will cold-start a
+    # second worker on demand. Keeps droplet memory footprint reasonable.
+    agents.cli.run_app(agents.WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        prewarm_fnc=prewarm,
+        num_idle_processes=1,
+    ))

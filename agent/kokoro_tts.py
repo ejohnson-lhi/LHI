@@ -23,6 +23,16 @@ confusing error.
 """
 from __future__ import annotations
 
+import os
+
+# Cap ONNX Runtime parallelism BEFORE importing kokoro_onnx (which triggers
+# ORT thread-pool initialization). On the 4-core droplet, leaving 2 cores
+# for the asyncio loop / Silero VAD / WebRTC encoder is the difference
+# between smooth audio publishing and residual within-utterance silence
+# gaps. Cost: ~10-15% slower per-synthesis (rtf increases slightly), but
+# the audio path stops underrunning.
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+
 import asyncio
 import logging
 from dataclasses import dataclass
