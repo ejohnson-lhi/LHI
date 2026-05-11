@@ -35,6 +35,19 @@ from threading import Lock
 
 log = logging.getLogger("audio_cache")
 
+# Bump this when changes to kokoro_tts.py's text normalization (or any
+# transformation that affects the audio bytes) make previously-cached
+# entries stale. On load, the cache compares its pickled version to this
+# constant; on mismatch, all entries are dropped and the cache rebuilds
+# fresh. Avoids hand-wiping `tts_cache.pkl` after every fix.
+#
+# History:
+#   1 - initial schema
+#   2 - kokoro_tts._normalize_for_tts: $NN -> "N dollars", strip hyphen
+#       from X-dollar(s). Caused by Iris pronouncing "$20" as "Dollar
+#       twenty" / "twenty-dollar" as "dollar twenty".
+CACHE_VERSION = 2
+
 
 class TTSAudioCache:
     def __init__(
@@ -59,13 +72,25 @@ class TTSAudioCache:
     def _load(self) -> None:
         """Load a previously-pickled cache from `persist_path`, if any.
 
-        Tolerates corrupt / missing files — just starts fresh.
+        Tolerates corrupt / missing files — just starts fresh. Also
+        drops the whole cache if the pickled `version` doesn't match
+        the current `CACHE_VERSION` (handles the "I changed the TTS
+        normalization and old entries have stale audio" case without
+        a manual file wipe).
         """
         if self._persist_path is None or not self._persist_path.exists():
             return
         try:
             with open(self._persist_path, "rb") as f:
                 data = pickle.load(f)
+            loaded_version = data.get("version")
+            if loaded_version != CACHE_VERSION:
+                log.info(
+                    "TTS cache schema mismatch (loaded=%s, current=%s); "
+                    "dropping all entries — they'll resynth with current code",
+                    loaded_version, CACHE_VERSION,
+                )
+                return
             entries = data.get("entries")
             if isinstance(entries, OrderedDict):
                 self._cache = entries
@@ -90,13 +115,16 @@ class TTSAudioCache:
         tmp = self._persist_path.with_suffix(".tmp")
         try:
             with self._lock:
-                payload = {"entries": OrderedDict(self._cache)}
+                payload = {
+                    "version": CACHE_VERSION,
+                    "entries": OrderedDict(self._cache),
+                }
             with open(tmp, "wb") as f:
                 pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
             tmp.replace(self._persist_path)
             log.info(
-                "Saved %d TTS cache entries to %s",
-                len(payload["entries"]), self._persist_path,
+                "Saved %d TTS cache entries (v%s) to %s",
+                len(payload["entries"]), CACHE_VERSION, self._persist_path,
             )
         except Exception as e:
             log.warning("TTS cache save failed: %s", e)
@@ -151,17 +179,29 @@ class TTSAudioCache:
         self,
         dir_path: Path,
         sample_rate: int = 24000,
+        wipe_first: bool = True,
     ) -> int:
         """Write each cache entry as a 16-bit mono WAV in `dir_path`.
 
         Filenames are sanitized phrase prefix + short MD5 hash, e.g.
         ``lighthouse_inn_this_is_iris_the_ai_assistant_9c1a3d2f.wav``.
         Hash suffix prevents collisions when two phrases sanitize to the
-        same prefix. Re-writes existing files (idempotent).
+        same prefix.
+
+        If `wipe_first` is True (default), existing .wav files in
+        `dir_path` are removed before writing. This keeps the dir in
+        sync with the current cache — entries that got evicted (LRU) or
+        dropped (version bump) don't leave stale WAVs behind.
 
         Returns number of files written.
         """
         dir_path.mkdir(parents=True, exist_ok=True)
+        if wipe_first:
+            for f in dir_path.glob("*.wav"):
+                try:
+                    f.unlink()
+                except OSError as e:
+                    log.warning("Could not remove %s: %s", f, e)
         count = 0
         with self._lock:
             snapshot = list(self._cache.items())

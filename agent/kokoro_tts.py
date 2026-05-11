@@ -47,16 +47,20 @@ KOKORO_SAMPLE_RATE = 24000
 KOKORO_NUM_CHANNELS = 1
 
 
-# espeak-ng (the phonemizer kokoro-onnx wraps) inverts hyphenated
-# number-dollar compounds: "twenty-dollar fee" is spoken as "dollar
-# twenty fee" — sounds like "$1.20" to callers. Strip the hyphen so it
-# reads correctly. Caught after live calls where Iris quoted the pet
-# fee as "$1.20" instead of "$20".
+# espeak-ng (the phonemizer kokoro-onnx wraps) puts "Dollar" BEFORE the
+# number in two patterns:
+#   1. Hyphenated compound: "twenty-dollar fee" -> "dollar twenty fee"
+#   2. Dollar-sign prefix:  "$20 fee"           -> "dollar twenty fee"
+# Both sound like "$1.20" or similar. Rewrite to "N dollars/dollar" so
+# espeak reads the natural order.
 _HYPHEN_DOLLAR_RE = re.compile(r"\b(\w+)-(dollars?)\b", re.IGNORECASE)
+_DOLLAR_PREFIX_RE = re.compile(r"\$(\d+)\b")
 
 
 def _normalize_for_tts(text: str) -> str:
-    return _HYPHEN_DOLLAR_RE.sub(r"\1 \2", text)
+    text = _HYPHEN_DOLLAR_RE.sub(r"\1 \2", text)
+    text = _DOLLAR_PREFIX_RE.sub(r"\1 dollars", text)
+    return text
 
 
 @dataclass
