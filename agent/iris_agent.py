@@ -52,6 +52,12 @@ HERE = Path(__file__).parent
 KOKORO_MODEL = HERE / "models" / "kokoro-v1.0.onnx"
 KOKORO_VOICES = HERE / "models" / "voices-v1.0.bin"
 
+# Disk-backed TTS audio cache. LiveKit spawns a fresh worker subprocess for
+# each call (with num_idle_processes=1), so cache survives only across
+# calls via disk. Lives under ~/.cache/ since systemd's ProtectSystem=strict
+# allows /home/iris/.cache (already in the unit's ReadWritePaths).
+TTS_CACHE_PATH = Path.home() / ".cache" / "iris" / "tts_cache.pkl"
+
 BACKEND_URL = os.environ.get("IRIS_BACKEND_URL", "http://127.0.0.1:8000")
 BACKEND_TIMEOUT_S = 15.0
 
@@ -307,14 +313,17 @@ class IrisAgent(Agent):
 
 def prewarm(proc: JobProcess) -> None:
     log.info("Prewarming Kokoro TTS model...")
-    cache = TTSAudioCache(max_auto_entries=200)
+    # Cache loads any previously-saved entries from disk on construction —
+    # so the greeting (and accumulated LLM phrasings) survive worker
+    # restarts between calls.
+    cache = TTSAudioCache(max_entries=500, persist_path=TTS_CACHE_PATH)
     tts = KokoroTTS(
         model_path=str(KOKORO_MODEL),
         voices_path=str(KOKORO_VOICES),
         voice="af_sarah",
         cache=cache,
     )
-    log.info("Pre-rendering greeting chunks...")
+    log.info("Pre-rendering greeting chunks (skipped if already cached)...")
     for chunk in GREETING_CHUNKS:
         tts.prerender(chunk)
     log.info("Kokoro TTS prewarmed; cache stats: %s", cache.stats())
@@ -546,7 +555,19 @@ async def entrypoint(ctx: JobContext) -> None:
             # Never let transcript writing crash session shutdown.
             log.exception("Failed to write transcript")
 
+    async def save_tts_cache() -> None:
+        """Persist the TTS audio cache to disk so subsequent worker
+        subprocesses (and post-deploy restarts) start with the same
+        entries already warm."""
+        try:
+            tts = ctx.proc.userdata.get("kokoro_tts")
+            if tts is not None:
+                await asyncio.to_thread(tts._cache.save)
+        except Exception:
+            log.exception("Failed to save TTS cache")
+
     ctx.add_shutdown_callback(write_transcript)
+    ctx.add_shutdown_callback(save_tts_cache)
 
     await session.start(room=ctx.room, agent=IrisAgent(caller_phone=caller_phone))
 

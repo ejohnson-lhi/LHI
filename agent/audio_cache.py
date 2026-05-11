@@ -1,82 +1,142 @@
-"""In-memory cache of synthesized TTS audio (raw PCM bytes).
+"""In-memory LRU cache of synthesized TTS audio (raw PCM bytes).
 
-Two purposes:
-  1. Pre-render fixed phrases (greeting, common closings) at worker
-     startup so the first call has zero TTS latency for those.
-  2. Auto-cache LLM-produced phrases as they're synthesized, so repeated
-     identical sentences across calls bypass Kokoro after the first hit.
+Why this exists:
+  - Pre-rendered phrases (greeting) play instantly without invoking Kokoro.
+  - LLM-produced phrases that repeat across turns / calls are served from
+    cache instead of resynthesizing.
 
-Cache keys are the literal text TTS.synthesize() receives. The framework
-splits LLM output at sentence boundaries before calling synthesize, so
-cache effectively works at sentence granularity.
+Why disk persistence matters:
+  LiveKit Agents spawns a fresh worker subprocess for each new job (with
+  num_idle_processes=1). The cache lives in worker memory, so it dies
+  with the worker. Without disk persistence we'd never get cross-call
+  cache hits — each call would start with a "fresh" cache containing
+  only what got pre-rendered at worker startup.
 
-Fixed entries are permanent; auto entries use LRU eviction (least-
-recently-used dropped first) past `max_auto_entries`. Every read and
-write on the auto cache moves the entry to the most-recently-used end.
+  Persisting on shutdown + loading on startup lets the cache grow
+  organically across calls. The greeting alone is enough to feel snappy
+  on call open; cross-call hits make repeated answers also fast.
+
+Design:
+  Single LRU cache (`OrderedDict`), evicts the least-recently-used entry
+  past `max_entries`. Persists as a pickled dict to `persist_path` if
+  provided. Atomic file replace on save so a half-written cache won't
+  corrupt the file on crash.
 """
 from __future__ import annotations
 
 import logging
+import pickle
 from collections import OrderedDict
+from pathlib import Path
 from threading import Lock
 
 log = logging.getLogger("audio_cache")
 
 
 class TTSAudioCache:
-    def __init__(self, max_auto_entries: int = 200) -> None:
-        self._fixed: dict[str, bytes] = {}
-        # OrderedDict gives us O(1) move_to_end (mark-as-recently-used) and
-        # O(1) popitem(last=False) (evict-LRU). Iteration order = LRU first,
-        # MRU last — useful for inspecting which entries are about to be
-        # dropped if you want to debug.
-        self._auto: OrderedDict[str, bytes] = OrderedDict()
-        self._max = max_auto_entries
+    def __init__(
+        self,
+        *,
+        max_entries: int = 500,
+        persist_path: Path | None = None,
+    ) -> None:
+        # OrderedDict gives O(1) move_to_end (mark-as-MRU) and O(1)
+        # popitem(last=False) (evict LRU). Iteration order is LRU first,
+        # MRU last — useful for debugging which entries are next to go.
+        self._cache: OrderedDict[str, bytes] = OrderedDict()
+        self._max = max_entries
         self._hits = 0
         self._misses = 0
         self._lock = Lock()
+        self._persist_path = persist_path
+        self._load()
+
+    # ----- persistence -----
+
+    def _load(self) -> None:
+        """Load a previously-pickled cache from `persist_path`, if any.
+
+        Tolerates corrupt / missing files — just starts fresh.
+        """
+        if self._persist_path is None or not self._persist_path.exists():
+            return
+        try:
+            with open(self._persist_path, "rb") as f:
+                data = pickle.load(f)
+            entries = data.get("entries")
+            if isinstance(entries, OrderedDict):
+                self._cache = entries
+                log.info(
+                    "Loaded %d TTS cache entries from %s",
+                    len(self._cache), self._persist_path,
+                )
+        except Exception as e:
+            log.warning(
+                "TTS cache load failed (%s); starting fresh", e,
+            )
+
+    def save(self) -> None:
+        """Pickle current cache to `persist_path`. Atomic rename pattern
+        so a crash mid-write can't leave a corrupt file in place.
+
+        Safe to call from a synchronous context (no asyncio dependencies).
+        """
+        if self._persist_path is None:
+            return
+        self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._persist_path.with_suffix(".tmp")
+        try:
+            with self._lock:
+                payload = {"entries": OrderedDict(self._cache)}
+            with open(tmp, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp.replace(self._persist_path)
+            log.info(
+                "Saved %d TTS cache entries to %s",
+                len(payload["entries"]), self._persist_path,
+            )
+        except Exception as e:
+            log.warning("TTS cache save failed: %s", e)
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+    # ----- read/write -----
 
     def get(self, text: str) -> bytes | None:
         with self._lock:
-            if text in self._fixed:
+            if text in self._cache:
+                # Touch: mark this entry as MRU so eviction skips it.
+                self._cache.move_to_end(text)
                 self._hits += 1
-                return self._fixed[text]
-            if text in self._auto:
-                # Touch: move to MRU end so it survives eviction longer.
-                self._auto.move_to_end(text)
-                self._hits += 1
-                return self._auto[text]
+                return self._cache[text]
             self._misses += 1
             return None
 
-    def put_fixed(self, text: str, audio: bytes) -> None:
+    def put(self, text: str, audio: bytes) -> None:
+        """Insert or refresh an entry. New entry becomes MRU; if cache
+        is full, the LRU entry is evicted."""
         with self._lock:
-            self._fixed[text] = audio
+            if text in self._cache:
+                self._cache.move_to_end(text)
+                return
+            if len(self._cache) >= self._max:
+                self._cache.popitem(last=False)
+            self._cache[text] = audio
 
-    def put_auto(self, text: str, audio: bytes) -> None:
-        with self._lock:
-            if text in self._fixed:
-                return
-            if text in self._auto:
-                # Already auto-cached — refresh its position.
-                self._auto.move_to_end(text)
-                return
-            if len(self._auto) >= self._max:
-                # Drop the least-recently-used entry.
-                self._auto.popitem(last=False)
-            self._auto[text] = audio
+    # ----- diagnostics -----
 
     def __contains__(self, text: str) -> bool:
         with self._lock:
-            return text in self._fixed or text in self._auto
+            return text in self._cache
 
     def stats(self) -> dict:
         with self._lock:
             total = self._hits + self._misses
             return {
-                "fixed": len(self._fixed),
-                "auto": len(self._auto),
-                "auto_max": self._max,
+                "entries": len(self._cache),
+                "max": self._max,
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": round(self._hits / total, 3) if total else 0.0,

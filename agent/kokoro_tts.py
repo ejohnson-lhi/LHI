@@ -92,12 +92,15 @@ class KokoroTTS(tts.TTS):
         return self._cache.stats()
 
     def prerender(self, text: str) -> None:
-        """Synthesize ``text`` synchronously and stash it in the permanent
-        cache. Call this at worker startup for fixed phrases (greeting,
-        common closings) so subsequent synthesize() calls with the same
-        text return instantly.
+        """Synthesize ``text`` synchronously and stash it in the cache.
 
-        Skips if already cached (idempotent).
+        Call this at worker startup for greeting and similar always-used
+        phrases so subsequent synthesize() calls return instantly. Touch
+        on lookup keeps these at MRU end of the LRU, so they don't get
+        evicted as long as they're used at the start of every call.
+
+        Skips if already cached (idempotent — handy when loading a
+        persisted cache then re-prewarming).
         """
         if text in self._cache:
             return
@@ -112,7 +115,7 @@ class KokoroTTS(tts.TTS):
                 f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"
             )
         pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-        self._cache.put_fixed(text, pcm)
+        self._cache.put(text, pcm)
         log.info(
             "Pre-rendered (%d bytes, %.2fs): %r",
             len(pcm), len(samples) / sr, text[:80],
@@ -218,11 +221,12 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             # Wrap so the framework's retry/backoff sees a known exception.
             raise APIConnectionError(f"Kokoro synthesis failed: {e}") from e
 
-        # Auto-cache: next time the framework asks for this exact sentence,
-        # we'll serve it from cache. Useful for frequently-repeated phrases
-        # ("Is there anything else I can help you with today?", greeting
-        # variants, common direct-answer phrasings, etc.).
-        self._tts._cache.put_auto(text, pcm_bytes)
+        # Cache the result: next time the framework asks for this exact
+        # sentence (within this worker, or across workers via the disk-
+        # persisted cache), we'll serve from cache. Useful for repeated
+        # phrases like "Is there anything else I can help you with today?"
+        # and natural-but-stable LLM phrasings.
+        self._tts._cache.put(text, pcm_bytes)
 
         output_emitter.push(pcm_bytes)
         output_emitter.flush()
