@@ -173,7 +173,47 @@ class TTSAudioCache:
                 "hit_rate": round(self._hits / total, 3) if total else 0.0,
             }
 
-    # ----- WAV export (for human inspection / download) -----
+    # ----- WAV export + validate-against-manifest workflow -----
+
+    @staticmethod
+    def _wav_filename(text: str) -> str:
+        """Filename `dump_to_wav_dir` would use for `text`. Deterministic
+        so the WAV dir can be treated as a manifest the agent honors:
+        delete a WAV and the agent drops that cache entry on next load."""
+        safe = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()[:60]
+        h = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+        return f"{safe}_{h}.wav"
+
+    def validate_against_wav_dir(self, wav_dir: Path) -> int:
+        """Drop cache entries whose expected WAV file is missing from
+        `wav_dir`. Treats the dir as a manifest of valid entries.
+
+        Skipped if `wav_dir` doesn't exist or contains no WAVs at all,
+        so a brand-new worker doesn't wipe its loaded cache before it's
+        ever dumped any WAVs.
+
+        Returns number of entries dropped. Intended to be called once
+        at worker prewarm, after the cache loads from disk.
+        """
+        if not wav_dir.exists():
+            return 0
+        existing = {f.name for f in wav_dir.glob("*.wav")}
+        if not existing:
+            return 0
+        with self._lock:
+            to_drop = [
+                text for text in self._cache
+                if self._wav_filename(text) not in existing
+            ]
+            for text in to_drop:
+                del self._cache[text]
+        if to_drop:
+            preview = ", ".join(repr(t[:50]) for t in to_drop[:5])
+            log.info(
+                "Dropped %d cache entries (WAVs missing from %s): %s",
+                len(to_drop), wav_dir, preview,
+            )
+        return len(to_drop)
 
     def dump_to_wav_dir(
         self,
@@ -206,9 +246,7 @@ class TTSAudioCache:
         with self._lock:
             snapshot = list(self._cache.items())
         for text, pcm in snapshot:
-            safe = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()[:60]
-            h = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
-            wav_path = dir_path / f"{safe}_{h}.wav"
+            wav_path = dir_path / self._wav_filename(text)
             try:
                 with wave.open(str(wav_path), "wb") as w:
                     w.setnchannels(1)

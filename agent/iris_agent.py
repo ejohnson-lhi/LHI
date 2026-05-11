@@ -325,6 +325,11 @@ def prewarm(proc: JobProcess) -> None:
     # so the greeting (and accumulated LLM phrasings) survive worker
     # restarts between calls.
     cache = TTSAudioCache(max_entries=500, persist_path=TTS_CACHE_PATH)
+    # Treat the WAV dir as a manifest: any cache entry whose corresponding
+    # WAV is missing gets dropped. That's the "git push delete" workflow —
+    # user listens, deletes bad WAVs, runs tools/push_deletions.bat, next
+    # call resynthesizes those phrases with current code.
+    cache.validate_against_wav_dir(TTS_CACHE_WAV_DIR)
     tts = KokoroTTS(
         model_path=str(KOKORO_MODEL),
         voices_path=str(KOKORO_VOICES),
