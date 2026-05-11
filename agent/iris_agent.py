@@ -141,14 +141,20 @@ class IrisAgent(Agent):
         self._caller_phone = caller_phone
 
     async def on_enter(self) -> None:
-        # Wait briefly for the audio path between LiveKit and the SIP gateway
-        # to settle. Without this, on_enter fires the moment Kokoro finishes
-        # loading — before livekit-sip has fully bridged audio with the
-        # caller — and the greeting plays into a void. Caller experience:
-        # call connects with no ringback, then silence.
-        await asyncio.sleep(1.5)
+        # Brief wait for the SIP audio bridge to settle. Without it the
+        # greeting plays into a void on some carriers. 0.5s is enough now
+        # that Kokoro is prewarmed (the older 1.5s was masking model-load
+        # time too).
+        await asyncio.sleep(0.5)
         log.info("Agent on_enter: speaking first message")
-        await self.session.say(FIRST_MESSAGE)
+        # allow_interruptions=False so the greeting plays even if the caller
+        # speaks first ("Hello?", "Anyone there?") — which happens often
+        # because there's no ringback tone on inbound Twilio + LiveKit-SIP
+        # calls, so callers don't know the line connected. With the default
+        # (True), LiveKit's VAD-driven interrupt logic suppresses the
+        # greeting and the caller hears silence followed by a confused
+        # back-and-forth.
+        await self.session.say(FIRST_MESSAGE, allow_interruptions=False)
 
     # -------------------------------------------------------------------------
     # Tools — JSON return values, all proxied to backend's existing handlers.
