@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
+import numpy as np
 import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc
@@ -89,6 +90,32 @@ GREETING_CHUNKS = [
     "Lighthouse Inn, this is Iris, the AI assistant.",
     "How may I help you?",
 ]
+
+# Synthetic ringback tone (440 + 480 Hz dual-tone, ~1.5s) played as the
+# agent's very first audio. LiveKit-SIP answers calls with 200 OK
+# immediately so Twilio can't play real PSTN ringback — this brief
+# fake ringback fills the silent-connect gap and gives callers the
+# familiar "one ring, then pickup" UX. Cached under a sentinel key
+# that no LLM output will ever match, then played via session.say()
+# which finds the cache hit and bypasses Kokoro entirely.
+RINGBACK_CACHE_KEY = "__ringback_tone__"
+RINGBACK_DURATION_S = 1.5
+
+
+def _generate_ringback_pcm(duration_s: float = RINGBACK_DURATION_S) -> bytes:
+    """24 kHz mono int16 PCM bytes of US ringback tone, with short
+    fade-in/out to avoid pops. Suitable for direct insertion into the
+    KokoroTTS cache (same format as Kokoro's output)."""
+    sr = 24000
+    n = int(sr * duration_s)
+    t = np.linspace(0, duration_s, n, endpoint=False, dtype=np.float32)
+    # North American ringback: 440 Hz + 480 Hz at equal volume.
+    tone = 0.25 * (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t))
+    fade = int(sr * 0.05)  # 50 ms fade
+    tone[:fade] *= np.linspace(0, 1, fade)
+    tone[-fade:] *= np.linspace(1, 0, fade)
+    pcm16 = (np.clip(tone, -1.0, 1.0) * 32767.0).astype(np.int16)
+    return pcm16.tobytes()
 
 
 # =============================================================================
@@ -168,18 +195,19 @@ class IrisAgent(Agent):
 
     async def on_enter(self) -> None:
         # Brief wait for the SIP audio bridge to settle. Without it the
-        # greeting plays into a void on some carriers. 0.5s is enough now
-        # that Kokoro is prewarmed (the older 1.5s was masking model-load
-        # time too).
-        await asyncio.sleep(0.5)
+        # first audio plays into a void on some carriers.
+        await asyncio.sleep(0.3)
+        # Play a synthetic ringback tone first so the caller hears a
+        # familiar "one ring" before Iris speaks — LiveKit-SIP answers
+        # with 200 OK immediately so Twilio can't generate real PSTN
+        # ringback. The tone is pre-cached in prewarm(), so this is an
+        # instant cache hit, not a synthesis call.
+        log.info("Agent on_enter: playing ringback tone")
+        await self.session.say(RINGBACK_CACHE_KEY, allow_interruptions=False)
         log.info("Agent on_enter: speaking first message")
         # allow_interruptions=False so the greeting plays even if the caller
-        # speaks first ("Hello?", "Anyone there?") — which happens often
-        # because there's no ringback tone on inbound Twilio + LiveKit-SIP
-        # calls, so callers don't know the line connected. With the default
-        # (True), LiveKit's VAD-driven interrupt logic suppresses the
-        # greeting and the caller hears silence followed by a confused
-        # back-and-forth.
+        # speaks first ("Hello?", "Anyone there?") — happens less now with
+        # the ringback, but still good defense.
         await self.session.say(FIRST_MESSAGE, allow_interruptions=False)
 
     # -------------------------------------------------------------------------
@@ -339,6 +367,11 @@ def prewarm(proc: JobProcess) -> None:
     log.info("Pre-rendering greeting chunks (skipped if already cached)...")
     for chunk in GREETING_CHUNKS:
         tts.prerender(chunk)
+    # Ringback tone — synthesized from numpy (NOT via Kokoro). Inserted
+    # unconditionally on every prewarm so a stale-cache wipe or WAV-
+    # manifest invalidation can't ever leave on_enter without it.
+    cache.put(RINGBACK_CACHE_KEY, _generate_ringback_pcm())
+    log.info("Cached ringback tone (%.1fs).", RINGBACK_DURATION_S)
     log.info("Kokoro TTS prewarmed; cache stats: %s", cache.stats())
     proc.userdata["kokoro_tts"] = tts
 
