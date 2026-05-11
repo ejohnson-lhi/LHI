@@ -13,7 +13,8 @@ from pathlib import Path
 # Repo layout:  <repo>/AI_Prompts/...   <repo>/agent/iris_prompt.py
 PROMPTS_DIR = Path(__file__).parent.parent / "AI_Prompts"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "Lighthouse_AI_system_prompt-2026may02.txt"
-KB_FILE = PROMPTS_DIR / "knowledge_base.md"
+# Knowledge base is now loaded by agent/inn_info.py and exposed as a tool
+# rather than inlined here. See build_system_prompt() docstring.
 
 
 def _render_placeholders(prompt: str, caller_phone: str | None = None) -> str:
@@ -68,8 +69,12 @@ def _render_placeholders(prompt: str, caller_phone: str | None = None) -> str:
 
 
 def build_system_prompt(caller_phone: str | None = None) -> str:
-    """Return the rendered system prompt (instructions + KB) for one call."""
+    """Return the rendered system prompt for one call.
+
+    The Knowledge Base is no longer inlined here; the agent's `inn_info`
+    tool fetches relevant entries on demand. That removes ~7K tokens from
+    every prompt the LLM processes (roughly 1s off cached TTFT) at the
+    cost of an extra LLM round-trip on the subset of turns that need KB.
+    """
     prompt = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
-    kb = KB_FILE.read_text(encoding="utf-8")
-    combined = f"{prompt}\n\n# Knowledge Base\n\n{kb}"
-    return _render_placeholders(combined, caller_phone=caller_phone)
+    return _render_placeholders(prompt, caller_phone=caller_phone)

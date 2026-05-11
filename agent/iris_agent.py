@@ -39,6 +39,7 @@ from livekit.agents import Agent, AgentSession, JobContext, JobProcess, function
 from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
 from livekit.plugins import anthropic, deepgram, silero
 
+import inn_info
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
 
@@ -278,6 +279,11 @@ class IrisAgent(Agent):
         if reason:
             args["reason"] = reason
         return json.dumps(await _call_backend_tool("cancel_reservation", args, self._caller_phone))
+
+    @function_tool
+    async def inn_info(self, question: str) -> str:
+        """Look up Lighthouse Inn details (room features, amenities, pet/smoking/parking/breakfast policy, local area, transit, hours, etc.). Use for any guest question not covered directly by your other tools or the inline system prompt."""
+        return inn_info.lookup(question)
 
 
 # =============================================================================
