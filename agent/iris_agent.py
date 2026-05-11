@@ -354,17 +354,30 @@ async def entrypoint(ctx: JobContext) -> None:
         preemptive_generation=False,
     )
 
-    # Log LLM metrics after each turn so we can verify prompt caching is
-    # actually hitting (cache_read_input_tokens should be high relative to
-    # input_tokens). Helps diagnose whether the 12-sec post-tool latency is
-    # cache-miss or just Sonnet being slow.
+    started_at = datetime.now()
+
+    # Per-call event timeline. Every interesting framework event gets pushed
+    # here with an elapsed-seconds timestamp from call start, then dumped to
+    # the transcript JSON at shutdown. Reading the array in order tells you
+    # exactly where time went: STT latency, LLM TTFT, tool-call duration,
+    # TTS synthesis, post-tool-call dead time.
+    events: list[dict] = []
+
+    def _record(event_type: str, **fields) -> None:
+        events.append({
+            "t": round((datetime.now() - started_at).total_seconds(), 3),
+            "event": event_type,
+            **fields,
+        })
+
+    # Metrics from the framework's STT / LLM / TTS instrumentation. Includes
+    # TTFT, duration, token counts (including cache hits — important for
+    # verifying prompt caching is working).
     @session.on("metrics_collected")
     def _on_metrics(ev) -> None:
         m = getattr(ev, "metrics", None)
         if m is None:
             return
-        # LLMMetrics, STTMetrics, TTSMetrics — log a compact one-liner
-        # with whatever attrs are present.
         kind = type(m).__name__
         attrs = {}
         for k in ("ttft", "duration", "prompt_tokens", "completion_tokens",
@@ -376,8 +389,60 @@ async def entrypoint(ctx: JobContext) -> None:
                 attrs[k] = round(v, 3) if isinstance(v, float) else v
         if attrs:
             log.info("metrics %s: %s", kind, attrs)
+            _record(f"metrics.{kind}", **attrs)
 
-    started_at = datetime.now()
+    # Agent state transitions: listening (waiting for user) -> thinking
+    # (LLM running) -> speaking (TTS playing). Gaps between these tell us
+    # where the wall-clock time is being spent.
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev) -> None:
+        new_state = getattr(ev, "new_state", None) or getattr(ev, "state", None)
+        old_state = getattr(ev, "old_state", None)
+        log.info("agent_state %s -> %s", old_state, new_state)
+        _record("agent_state", state=str(new_state), prev=str(old_state) if old_state else None)
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev) -> None:
+        new_state = getattr(ev, "new_state", None) or getattr(ev, "state", None)
+        _record("user_state", state=str(new_state))
+
+    # STT finalization — useful for measuring "STT finalize -> LLM start" gap.
+    @session.on("user_input_transcribed")
+    def _on_user_input(ev) -> None:
+        text = getattr(ev, "transcript", None) or getattr(ev, "text", None)
+        is_final = getattr(ev, "is_final", None)
+        if is_final is False:
+            return  # skip interim transcripts to avoid noise
+        _record("user_input_transcribed", text=text)
+
+    # Each item the framework adds to session.history (user msg, assistant
+    # msg, tool call, tool output). Lets us correlate timeline with content.
+    @session.on("conversation_item_added")
+    def _on_item_added(ev) -> None:
+        item = getattr(ev, "item", None)
+        if item is None:
+            return
+        kind = type(item).__name__
+        info: dict = {"item_type": kind}
+        for attr in ("role", "name", "call_id", "interrupted"):
+            v = getattr(item, attr, None)
+            if v is not None:
+                info[attr] = v
+        # Truncate content to keep timeline readable; full content is in `items`.
+        content = getattr(item, "content", None) or getattr(item, "output", None)
+        if isinstance(content, list):
+            content = " ".join(getattr(b, "text", str(b)) for b in content)
+        if content:
+            info["preview"] = (str(content)[:120] + "...") if len(str(content)) > 120 else str(content)
+        _record("conversation_item_added", **info)
+
+    # Tool execution boundaries — confirms the post-tool-call dead time we've
+    # been hunting (LLM call after tool result returning sometimes waits ~7s).
+    @session.on("function_tools_executed")
+    def _on_tools_executed(ev) -> None:
+        calls = getattr(ev, "function_calls", None) or []
+        names = [getattr(c, "name", None) for c in calls]
+        _record("function_tools_executed", names=names, count=len(names))
 
     async def write_transcript() -> None:
         """On shutdown, dump session.history to JSON for after-the-fact review.
@@ -417,6 +482,8 @@ async def entrypoint(ctx: JobContext) -> None:
                 "ended_at": datetime.now().isoformat(),
                 "duration_seconds": (datetime.now() - started_at).total_seconds(),
                 "item_count": len(items),
+                "event_count": len(events),
+                "events": events,
                 "items": items,
             }
             out.write_text(json.dumps(transcript, indent=2, default=str))
