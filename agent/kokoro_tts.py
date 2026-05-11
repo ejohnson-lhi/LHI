@@ -141,18 +141,30 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             mime_type="audio/pcm",
         )
 
+        kokoro = self._tts._kokoro
+        text = self.input_text
+
+        def _synth_and_encode() -> bytes:
+            # Run synthesis AND the float32→int16 conversion on the worker
+            # thread. The numpy clip/multiply/cast looks cheap but on a
+            # CPU-constrained host with ONNX Runtime intra-op threads still
+            # winding down, this can hold the asyncio loop's GIL for tens of
+            # ms. That long enough to underrun ParticipantAudioOutput's
+            # ~250 ms buffer and produce within-word silence gaps in the
+            # published Opus stream. Keeping everything off-loop fixes it.
+            samples, sr = kokoro.create(text, voice=opts.voice, speed=opts.speed, lang=opts.lang)
+            if sr != KOKORO_SAMPLE_RATE:
+                raise APIConnectionError(
+                    f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"
+                )
+            # samples is float32 in [-1, 1]. LiveKit wants 16-bit signed PCM
+            # little-endian. Clip first to avoid overflow on out-of-range
+            # samples (rare but defensive).
+            pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+            return pcm16.tobytes()
+
         try:
-            # Kokoro is sync + CPU-bound. ONNX Runtime releases the GIL
-            # during inference, so to_thread genuinely runs it off the
-            # event loop and other coroutines (LiveKit I/O, LLM, STT) keep
-            # running concurrently.
-            samples, sr = await asyncio.to_thread(
-                self._tts._kokoro.create,
-                self.input_text,
-                voice=opts.voice,
-                speed=opts.speed,
-                lang=opts.lang,
-            )
+            pcm_bytes = await asyncio.to_thread(_synth_and_encode)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -160,16 +172,5 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             # Wrap so the framework's retry/backoff sees a known exception.
             raise APIConnectionError(f"Kokoro synthesis failed: {e}") from e
 
-        if sr != KOKORO_SAMPLE_RATE:
-            raise APIConnectionError(
-                f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"
-            )
-
-        # samples is float32 in [-1, 1]. LiveKit wants 16-bit signed PCM
-        # little-endian. Clip first to avoid overflow on out-of-range
-        # samples (rare but defensive).
-        clipped = np.clip(samples, -1.0, 1.0)
-        pcm16 = (clipped * 32767.0).astype(np.int16)
-
-        output_emitter.push(pcm16.tobytes())
+        output_emitter.push(pcm_bytes)
         output_emitter.flush()
