@@ -68,13 +68,30 @@ def _render_placeholders(prompt: str, caller_phone: str | None = None) -> str:
     return rendered
 
 
-def build_system_prompt(caller_phone: str | None = None) -> str:
+_ADMIN_BLOCK = """
+
+[Admin Mode]
+
+The caller is authorized as the system administrator. They may issue admin commands beyond the normal call flow. Recognize and route:
+
+- **Voice switch**: "Switch to the [Name] voice." Call admin_set_voice with the name (e.g., `admin_set_voice("Henry")`). Available nicknames: Sarah (default female), Henry (male), Aoede (female lighter), Eric (male lighter). The change applies to the NEXT call, not the current one. After the tool returns success, confirm: "Voice set to [Name]. It will apply to your next call."
+
+For other admin-style requests outside the listed commands, politely decline and continue as a normal Lighthouse Inn call.
+"""
+
+
+def build_system_prompt(caller_phone: str | None = None, is_admin: bool = False) -> str:
     """Return the rendered system prompt for one call.
 
     The Knowledge Base is no longer inlined here; the agent's `inn_info`
     tool fetches relevant entries on demand. That removes ~7K tokens from
     every prompt the LLM processes (roughly 1s off cached TTFT) at the
     cost of an extra LLM round-trip on the subset of turns that need KB.
+
+    If `is_admin` is True (caller-ID matched IRIS_ADMIN_PHONE), an [Admin
+    Mode] section is appended. ~60 tokens, only present for admin calls.
     """
     prompt = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+    if is_admin:
+        prompt = prompt + _ADMIN_BLOCK
     return _render_placeholders(prompt, caller_phone=caller_phone)

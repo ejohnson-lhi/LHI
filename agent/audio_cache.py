@@ -46,7 +46,10 @@ log = logging.getLogger("audio_cache")
 #   2 - kokoro_tts._normalize_for_tts: $NN -> "N dollars", strip hyphen
 #       from X-dollar(s). Caused by Iris pronouncing "$20" as "Dollar
 #       twenty" / "twenty-dollar" as "dollar twenty".
-CACHE_VERSION = 2
+#   3 - cache keys now include voice prefix "[voice]text" so multiple
+#       voices coexist without serving stale audio when switching;
+#       also "$NN" now -> "N dollar" (singular) for adjectival fit.
+CACHE_VERSION = 3
 
 
 class TTSAudioCache:

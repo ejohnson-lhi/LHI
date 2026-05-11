@@ -59,7 +59,10 @@ _DOLLAR_PREFIX_RE = re.compile(r"\$(\d+)\b")
 
 def _normalize_for_tts(text: str) -> str:
     text = _HYPHEN_DOLLAR_RE.sub(r"\1 \2", text)
-    text = _DOLLAR_PREFIX_RE.sub(r"\1 dollars", text)
+    # Singular "dollar" (not "dollars"): the LLM's usual phrasing puts the
+    # number in adjectival position ("a $20 fee" → "a 20 dollar fee").
+    # Plural would make it "a 20 dollars fee" which sounds awkward.
+    text = _DOLLAR_PREFIX_RE.sub(r"\1 dollar", text)
     return text
 
 
@@ -108,6 +111,17 @@ class KokoroTTS(tts.TTS):
         """Snapshot of the audio cache: entry counts + lifetime hit rate."""
         return self._cache.stats()
 
+    def cache_key(self, text: str) -> str:
+        """Cache key for `text` under the current voice.
+
+        Different voices produce different audio for the same input text,
+        so the voice has to be part of the key — otherwise switching
+        IRIS_VOICE would serve stale audio from the wrong voice. Format
+        is `[voice]text` so that two voices' entries can coexist in a
+        single cache file and survive voice switches.
+        """
+        return f"[{self._opts.voice}]{text}"
+
     def prerender(self, text: str) -> None:
         """Synthesize ``text`` synchronously and stash it in the cache.
 
@@ -119,7 +133,8 @@ class KokoroTTS(tts.TTS):
         Skips if already cached (idempotent — handy when loading a
         persisted cache then re-prewarming).
         """
-        if text in self._cache:
+        key = self.cache_key(text)
+        if key in self._cache:
             return
         samples, sr = self._kokoro.create(
             _normalize_for_tts(text),
@@ -132,10 +147,10 @@ class KokoroTTS(tts.TTS):
                 f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"
             )
         pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-        self._cache.put(text, pcm)
+        self._cache.put(key, pcm)
         log.info(
-            "Pre-rendered (%d bytes, %.2fs): %r",
-            len(pcm), len(samples) / sr, text[:80],
+            "Pre-rendered (%d bytes, %.2fs, voice=%s): %r",
+            len(pcm), len(samples) / sr, self._opts.voice, text[:80],
         )
 
     @property
@@ -199,9 +214,10 @@ class _KokoroChunkedStream(tts.ChunkedStream):
         )
 
         text = self.input_text
+        key = self._tts.cache_key(text)
 
         # Cache hit: skip synth entirely, push the pre-rendered bytes.
-        cached = self._tts._cache.get(text)
+        cached = self._tts._cache.get(key)
         if cached is not None:
             log.info("TTS cache hit (%d bytes): %r", len(cached), text[:80])
             output_emitter.push(cached)
@@ -241,12 +257,10 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             # Wrap so the framework's retry/backoff sees a known exception.
             raise APIConnectionError(f"Kokoro synthesis failed: {e}") from e
 
-        # Cache the result: next time the framework asks for this exact
-        # sentence (within this worker, or across workers via the disk-
-        # persisted cache), we'll serve from cache. Useful for repeated
-        # phrases like "Is there anything else I can help you with today?"
-        # and natural-but-stable LLM phrasings.
-        self._tts._cache.put(text, pcm_bytes)
+        # Cache the result keyed by `[voice]text` so a future call with
+        # the same voice + text hits cache. Two voices keep separate
+        # entries, so switching IRIS_VOICE doesn't serve stale audio.
+        self._tts._cache.put(key, pcm_bytes)
 
         output_emitter.push(pcm_bytes)
         output_emitter.flush()

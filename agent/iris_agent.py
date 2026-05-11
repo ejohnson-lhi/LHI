@@ -53,6 +53,43 @@ HERE = Path(__file__).parent
 KOKORO_MODEL = HERE / "models" / "kokoro-v1.0.onnx"
 KOKORO_VOICES = HERE / "models" / "voices-v1.0.bin"
 
+# Which Kokoro voice Iris speaks with. The admin can switch this live by
+# calling Iris and saying "switch to the Henry voice" — see admin_set_voice
+# below. Resolution order: ~/.cache/iris/voice.txt (last admin choice) →
+# IRIS_VOICE env var → "af_sarah" default.
+#
+# Friendly-name → internal-voice map. The LLM sees these nicknames in the
+# admin prompt block and translates the spoken name to the internal key
+# when calling admin_set_voice.
+VOICE_NICKNAMES: dict[str, str] = {
+    "sarah": "af_sarah",     # default female, warm
+    "henry": "am_santa",     # male, mature
+    "aoede": "af_aoede",     # female, lighter
+    "eric": "am_eric",       # male, lighter
+}
+
+VOICE_STATE_FILE = Path.home() / ".cache" / "iris" / "voice.txt"
+
+
+def _resolve_voice() -> str:
+    """Pick voice from state file → env var → default. Tolerates a missing
+    or corrupt state file."""
+    if VOICE_STATE_FILE.exists():
+        try:
+            v = VOICE_STATE_FILE.read_text().strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    return os.environ.get("IRIS_VOICE", "af_sarah")
+
+
+# Admin's caller-ID phone number. When a call arrives from this number,
+# the agent flags is_admin=True and the system prompt gets the [Admin Mode]
+# block (instructions for handling voice-switch and other admin commands).
+# Empty/unset = no admin recognized.
+ADMIN_PHONE = os.environ.get("IRIS_ADMIN_PHONE", "")
+
 # Disk-backed TTS audio cache. LiveKit spawns a fresh worker subprocess for
 # each call (with num_idle_processes=1), so cache survives only across
 # calls via disk. Lives under ~/.cache/ since systemd's ProtectSystem=strict
@@ -190,8 +227,14 @@ class IrisAgent(Agent):
     """
 
     def __init__(self, caller_phone: str | None) -> None:
-        super().__init__(instructions=build_system_prompt(caller_phone=caller_phone))
+        self._is_admin = bool(ADMIN_PHONE) and caller_phone == ADMIN_PHONE
+        super().__init__(instructions=build_system_prompt(
+            caller_phone=caller_phone,
+            is_admin=self._is_admin,
+        ))
         self._caller_phone = caller_phone
+        if self._is_admin:
+            log.info("Caller %s recognized as admin", caller_phone)
 
     async def on_enter(self) -> None:
         # Brief wait for the SIP audio bridge to settle. Without it the
@@ -338,6 +381,34 @@ class IrisAgent(Agent):
         """Look up Lighthouse Inn details (room features, amenities, pet/smoking/parking/breakfast policy, local area, transit, hours, etc.). Use for any guest question not covered directly by your other tools or the inline system prompt."""
         return inn_info.lookup(question)
 
+    @function_tool
+    async def admin_set_voice(self, voice: str) -> str:
+        """[Admin only] Switch Iris's voice for the NEXT call. `voice` accepts a nickname (e.g. 'Henry', 'Sarah') or the internal Kokoro voice key (e.g. 'am_santa'). Use when the admin says 'switch to the [name] voice'."""
+        if not self._is_admin:
+            return json.dumps({"error": "Not authorized."})
+        # Resolve nickname → internal key. LLM may pass either form.
+        v = voice.lower().strip()
+        resolved = VOICE_NICKNAMES.get(v, voice)
+        # Validate against what Kokoro actually loaded.
+        kokoro = self.session.tts._kokoro
+        available = set(kokoro.get_voices())
+        if resolved not in available:
+            return json.dumps({
+                "error": f"Unknown voice: {voice}",
+                "valid_nicknames": list(VOICE_NICKNAMES),
+            })
+        try:
+            VOICE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            VOICE_STATE_FILE.write_text(resolved)
+        except OSError as e:
+            return json.dumps({"error": f"Could not write voice state: {e}"})
+        log.info("Admin set voice to %s (next call)", resolved)
+        return json.dumps({
+            "status": "ok",
+            "voice": resolved,
+            "applies_to": "next call",
+        })
+
 
 # =============================================================================
 # Worker subprocess prewarm — runs once when each worker child starts, BEFORE
@@ -358,19 +429,22 @@ def prewarm(proc: JobProcess) -> None:
     # user listens, deletes bad WAVs, runs tools/push_deletions.bat, next
     # call resynthesizes those phrases with current code.
     cache.validate_against_wav_dir(TTS_CACHE_WAV_DIR)
+    voice = _resolve_voice()
+    log.info("Using Kokoro voice: %s", voice)
     tts = KokoroTTS(
         model_path=str(KOKORO_MODEL),
         voices_path=str(KOKORO_VOICES),
-        voice="af_sarah",
+        voice=voice,
         cache=cache,
     )
     log.info("Pre-rendering greeting chunks (skipped if already cached)...")
     for chunk in GREETING_CHUNKS:
         tts.prerender(chunk)
-    # Ringback tone — synthesized from numpy (NOT via Kokoro). Inserted
-    # unconditionally on every prewarm so a stale-cache wipe or WAV-
-    # manifest invalidation can't ever leave on_enter without it.
-    cache.put(RINGBACK_CACHE_KEY, _generate_ringback_pcm())
+    # Ringback tone — synthesized from numpy (NOT via Kokoro), but stored
+    # under the voice-aware cache key so on_enter's session.say() lookup
+    # finds it. Inserted unconditionally on every prewarm so a stale
+    # cache wipe or WAV-manifest invalidation can't break on_enter.
+    cache.put(tts.cache_key(RINGBACK_CACHE_KEY), _generate_ringback_pcm())
     log.info("Cached ringback tone (%.1fs).", RINGBACK_DURATION_S)
     log.info("Kokoro TTS prewarmed; cache stats: %s", cache.stats())
     proc.userdata["kokoro_tts"] = tts
