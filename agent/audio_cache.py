@@ -110,24 +110,54 @@ class TTSAudioCache:
         """Pickle current cache to `persist_path`. Atomic rename pattern
         so a crash mid-write can't leave a corrupt file in place.
 
+        **Merge-on-save**: before writing, re-read whatever's on disk and
+        merge with our in-memory entries. Concurrent workers (one per
+        call, with num_idle_processes=1) often hold stale snapshots; if
+        each saved its own snapshot blindly the cache would shrink as
+        later writes overwrite earlier ones with smaller views. Merging
+        means each worker contributes additively.
+
         Safe to call from a synchronous context (no asyncio dependencies).
         """
         if self._persist_path is None:
             return
         self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Re-read disk so we can union with our in-memory additions.
+        disk_entries: OrderedDict[str, bytes] = OrderedDict()
+        if self._persist_path.exists():
+            try:
+                with open(self._persist_path, "rb") as f:
+                    data = pickle.load(f)
+                if data.get("version") == CACHE_VERSION:
+                    loaded = data.get("entries")
+                    if isinstance(loaded, OrderedDict):
+                        disk_entries = loaded
+            except Exception as e:
+                log.warning("Could not re-read cache for merge: %s", e)
+
+        with self._lock:
+            merged: OrderedDict[str, bytes] = OrderedDict(disk_entries)
+            for k, v in self._cache.items():
+                # Our version wins on collision; move to MRU end.
+                merged[k] = v
+                merged.move_to_end(k)
+            # Cap to max_entries (LRU eviction).
+            while len(merged) > self._max:
+                merged.popitem(last=False)
+            # Keep our in-memory view in sync with what we're about to write,
+            # so further get/put work against the merged set.
+            self._cache = merged
+
         tmp = self._persist_path.with_suffix(".tmp")
         try:
-            with self._lock:
-                payload = {
-                    "version": CACHE_VERSION,
-                    "entries": OrderedDict(self._cache),
-                }
+            payload = {"version": CACHE_VERSION, "entries": merged}
             with open(tmp, "wb") as f:
                 pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
             tmp.replace(self._persist_path)
             log.info(
-                "Saved %d TTS cache entries (v%s) to %s",
-                len(payload["entries"]), CACHE_VERSION, self._persist_path,
+                "Saved %d TTS cache entries (v%s, merged) to %s",
+                len(merged), CACHE_VERSION, self._persist_path,
             )
         except Exception as e:
             log.warning("TTS cache save failed: %s", e)

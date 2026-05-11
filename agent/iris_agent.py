@@ -412,29 +412,45 @@ class IrisAgent(Agent):
 
     @function_tool
     async def admin_set_voice(self, voice: str) -> str:
-        """[Admin only] Switch Iris's voice for the NEXT call. `voice` accepts a nickname (e.g. 'Henry', 'Sarah') or the internal Kokoro voice key (e.g. 'am_santa'). Use when the admin says 'switch to the [name] voice'."""
+        """[Admin only] Switch Iris's voice for the NEXT call. `voice` accepts a voice nickname ('sarah', 'santa', 'aoede', 'eric'), a persona name ('Iris', 'Henry', 'Aoede', 'Eric'), or the internal Kokoro key ('af_sarah', 'am_santa', etc.). Returns a JSON object with persona_name — use that name verbatim when confirming the change to the admin."""
         if not self._is_admin:
             return json.dumps({"error": "Not authorized."})
-        # Resolve nickname → internal key. LLM may pass either form.
-        v = voice.lower().strip()
-        resolved = VOICE_NICKNAMES.get(v, voice)
+
+        v = voice.strip()
+        v_lower = v.lower()
+
+        # Resolution order: voice nickname → persona name → assume internal.
+        resolved = VOICE_NICKNAMES.get(v_lower)
+        if resolved is None:
+            # Match against persona names (case-insensitive).
+            for vm, pn in PERSONA_NAMES.items():
+                if pn.lower() == v_lower:
+                    resolved = vm
+                    break
+        if resolved is None:
+            resolved = v  # last resort: assume it's an internal voice key
+
         # Validate against what Kokoro actually loaded.
         kokoro = self.session.tts._kokoro
         available = set(kokoro.get_voices())
         if resolved not in available:
             return json.dumps({
                 "error": f"Unknown voice: {voice}",
-                "valid_nicknames": list(VOICE_NICKNAMES),
+                "valid_voice_nicknames": list(VOICE_NICKNAMES),
+                "valid_persona_names": list(PERSONA_NAMES.values()),
             })
         try:
             VOICE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             VOICE_STATE_FILE.write_text(resolved)
         except OSError as e:
             return json.dumps({"error": f"Could not write voice state: {e}"})
-        log.info("Admin set voice to %s (next call)", resolved)
+
+        new_persona = PERSONA_NAMES.get(resolved, "Iris")
+        log.info("Admin set voice to %s (persona=%s); applies next call", resolved, new_persona)
         return json.dumps({
             "status": "ok",
-            "voice": resolved,
+            "voice_model": resolved,
+            "persona_name": new_persona,
             "applies_to": "next call",
         })
 

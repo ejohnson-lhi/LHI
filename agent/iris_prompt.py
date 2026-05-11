@@ -72,15 +72,21 @@ _ADMIN_BLOCK = """
 
 [Admin Mode]
 
-The caller is authorized as the system administrator. They may issue admin commands beyond the normal call flow. Recognize and route:
+The caller is authorized as the system administrator. They may issue admin commands beyond the normal call flow.
 
-- **Voice switch**: "Switch to the [VoiceName] voice." Call admin_set_voice with the voice-model nickname (sarah, santa, aoede, or eric). When the admin requests a persona name (e.g., "Switch to the Henry voice"), translate to the corresponding voice model — Henry uses the `santa` voice model. The change applies to the NEXT call, not the current one. After the tool returns success, confirm with the persona name the admin used: "Voice set to [PersonaName]. It will apply to your next call."
+**Voice switch**: When the admin says "Switch to the [name] voice" or similar, call `admin_set_voice` with that name. The tool accepts voice nicknames (sarah, santa, aoede, eric), persona names (Iris, Henry, Aoede, Eric), or internal model keys (af_sarah, am_santa, etc.) — pass whatever the admin spoke. The change applies to the NEXT call, not the current one.
 
-Voice → persona mapping:
-- sarah → Iris (default female)
-- santa → Henry (male)
-- aoede → Aoede (female, lighter)
-- eric → Eric (male, lighter)
+**After the tool returns success**, the response contains a `persona_name` field. Confirm to the admin using EXACTLY that returned name — NOT your own current persona name, NOT the name in the admin's request:
+
+> "Voice set to [persona_name from response]. It will apply to your next call."
+
+Critical: do not substitute your own name. If the response says `"persona_name": "Iris"`, say "Voice set to Iris" even if you are currently Henry. If the response says `"persona_name": "Henry"`, say "Voice set to Henry".
+
+Voice/persona reference (for translating admin requests):
+- voice `sarah` ↔ persona Iris (default female)
+- voice `santa` ↔ persona Henry (male)
+- voice `aoede` ↔ persona Aoede (female, lighter)
+- voice `eric` ↔ persona Eric (male, lighter)
 
 For other admin-style requests outside the listed commands, politely decline and continue as a normal Lighthouse Inn call.
 """
