@@ -1,10 +1,11 @@
 @echo off
-REM Pull new Iris call recordings + transcripts from the droplet to the
-REM local project's recordings/ folder. Skips files already present.
+REM Pull new Iris call recordings + transcripts (and pre-cached TTS WAVs)
+REM from the droplet to the local project's recordings/ folder. Skips files
+REM already present. Walks subdirectories so files under recordings/tts_cache/
+REM end up under recordings\tts_cache\ on Windows.
 REM
 REM Uses Windows' built-in OpenSSH (System32\OpenSSH) by absolute path so
-REM PATH lookup quirks don't matter, and so it shares your Windows
-REM ssh-agent (no passphrase prompt per run).
+REM PATH lookup quirks don't matter, and so it shares your Windows ssh-agent.
 
 setlocal enabledelayedexpansion
 
@@ -12,8 +13,6 @@ set "REMOTE=iris@64.23.167.164"
 set "REMOTE_DIR=/opt/iris-backend/recordings"
 set "LOCAL_DIR=%~dp0..\recordings"
 
-REM Find Windows OpenSSH. Sysnative is the 32-bit-process alias for the
-REM real 64-bit System32; check it first in case this cmd is 32-bit.
 if exist "%SystemRoot%\Sysnative\OpenSSH\ssh.exe" (
     set "SSH=%SystemRoot%\Sysnative\OpenSSH\ssh.exe"
     set "SCP=%SystemRoot%\Sysnative\OpenSSH\scp.exe"
@@ -29,11 +28,12 @@ if not exist "%LOCAL_DIR%" mkdir "%LOCAL_DIR%"
 
 echo Local destination: %LOCAL_DIR%
 echo Using ssh: %SSH%
-echo Listing remote files on %REMOTE%...
+echo Listing remote files (recursive) on %REMOTE%...
 
 set "TMP=%TEMP%\iris_remote_%RANDOM%.txt"
-REM Filter on the remote side — only .ogg, .wav, and .json files.
-"%SSH%" %REMOTE% "ls -1 %REMOTE_DIR% | grep -E '\.(ogg|wav|json)$'" > "%TMP%"
+REM find -printf '%P\n' gives paths relative to REMOTE_DIR (no leading slash).
+REM The %%P escapes one % in batch so the remote bash sees the literal %P.
+"%SSH%" %REMOTE% "find %REMOTE_DIR% -type f \( -name '*.ogg' -o -name '*.wav' -o -name '*.json' \) -printf '%%P\n'" > "%TMP%"
 if errorlevel 1 (
     echo.
     echo ERROR: ssh failed.
@@ -43,12 +43,19 @@ if errorlevel 1 (
 
 set /a NEW=0
 set /a TOTAL=0
-for /f "usebackq delims=" %%f in ("%TMP%") do (
-    set "F=%%f"
+for /f "usebackq delims=" %%F in ("%TMP%") do (
+    set "REL=%%F"
     set /a TOTAL+=1
-    if not exist "%LOCAL_DIR%\!F!" (
-        echo Pulling: !F!
-        "%SCP%" -q "%REMOTE%:%REMOTE_DIR%/!F!" "%LOCAL_DIR%"
+    REM Convert remote forward slashes to Windows backslashes.
+    set "REL_WIN=!REL:/=\!"
+    set "LOCAL_FILE=%LOCAL_DIR%\!REL_WIN!"
+    if not exist "!LOCAL_FILE!" (
+        REM Extract parent dir from the full local path and mkdir it.
+        for %%D in ("!LOCAL_FILE!") do (
+            if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>&1
+        )
+        echo Pulling: !REL!
+        "%SCP%" -q "%REMOTE%:%REMOTE_DIR%/!REL!" "!LOCAL_FILE!"
         set /a NEW+=1
     )
 )

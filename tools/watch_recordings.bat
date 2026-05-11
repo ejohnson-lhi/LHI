@@ -1,10 +1,10 @@
 @echo off
-REM Continuously poll the droplet every 30 seconds and pull any new
-REM recordings/transcripts. Leave this window open while testing; close
-REM it (or Ctrl-C) when done.
+REM Continuously poll the droplet every 30 seconds and pull new recordings,
+REM transcripts, and TTS-cache WAVs. Leave this window open while testing;
+REM close it (or Ctrl-C) when done.
 REM
-REM Self-contained (does not call sync_recordings.bat) to avoid arg /
-REM setlocal interactions between the two scripts.
+REM Walks subdirectories so files under recordings/tts_cache/ end up
+REM under recordings\tts_cache\ on Windows.
 
 setlocal enabledelayedexpansion
 
@@ -34,7 +34,7 @@ echo.
 :loop
 echo [%TIME%] checking...
 set "TMP=%TEMP%\iris_watch_%RANDOM%.txt"
-"%SSH%" %REMOTE% "ls -1 %REMOTE_DIR% | grep -E '\.(ogg|wav|json)$'" > "%TMP%" 2>nul
+"%SSH%" %REMOTE% "find %REMOTE_DIR% -type f \( -name '*.ogg' -o -name '*.wav' -o -name '*.json' \) -printf '%%P\n'" > "%TMP%" 2>nul
 if errorlevel 1 (
     echo [%TIME%] ssh failed, will retry next cycle.
     del "%TMP%" 2>nul
@@ -42,11 +42,16 @@ if errorlevel 1 (
 )
 
 set /a NEW=0
-for /f "usebackq delims=" %%f in ("%TMP%") do (
-    set "F=%%f"
-    if not exist "%LOCAL_DIR%\!F!" (
-        echo [%TIME%] pulling !F!
-        "%SCP%" -q "%REMOTE%:%REMOTE_DIR%/!F!" "%LOCAL_DIR%"
+for /f "usebackq delims=" %%F in ("%TMP%") do (
+    set "REL=%%F"
+    set "REL_WIN=!REL:/=\!"
+    set "LOCAL_FILE=%LOCAL_DIR%\!REL_WIN!"
+    if not exist "!LOCAL_FILE!" (
+        for %%D in ("!LOCAL_FILE!") do (
+            if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>&1
+        )
+        echo [%TIME%] pulling !REL!
+        "%SCP%" -q "%REMOTE%:%REMOTE_DIR%/!REL!" "!LOCAL_FILE!"
         set /a NEW+=1
     )
 )

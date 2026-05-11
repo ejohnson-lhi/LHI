@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -44,6 +45,18 @@ log = logging.getLogger(__name__)
 # Kokoro v1.0 always returns 24 kHz mono float32 in [-1, 1].
 KOKORO_SAMPLE_RATE = 24000
 KOKORO_NUM_CHANNELS = 1
+
+
+# espeak-ng (the phonemizer kokoro-onnx wraps) inverts hyphenated
+# number-dollar compounds: "twenty-dollar fee" is spoken as "dollar
+# twenty fee" — sounds like "$1.20" to callers. Strip the hyphen so it
+# reads correctly. Caught after live calls where Iris quoted the pet
+# fee as "$1.20" instead of "$20".
+_HYPHEN_DOLLAR_RE = re.compile(r"\b(\w+)-(dollars?)\b", re.IGNORECASE)
+
+
+def _normalize_for_tts(text: str) -> str:
+    return _HYPHEN_DOLLAR_RE.sub(r"\1 \2", text)
 
 
 @dataclass
@@ -105,7 +118,7 @@ class KokoroTTS(tts.TTS):
         if text in self._cache:
             return
         samples, sr = self._kokoro.create(
-            text,
+            _normalize_for_tts(text),
             voice=self._opts.voice,
             speed=self._opts.speed,
             lang=self._opts.lang,
@@ -201,7 +214,10 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             # ms. That long enough to underrun ParticipantAudioOutput's
             # ~250 ms buffer and produce within-word silence gaps in the
             # published Opus stream. Keeping everything off-loop fixes it.
-            samples, sr = kokoro.create(text, voice=opts.voice, speed=opts.speed, lang=opts.lang)
+            samples, sr = kokoro.create(
+                _normalize_for_tts(text),
+                voice=opts.voice, speed=opts.speed, lang=opts.lang,
+            )
             if sr != KOKORO_SAMPLE_RATE:
                 raise APIConnectionError(
                     f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"

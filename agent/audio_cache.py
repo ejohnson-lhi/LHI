@@ -24,8 +24,11 @@ Design:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import pickle
+import re
+import wave
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
@@ -141,3 +144,38 @@ class TTSAudioCache:
                 "misses": self._misses,
                 "hit_rate": round(self._hits / total, 3) if total else 0.0,
             }
+
+    # ----- WAV export (for human inspection / download) -----
+
+    def dump_to_wav_dir(
+        self,
+        dir_path: Path,
+        sample_rate: int = 24000,
+    ) -> int:
+        """Write each cache entry as a 16-bit mono WAV in `dir_path`.
+
+        Filenames are sanitized phrase prefix + short MD5 hash, e.g.
+        ``lighthouse_inn_this_is_iris_the_ai_assistant_9c1a3d2f.wav``.
+        Hash suffix prevents collisions when two phrases sanitize to the
+        same prefix. Re-writes existing files (idempotent).
+
+        Returns number of files written.
+        """
+        dir_path.mkdir(parents=True, exist_ok=True)
+        count = 0
+        with self._lock:
+            snapshot = list(self._cache.items())
+        for text, pcm in snapshot:
+            safe = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()[:60]
+            h = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+            wav_path = dir_path / f"{safe}_{h}.wav"
+            try:
+                with wave.open(str(wav_path), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(sample_rate)
+                    w.writeframes(pcm)
+                count += 1
+            except OSError as e:
+                log.warning("Could not write %s: %s", wav_path, e)
+        return count

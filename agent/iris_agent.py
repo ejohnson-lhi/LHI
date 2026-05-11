@@ -58,6 +58,14 @@ KOKORO_VOICES = HERE / "models" / "voices-v1.0.bin"
 # allows /home/iris/.cache (already in the unit's ReadWritePaths).
 TTS_CACHE_PATH = Path.home() / ".cache" / "iris" / "tts_cache.pkl"
 
+# Subfolder of the recordings dir where we ALSO dump each cached entry as
+# a WAV file at shutdown — handy for listening to what's in the cache and
+# spotting TTS mispronunciations. The recordings dir is already in
+# ReadWritePaths and is synced to Windows by sync_recordings.bat.
+TTS_CACHE_WAV_DIR = Path(os.environ.get(
+    "IRIS_TTS_CACHE_WAV_DIR", "/opt/iris-backend/recordings/tts_cache"
+))
+
 BACKEND_URL = os.environ.get("IRIS_BACKEND_URL", "http://127.0.0.1:8000")
 BACKEND_TIMEOUT_S = 15.0
 
@@ -558,11 +566,24 @@ async def entrypoint(ctx: JobContext) -> None:
     async def save_tts_cache() -> None:
         """Persist the TTS audio cache to disk so subsequent worker
         subprocesses (and post-deploy restarts) start with the same
-        entries already warm."""
+        entries already warm.
+
+        Also dump each cached entry as a WAV file in the recordings
+        subfolder so they sync to the Windows side and can be listened
+        to for pronunciation review.
+        """
         try:
             tts = ctx.proc.userdata.get("kokoro_tts")
-            if tts is not None:
-                await asyncio.to_thread(tts._cache.save)
+            if tts is None:
+                return
+            await asyncio.to_thread(tts._cache.save)
+            count = await asyncio.to_thread(
+                tts._cache.dump_to_wav_dir, TTS_CACHE_WAV_DIR
+            )
+            log.info(
+                "Dumped %d cached phrases as WAV to %s",
+                count, TTS_CACHE_WAV_DIR,
+            )
         except Exception:
             log.exception("Failed to save TTS cache")
 
