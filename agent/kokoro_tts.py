@@ -37,6 +37,8 @@ from livekit.agents import (
 )
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
+from audio_cache import TTSAudioCache
+
 log = logging.getLogger(__name__)
 
 # Kokoro v1.0 always returns 24 kHz mono float32 in [-1, 1].
@@ -62,6 +64,7 @@ class KokoroTTS(tts.TTS):
         voice: str = "af_sarah",
         speed: float = 1.0,
         lang: str = "en-us",
+        cache: TTSAudioCache | None = None,
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
@@ -80,6 +83,36 @@ class KokoroTTS(tts.TTS):
                 f"Choose from: {sorted(v for v in available if v.startswith(('af_', 'am_')))}"
             )
         log.info("Kokoro loaded; %d total voices, using %s", len(available), voice)
+        # Audio cache lets us serve pre-rendered greeting + repeated LLM
+        # phrases without invoking Kokoro at all. See agent/audio_cache.py.
+        self._cache = cache if cache is not None else TTSAudioCache()
+
+    def prerender(self, text: str) -> None:
+        """Synthesize ``text`` synchronously and stash it in the permanent
+        cache. Call this at worker startup for fixed phrases (greeting,
+        common closings) so subsequent synthesize() calls with the same
+        text return instantly.
+
+        Skips if already cached (idempotent).
+        """
+        if text in self._cache:
+            return
+        samples, sr = self._kokoro.create(
+            text,
+            voice=self._opts.voice,
+            speed=self._opts.speed,
+            lang=self._opts.lang,
+        )
+        if sr != KOKORO_SAMPLE_RATE:
+            raise APIConnectionError(
+                f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"
+            )
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        self._cache.put_fixed(text, pcm)
+        log.info(
+            "Pre-rendered (%d bytes, %.2fs): %r",
+            len(pcm), len(samples) / sr, text[:80],
+        )
 
     @property
     def model(self) -> str:
@@ -141,8 +174,17 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             mime_type="audio/pcm",
         )
 
-        kokoro = self._tts._kokoro
         text = self.input_text
+
+        # Cache hit: skip synth entirely, push the pre-rendered bytes.
+        cached = self._tts._cache.get(text)
+        if cached is not None:
+            log.info("TTS cache hit (%d bytes): %r", len(cached), text[:80])
+            output_emitter.push(cached)
+            output_emitter.flush()
+            return
+
+        kokoro = self._tts._kokoro
 
         def _synth_and_encode() -> bytes:
             # Run synthesis AND the float32→int16 conversion on the worker
@@ -171,6 +213,12 @@ class _KokoroChunkedStream(tts.ChunkedStream):
             # Anything from kokoro-onnx (bad text, ORT crash) surfaces here.
             # Wrap so the framework's retry/backoff sees a known exception.
             raise APIConnectionError(f"Kokoro synthesis failed: {e}") from e
+
+        # Auto-cache: next time the framework asks for this exact sentence,
+        # we'll serve it from cache. Useful for frequently-repeated phrases
+        # ("Is there anything else I can help you with today?", greeting
+        # variants, common direct-answer phrasings, etc.).
+        self._tts._cache.put_auto(text, pcm_bytes)
 
         output_emitter.push(pcm_bytes)
         output_emitter.flush()

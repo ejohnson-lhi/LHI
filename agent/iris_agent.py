@@ -40,6 +40,7 @@ from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
 from livekit.plugins import anthropic, deepgram, silero
 
 import inn_info
+from audio_cache import TTSAudioCache
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
 
@@ -64,6 +65,16 @@ TRANSCRIPTS_DIR = Path(os.environ.get(
 # First message text. Same wording the previous Vapi setup used. Spoken
 # verbatim (not LLM-generated) so the greeting is consistent across calls.
 FIRST_MESSAGE = "Lighthouse Inn, this is Iris, the AI assistant. How may I help you?"
+
+# Sentences the LiveKit TTS layer will actually call .synthesize() with
+# when session.say(FIRST_MESSAGE) runs. The framework splits at sentence
+# boundaries before invoking TTS, so cache keys must match the post-split
+# chunks (verified empirically from per-call TTSMetrics: 47 chars + 19 chars).
+# Pre-rendered at prewarm so the first call's greeting has zero TTS wait.
+GREETING_CHUNKS = [
+    "Lighthouse Inn, this is Iris, the AI assistant.",
+    "How may I help you?",
+]
 
 
 # =============================================================================
@@ -296,12 +307,18 @@ class IrisAgent(Agent):
 
 def prewarm(proc: JobProcess) -> None:
     log.info("Prewarming Kokoro TTS model...")
-    proc.userdata["kokoro_tts"] = KokoroTTS(
+    cache = TTSAudioCache(max_auto_entries=200)
+    tts = KokoroTTS(
         model_path=str(KOKORO_MODEL),
         voices_path=str(KOKORO_VOICES),
         voice="af_sarah",
+        cache=cache,
     )
-    log.info("Kokoro TTS prewarmed and ready.")
+    log.info("Pre-rendering greeting chunks...")
+    for chunk in GREETING_CHUNKS:
+        tts.prerender(chunk)
+    log.info("Kokoro TTS prewarmed; cache stats: %s", cache.stats())
+    proc.userdata["kokoro_tts"] = tts
 
 
 # =============================================================================
