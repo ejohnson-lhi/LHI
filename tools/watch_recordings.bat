@@ -34,7 +34,7 @@ echo.
 :loop
 echo [%TIME%] checking...
 set "TMP=%TEMP%\iris_watch_%RANDOM%.txt"
-"%SSH%" %REMOTE% "ls -1 %REMOTE_DIR% | grep -E '\.(ogg|json)$'" > "%TMP%" 2>nul
+"%SSH%" %REMOTE% "ls -1 %REMOTE_DIR% | grep -E '\.(ogg|wav|json)$'" > "%TMP%" 2>nul
 if errorlevel 1 (
     echo [%TIME%] ssh failed, will retry next cycle.
     del "%TMP%" 2>nul

@@ -32,8 +32,8 @@ echo Using ssh: %SSH%
 echo Listing remote files on %REMOTE%...
 
 set "TMP=%TEMP%\iris_remote_%RANDOM%.txt"
-REM Filter on the remote side — only .ogg and .json files.
-"%SSH%" %REMOTE% "ls -1 %REMOTE_DIR% | grep -E '\.(ogg|json)$'" > "%TMP%"
+REM Filter on the remote side — only .ogg, .wav, and .json files.
+"%SSH%" %REMOTE% "ls -1 %REMOTE_DIR% | grep -E '\.(ogg|wav|json)$'" > "%TMP%"
 if errorlevel 1 (
     echo.
     echo ERROR: ssh failed.
