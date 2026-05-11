@@ -23,8 +23,13 @@ StandardError=journal
 # Hardening (matches iris-backend.service)
 NoNewPrivileges=true
 ProtectSystem=strict
-# Agent needs to read model cache + write Hugging Face downloads
-ReadWritePaths=/home/iris/.cache /opt/iris-backend/agent
+# Writable paths:
+#  - /home/iris/.cache — Hugging Face model downloads
+#  - /opt/iris-backend/agent — venv + transient artifacts
+#  - /opt/iris-backend/recordings — per-call transcript JSONs the agent
+#    writes from its shutdown callback (Egress also writes OGGs here from
+#    inside its container — that path bypasses systemd hardening)
+ReadWritePaths=/home/iris/.cache /opt/iris-backend/agent /opt/iris-backend/recordings
 PrivateTmp=true
 
 [Install]

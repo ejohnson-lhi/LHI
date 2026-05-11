@@ -69,7 +69,10 @@ if errorlevel 1 (
 echo.
 
 echo === Pulling on droplet and restarting agent service ===
-"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo systemctl restart iris-agent.service && echo --- service status --- && sudo systemctl status iris-agent.service --no-pager -l | head -20"
+REM On the droplet: pull, sync the systemd unit file (idempotent — only
+REM reloads if cp actually changed anything since cp -u checks mtime),
+REM then restart the agent service.
+"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo systemctl daemon-reload && sudo systemctl restart iris-agent.service && echo --- service status --- && sudo systemctl status iris-agent.service --no-pager -l | head -20"
 
 REM Clear the message file so a stale message doesn't get reused on the next run.
 if exist "%MSG_FILE%" del "%MSG_FILE%"
