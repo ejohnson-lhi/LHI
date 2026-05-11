@@ -60,13 +60,30 @@ KOKORO_VOICES = HERE / "models" / "voices-v1.0.bin"
 #
 # Friendly-name → internal-voice map. The LLM sees these nicknames in the
 # admin prompt block and translates the spoken name to the internal key
-# when calling admin_set_voice.
+# when calling admin_set_voice. Nicknames follow the Kokoro model pattern
+# (af_sarah → sarah, am_santa → santa) so they're easy to remember.
 VOICE_NICKNAMES: dict[str, str] = {
-    "sarah": "af_sarah",     # default female, warm
-    "henry": "am_santa",     # male, mature
-    "aoede": "af_aoede",     # female, lighter
-    "eric": "am_eric",       # male, lighter
+    "sarah": "af_sarah",
+    "santa": "am_santa",
+    "aoede": "af_aoede",
+    "eric":  "am_eric",
 }
+
+# Per-voice persona name — what Iris calls herself when using that voice.
+# Decoupled from the voice MODEL nickname so "Santa" voice (Kokoro model
+# am_santa) can be introduced to callers as "Henry" rather than "Santa".
+# Used in the greeting and substituted throughout the system prompt so
+# the LLM consistently refers to itself by the persona name.
+PERSONA_NAMES: dict[str, str] = {
+    "af_sarah": "Iris",
+    "am_santa": "Henry",
+    "af_aoede": "Aoede",
+    "am_eric":  "Eric",
+}
+
+
+def _persona_for(voice: str) -> str:
+    return PERSONA_NAMES.get(voice, "Iris")
 
 VOICE_STATE_FILE = Path.home() / ".cache" / "iris" / "voice.txt"
 
@@ -114,19 +131,24 @@ TRANSCRIPTS_DIR = Path(os.environ.get(
     "IRIS_TRANSCRIPTS_DIR", "/opt/iris-backend/recordings"
 ))
 
-# First message text. Same wording the previous Vapi setup used. Spoken
-# verbatim (not LLM-generated) so the greeting is consistent across calls.
-FIRST_MESSAGE = "Lighthouse Inn, this is Iris, the AI assistant. How may I help you?"
+# First message template. The persona name is substituted per voice
+# (Iris for af_sarah, Henry for am_santa, etc.). Spoken verbatim (not
+# LLM-generated) so the greeting is consistent across calls.
+FIRST_MESSAGE_TEMPLATE = "Lighthouse Inn, this is {persona}, the AI assistant. How may I help you?"
 
-# Sentences the LiveKit TTS layer will actually call .synthesize() with
-# when session.say(FIRST_MESSAGE) runs. The framework splits at sentence
-# boundaries before invoking TTS, so cache keys must match the post-split
-# chunks (verified empirically from per-call TTSMetrics: 47 chars + 19 chars).
-# Pre-rendered at prewarm so the first call's greeting has zero TTS wait.
-GREETING_CHUNKS = [
-    "Lighthouse Inn, this is Iris, the AI assistant.",
-    "How may I help you?",
-]
+
+def _first_message_for(persona: str) -> str:
+    return FIRST_MESSAGE_TEMPLATE.format(persona=persona)
+
+
+def _greeting_chunks_for(persona: str) -> list[str]:
+    """Sentence-split version of the greeting — what LiveKit's TTS layer
+    actually calls .synthesize() with. Each chunk gets pre-rendered into
+    the cache at prewarm so the greeting plays as cache hits (instant)."""
+    return [
+        f"Lighthouse Inn, this is {persona}, the AI assistant.",
+        "How may I help you?",
+    ]
 
 # Synthetic ringback tone (440 + 480 Hz dual-tone, ~1.5s) played as the
 # agent's very first audio. LiveKit-SIP answers calls with 200 OK
@@ -226,11 +248,13 @@ class IrisAgent(Agent):
     as the default phone for tool calls that need caller-ID.
     """
 
-    def __init__(self, caller_phone: str | None) -> None:
+    def __init__(self, caller_phone: str | None, persona: str = "Iris") -> None:
         self._is_admin = bool(ADMIN_PHONE) and caller_phone == ADMIN_PHONE
+        self._persona = persona
         super().__init__(instructions=build_system_prompt(
             caller_phone=caller_phone,
             is_admin=self._is_admin,
+            persona=persona,
         ))
         self._caller_phone = caller_phone
         if self._is_admin:
@@ -241,17 +265,22 @@ class IrisAgent(Agent):
         # first audio plays into a void on some carriers.
         await asyncio.sleep(0.3)
         # Play a synthetic ringback tone first so the caller hears a
-        # familiar "one ring" before Iris speaks — LiveKit-SIP answers
-        # with 200 OK immediately so Twilio can't generate real PSTN
-        # ringback. The tone is pre-cached in prewarm(), so this is an
-        # instant cache hit, not a synthesis call.
+        # familiar "one ring" before the agent speaks — LiveKit-SIP
+        # answers with 200 OK immediately so Twilio can't generate real
+        # PSTN ringback. The tone is pre-cached in prewarm(), so this is
+        # an instant cache hit, not a synthesis call.
         log.info("Agent on_enter: playing ringback tone")
         await self.session.say(RINGBACK_CACHE_KEY, allow_interruptions=False)
-        log.info("Agent on_enter: speaking first message")
-        # allow_interruptions=False so the greeting plays even if the caller
-        # speaks first ("Hello?", "Anyone there?") — happens less now with
-        # the ringback, but still good defense.
-        await self.session.say(FIRST_MESSAGE, allow_interruptions=False)
+        # Greeting uses the persona name for the current voice. Cache key
+        # is voice-aware so this is also a cache hit (pre-rendered in
+        # prewarm or entrypoint when voice changed).
+        voice = self.session.tts._opts.voice
+        persona = _persona_for(voice)
+        first_message = _first_message_for(persona)
+        log.info("Agent on_enter: speaking first message (voice=%s, persona=%s)", voice, persona)
+        # allow_interruptions=False so the greeting plays even if the
+        # caller speaks first.
+        await self.session.say(first_message, allow_interruptions=False)
 
     # -------------------------------------------------------------------------
     # Tools — JSON return values, all proxied to backend's existing handlers.
@@ -430,7 +459,8 @@ def prewarm(proc: JobProcess) -> None:
     # call resynthesizes those phrases with current code.
     cache.validate_against_wav_dir(TTS_CACHE_WAV_DIR)
     voice = _resolve_voice()
-    log.info("Using Kokoro voice: %s", voice)
+    persona = _persona_for(voice)
+    log.info("Using Kokoro voice: %s (persona=%s)", voice, persona)
     tts = KokoroTTS(
         model_path=str(KOKORO_MODEL),
         voices_path=str(KOKORO_VOICES),
@@ -438,7 +468,7 @@ def prewarm(proc: JobProcess) -> None:
         cache=cache,
     )
     log.info("Pre-rendering greeting chunks (skipped if already cached)...")
-    for chunk in GREETING_CHUNKS:
+    for chunk in _greeting_chunks_for(persona):
         tts.prerender(chunk)
     # Ringback tone — synthesized from numpy (NOT via Kokoro), but stored
     # under the voice-aware cache key so on_enter's session.say() lookup
@@ -458,6 +488,32 @@ def prewarm(proc: JobProcess) -> None:
 async def entrypoint(ctx: JobContext) -> None:
     log.info("Job received for room %s", ctx.room.name)
     await ctx.connect()
+
+    # Re-read voice state file in case admin_set_voice was called by an
+    # earlier call AFTER this worker finished prewarming. Without this,
+    # voice switches don't take effect until two calls later (one to
+    # write voice.txt, one to spawn a worker that prewarms with the new
+    # value). With this, the switch applies on the very next call.
+    tts: KokoroTTS = ctx.proc.userdata["kokoro_tts"]
+    desired_voice = _resolve_voice()
+    if desired_voice != tts._opts.voice:
+        log.info(
+            "Voice changed since prewarm: %s -> %s; switching + re-rendering greeting",
+            tts._opts.voice, desired_voice,
+        )
+        tts.update_options(voice=desired_voice)
+        # Synchronously re-render greeting in the new voice. ~5s blocking
+        # cost on the call where voice just changed; subsequent calls have
+        # this worker's prewarm picking up the right voice from voice.txt
+        # so they're instant.
+        new_persona = _persona_for(desired_voice)
+        for chunk in _greeting_chunks_for(new_persona):
+            await asyncio.to_thread(tts.prerender, chunk)
+        # Ringback tone is voice-independent (a tone, not speech) but the
+        # cache key is voice-prefixed, so the new voice needs its own
+        # entry. Re-insert from numpy — same audio bytes, just under the
+        # new voice's key.
+        tts._cache.put(tts.cache_key(RINGBACK_CACHE_KEY), _generate_ringback_pcm())
 
     # Wait for the SIP participant to join the room so we can pull the
     # caller's phone number off their attributes. SIP participants come in
@@ -702,7 +758,10 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(write_transcript)
     ctx.add_shutdown_callback(save_tts_cache)
 
-    await session.start(room=ctx.room, agent=IrisAgent(caller_phone=caller_phone))
+    await session.start(
+        room=ctx.room,
+        agent=IrisAgent(caller_phone=caller_phone, persona=_persona_for(tts._opts.voice)),
+    )
 
 
 if __name__ == "__main__":
