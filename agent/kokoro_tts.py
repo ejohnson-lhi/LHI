@@ -87,6 +87,10 @@ class KokoroTTS(tts.TTS):
         # phrases without invoking Kokoro at all. See agent/audio_cache.py.
         self._cache = cache if cache is not None else TTSAudioCache()
 
+    def cache_stats(self) -> dict:
+        """Snapshot of the audio cache: entry counts + lifetime hit rate."""
+        return self._cache.stats()
+
     def prerender(self, text: str) -> None:
         """Synthesize ``text`` synchronously and stash it in the permanent
         cache. Call this at worker startup for fixed phrases (greeting,

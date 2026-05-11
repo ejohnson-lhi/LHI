@@ -520,6 +520,14 @@ async def entrypoint(ctx: JobContext) -> None:
                         d[attr] = v
                 items.append(d)
 
+            # Snapshot of the per-worker TTS audio cache. Cumulative across
+            # every call this worker has handled; lets us see whether
+            # auto-caching is actually hitting on the LLM's natural
+            # phrasings, or whether we need to tune the prompt to enforce
+            # specific canned wording.
+            tts = ctx.proc.userdata.get("kokoro_tts")
+            cache_stats = tts.cache_stats() if tts is not None else None
+
             transcript = {
                 "room": ctx.room.name,
                 "caller_phone": caller_phone,
@@ -528,6 +536,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 "duration_seconds": (datetime.now() - started_at).total_seconds(),
                 "item_count": len(items),
                 "event_count": len(events),
+                "tts_cache_stats": cache_stats,
                 "events": events,
                 "items": items,
             }
