@@ -51,3 +51,29 @@ Thumbs.db
 # --- Twilio compliance / status exports (filenames contain Account SID,
 # triggering GitHub push protection; not source anyway) ---
 SMS-AC*.csv
+
+# --- Twilio Console exports (saved web pages, reference only) ---
+Voice _ Twilio Console-*.htm
+Voice _ Twilio Console-*_files/
+
+# --- Grandstream HT802 reference docs (saved web pages + zipped firmware) ---
+HT802V2*.htm
+HT802V2*_files/
+HT802V2*/
+Release_HT80xV2_*.zip
+Release_HT80xV2_*/
+
+# --- Packet captures (debugging only, large binaries) ---
+capture-*.tgz
+capture*.tgz
+
+# --- TTS A/B testing artifacts (large model + voice files, generated audio).
+# Scripts in tools/tts_ab/*.py ARE tracked; outputs and model blobs are not.
+tools/tts_ab/kokoro-v1.0.onnx
+tools/tts_ab/voices-v1.0.bin
+tools/tts_ab/output/
+tools/tts_ab/iris_snapshot.json
+
+# --- Deploy helper: next-commit message written by Claude, consumed by
+# deploy.bat. Local only - each commit's actual message lands in git history.
+tools/.deploy_msg
