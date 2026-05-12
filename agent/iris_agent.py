@@ -452,13 +452,8 @@ class IrisAgent(Agent):
 
     @function_tool
     async def transfer_to(self, destination: str) -> str:
-        """Warm-transfer the caller to a human. `destination` is 'front_desk' (the HT802-attached desk phone) or 'eric' (Eric's mobile). Dials the destination and waits up to 30 seconds for an answer. Returns JSON: status='connected' (destination joined the call) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate. On connected, briefly tell the caller and the new participant 'You're connected — I'll step out.' and then say nothing more."""
+        """Transfer the caller to a human. `destination` is 'front_desk' or 'eric'. The transfer uses SIP REFER: Twilio creates a new outbound call to the destination using the ORIGINAL caller's number as caller-ID (so the destination can call back). Iris drops off the call as soon as Twilio accepts the REFER. SAY "Connecting you to {destination} now, one moment" BEFORE invoking this tool — once the tool returns, Iris's audio path is gone. Returns JSON: status='connected' (Twilio accepted the REFER and is ringing the destination) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate."""
 
-        if not OUTBOUND_TRUNK_ID:
-            log.error("Transfer requested but IRIS_OUTBOUND_TRUNK_ID not set")
-            return json.dumps({
-                "error": "Outbound calling is not configured on the agent. Cannot transfer.",
-            })
         target = TRANSFER_TARGETS.get(destination)
         if target is None:
             return json.dumps({
@@ -471,37 +466,48 @@ class IrisAgent(Agent):
             log.error("Transfer requested but agent has no room reference")
             return json.dumps({"error": "Internal: no room available."})
         room_name = self._room.name
-        log.info("Transfer initiated: %s -> %s (room=%s)", destination, sip_to, room_name)
+
+        # Find the inbound SIP participant (the caller). LiveKit-SIP names
+        # inbound participants "sip_<E.164>" (e.g. "sip_+15419973221").
+        sip_participant_identity: str | None = None
+        for identity in self._room.remote_participants:
+            if identity.startswith("sip_"):
+                sip_participant_identity = identity
+                break
+        if sip_participant_identity is None:
+            log.error("No inbound SIP participant in room %s; cannot REFER", room_name)
+            return json.dumps({"error": "Internal: no inbound SIP participant in room."})
+
+        log.info(
+            "REFER transfer: participant=%s -> %s (%s, room=%s)",
+            sip_participant_identity, destination, sip_to, room_name,
+        )
 
         try:
             lk = api.LiveKitAPI()
             try:
-                await lk.sip.create_sip_participant(
-                    api.CreateSIPParticipantRequest(
-                        sip_trunk_id=OUTBOUND_TRUNK_ID,
-                        sip_call_to=sip_to,
+                await lk.sip.transfer_sip_participant(
+                    api.TransferSIPParticipantRequest(
+                        participant_identity=sip_participant_identity,
                         room_name=room_name,
-                        participant_identity=f"transfer-{destination}",
-                        participant_name=label,
-                        # play_dialtone=True plays ringback into the room
-                        # so the caller hears something while we wait.
+                        # tel: URI for PSTN destinations; LiveKit-SIP forwards
+                        # this as the Refer-To header to Twilio.
+                        transfer_to=f"tel:{sip_to}",
                         play_dialtone=True,
-                        wait_until_answered=True,
-                        # protobuf Duration field — needs timedelta, not int.
                         ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
                     )
                 )
             finally:
                 await lk.aclose()
-        except Exception as e:
-            log.exception("Transfer to %s failed", destination)
+        except Exception:
+            log.exception("REFER transfer to %s failed", destination)
             return json.dumps({
                 "status": "no_answer",
                 "destination": destination,
                 "display": label,
             })
 
-        log.info("Transfer to %s connected", destination)
+        log.info("REFER transfer to %s accepted by Twilio", destination)
         return json.dumps({
             "status": "connected",
             "destination": destination,
