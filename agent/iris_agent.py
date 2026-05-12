@@ -272,9 +272,18 @@ class IrisAgent(Agent):
     as the default phone for tool calls that need caller-ID.
     """
 
-    def __init__(self, caller_phone: str | None, persona: str = "Iris") -> None:
+    def __init__(
+        self,
+        caller_phone: str | None,
+        persona: str = "Iris",
+        room: rtc.Room | None = None,
+    ) -> None:
         self._is_admin = bool(ADMIN_PHONE) and caller_phone == ADMIN_PHONE
         self._persona = persona
+        # AgentSession in livekit-agents 1.5.8 doesn't expose `room` as a
+        # public attribute, so we capture ctx.room here. transfer_to needs
+        # the room name to dial an outbound SIP participant into it.
+        self._room = room
         super().__init__(instructions=build_system_prompt(
             caller_phone=caller_phone,
             is_admin=self._is_admin,
@@ -451,7 +460,11 @@ class IrisAgent(Agent):
             })
 
         sip_to, label = target
-        log.info("Transfer initiated: %s -> %s", destination, sip_to)
+        if self._room is None:
+            log.error("Transfer requested but agent has no room reference")
+            return json.dumps({"error": "Internal: no room available."})
+        room_name = self._room.name
+        log.info("Transfer initiated: %s -> %s (room=%s)", destination, sip_to, room_name)
 
         try:
             lk = api.LiveKitAPI()
@@ -460,7 +473,7 @@ class IrisAgent(Agent):
                     api.CreateSIPParticipantRequest(
                         sip_trunk_id=OUTBOUND_TRUNK_ID,
                         sip_call_to=sip_to,
-                        room_name=self.session.room.name,
+                        room_name=room_name,
                         participant_identity=f"transfer-{destination}",
                         participant_name=label,
                         # play_dialtone=True plays ringback into the room
@@ -473,7 +486,7 @@ class IrisAgent(Agent):
             finally:
                 await lk.aclose()
         except Exception as e:
-            log.warning("Transfer to %s failed: %s", destination, e)
+            log.exception("Transfer to %s failed", destination)
             return json.dumps({
                 "status": "no_answer",
                 "destination": destination,
@@ -853,7 +866,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(
         room=ctx.room,
-        agent=IrisAgent(caller_phone=caller_phone, persona=_persona_for(tts._opts.voice)),
+        agent=IrisAgent(
+            caller_phone=caller_phone,
+            persona=_persona_for(tts._opts.voice),
+            room=ctx.room,
+        ),
     )
 
 
