@@ -326,6 +326,50 @@ A scheduled job on the VPS pulls every Vapi call's full data into our own storag
 
 - **Hyak phone service**: month-to-month, no contract barrier to porting. Bundled with internet, not expensive on its own. Internet stays with Hyak after the port; phone portion gets cancelled when Twilio takes over.
 
+## Transfer: SIP REFER blind-transfer configuration (verified 2026-05-12)
+
+A SIP REFER on the inbound dialog is currently the only way to preserve the original caller's number to the transfer destination when transferring through Twilio's PSTN termination. Iris drops off the call as soon as Twilio accepts the REFER — the trade-off for caller-ID preservation. Documented here so the configuration can be reconstructed if the trunk or agent state is ever rebuilt.
+
+### Twilio configuration
+
+Elastic SIP Trunking → Trunks → **Lighthouse Inn outbound** (`ST_KvjTtrM3PPtk`) → Voice → "Call Transfer" section:
+
+- **Call Transfer (SIP REFER)**: Enabled — *"Twilio will consume an incoming SIP REFER from your communications infrastructure and create an INVITE message to the address in the Refer-To header"*
+- **Caller ID for Transfer Target**: `Set caller ID as Transferee` — this is the load-bearing setting. With this, Twilio presents the **original caller's** number on the new outbound INVITE to the destination. Other options (e.g. "Transferor") fall back to the trunk's authorized DID.
+- **Enable PSTN Transfer**: checked — required to allow REFER targets that are PSTN phone numbers (vs. SIP URIs only).
+
+The trunk's outbound caller-ID-authorized number (`+15419915071`) is still required for non-REFER outbound calls, but it is NOT used on REFER-bridged legs.
+
+### LiveKit code (`agent/iris_agent.py::transfer_to`)
+
+```python
+await lk.sip.transfer_sip_participant(
+    api.TransferSIPParticipantRequest(
+        participant_identity=sip_participant_identity,  # "sip_+<E.164>" of the inbound caller
+        room_name=room_name,
+        transfer_to=f"tel:{sip_to}",                    # tel: URI per RFC 3966
+        play_dialtone=True,                             # caller hears ringback during transfer
+        ringing_timeout=timedelta(seconds=30),
+    )
+)
+```
+
+`participant_identity` is found by iterating `self._room.remote_participants` for an entry whose identity starts with `"sip_"` (LiveKit-SIP names inbound SIP participants `sip_<E.164>`, e.g. `sip_+15419973221`).
+
+### Behavior
+
+- LiveKit-SIP sends SIP REFER on the inbound dialog to Twilio, with `Refer-To: <tel:+1...>`.
+- Twilio responds 202 Accepted, then creates a new outbound INVITE to the destination, presenting the original caller's number as `From` (because of the Transferee setting).
+- When the destination answers, Twilio bridges the original caller to the destination. The LiveKit-side dialog terminates (Iris is removed from the call).
+- Iris must announce the transfer **before** invoking the tool; once REFER is accepted, her audio path is gone.
+
+### Tradeoff and follow-up direction
+
+REFER blind-transfer satisfies the **caller-ID preservation** design goal but conflicts with the **Iris stays in the call** goal (for warm-transfer briefings or to step back in if needed). These two goals are mutually exclusive through Twilio's PSTN termination as of 2026-05-12. The follow-up direction:
+
+- **Front desk transfers (HT802)** — once the HT802 SIP-Domain outbound trunk is in place, Iris can dial the HT802 directly via SIP Domain (not PSTN termination), where she can control the `From` header without Twilio's PSTN-side caller-ID gating. Iris stays in the call, caller-ID is preserved on the front-desk handset's display.
+- **Eric's cell (PSTN)** — caller-ID gating applies regardless. The available options are: (a) REFER (current; caller-ID preserved, Iris drops) or (b) `create_sip_participant` (Iris stays, Eric sees `+15419915071`). No path preserves both.
+
 ## Integration with GX-26 (existing hotel automation system)
 
 **Location**: `D:\2-Work\ComputerSoftwareDevelopment\Cloudbeds-GX26`

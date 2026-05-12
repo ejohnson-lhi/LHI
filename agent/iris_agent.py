@@ -107,31 +107,39 @@ def _resolve_voice() -> str:
 # Empty/unset = no admin recognized.
 ADMIN_PHONE = os.environ.get("IRIS_ADMIN_PHONE", "")
 
-# LiveKit outbound SIP trunk ID for placing transfer calls. Set in
-# /opt/iris-backend/agent/.env after creating the trunk on the droplet:
-#   lk sip outbound create deploy/livekit/config/outbound-trunk.json
-# (See the example template adjacent to the file.) If unset, the transfer
-# tool returns an error rather than crashing the agent.
+# LiveKit outbound SIP trunks for placing transfer calls. Two trunks because
+# the two destinations route differently:
+#   IRIS_OUTBOUND_TRUNK_ID   -> Twilio PSTN Termination (lighthouseinn.pstn.twilio.com)
+#                               Used for 'eric' via SIP REFER. Twilio gates the
+#                               From header to authorized DIDs but preserves the
+#                               original caller's number on the REFER-bridged leg.
+#   IRIS_FRONTDESK_TRUNK_ID  -> Twilio SIP Domain (lighthouseinn-frontdesk.sip.twilio.com)
+#                               Used for 'front_desk' via warm-bridge create_sip_participant.
+#                               SIP Domain doesn't gate From the way PSTN does, so we
+#                               pass sip_number=<caller's E.164>, which becomes the From
+#                               on the INVITE to the HT802. The HT802 generates FSK
+#                               caller-ID to the analog handset from that From header.
+# Either unset -> transfer_to returns an error for that destination rather than
+# crashing the agent.
 OUTBOUND_TRUNK_ID = os.environ.get("IRIS_OUTBOUND_TRUNK_ID", "")
+FRONTDESK_TRUNK_ID = os.environ.get("IRIS_FRONTDESK_TRUNK_ID", "")
 
 # Warm-transfer destinations the agent's transfer_to tool routes to.
 # Keys match the `destination` parameter the LLM passes (per the [Transfer
-# Scope Rules] prompt section). Values are (sip_call_to, friendly_label).
-#
-# sip_call_to must be a phone number (E.164) or a bare SIP user, NOT a
-# full SIP URI. LiveKit constructs the INVITE using the outbound trunk's
-# `address` field as the host. To reach a different host (e.g., the
-# HT802 SIP Domain at lighthouseinn-frontdesk.sip.twilio.com), we'd need
-# a second outbound trunk pointing at that host.
-#
-# Phase 1 (current): both targets route to Eric's cell. Until the second
-# trunk for the HT802 SIP Domain is set up, "front_desk" is temporarily
-# aliased to Eric so the transfer flow works end-to-end. The LLM still
-# distinguishes the two semantically; only the underlying number is the
-# same.
-TRANSFER_TARGETS: dict[str, tuple[str, str]] = {
-    "front_desk": ("+15412286786", "the front desk"),
-    "eric":       ("+15412286786", "Eric"),
+# Scope Rules] prompt section). Each value is (call_to, label, routing):
+#   - call_to: for routing='sip_domain', the SIP user on the domain (LiveKit
+#     forms `sip:<call_to>@<trunk.address>`). For routing='refer', the bare
+#     E.164 PSTN number used to build the Refer-To `tel:` URI.
+#   - label: friendly name the LLM uses when announcing the transfer.
+#   - routing: 'sip_domain' = warm-bridge via the SIP Domain trunk, Iris
+#     stays in the call (silent), caller's number is passed as From so the
+#     ATA shows the original caller's caller-ID on the handset display.
+#     'refer' = SIP REFER via the PSTN trunk, Iris drops off, Twilio bridges
+#     directly; caller-ID preserved by the trunk's "Caller ID for Transfer
+#     Target = Transferee" setting.
+TRANSFER_TARGETS: dict[str, tuple[str, str, str]] = {
+    "front_desk": ("frontdesk",    "the front desk", "sip_domain"),
+    "eric":       ("+15412286786", "Eric",           "refer"),
 }
 
 # Max time to wait for the destination to pick up before treating as
@@ -452,7 +460,7 @@ class IrisAgent(Agent):
 
     @function_tool
     async def transfer_to(self, destination: str) -> str:
-        """Transfer the caller to a human. `destination` is 'front_desk' or 'eric'. The transfer uses SIP REFER: Twilio creates a new outbound call to the destination using the ORIGINAL caller's number as caller-ID (so the destination can call back). Iris drops off the call as soon as Twilio accepts the REFER. SAY "Connecting you to {destination} now, one moment" BEFORE invoking this tool — once the tool returns, Iris's audio path is gone. Returns JSON: status='connected' (Twilio accepted the REFER and is ringing the destination) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate."""
+        """Transfer the caller to a human. `destination` is 'front_desk' or 'eric'. The two destinations behave differently: 'front_desk' is a warm bridge — Iris stays on the call (silent) while the front-desk handset rings, and the handset displays the caller's original phone number. 'eric' uses SIP REFER — Twilio dials Eric's cell directly and bridges him with the caller, and Iris drops off the call as soon as Twilio accepts the REFER. When using 'eric', SAY "Connecting you to Eric now, one moment" BEFORE invoking this tool — once the tool returns, Iris's audio path is gone. Returns JSON: status='connected' (destination joined the call / REFER accepted) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate."""
 
         target = TRANSFER_TARGETS.get(destination)
         if target is None:
@@ -461,10 +469,82 @@ class IrisAgent(Agent):
                 "valid_destinations": list(TRANSFER_TARGETS),
             })
 
-        sip_to, label = target
+        call_to, label, routing = target
         if self._room is None:
             log.error("Transfer requested but agent has no room reference")
             return json.dumps({"error": "Internal: no room available."})
+
+        if routing == "sip_domain":
+            return await self._transfer_warm_bridge(destination, call_to, label)
+        if routing == "refer":
+            return await self._transfer_refer(destination, call_to, label)
+        log.error("Unknown routing %r for destination %r", routing, destination)
+        return json.dumps({"error": f"Unknown routing type for {destination!r}"})
+
+    async def _transfer_warm_bridge(
+        self, destination: str, sip_user: str, label: str
+    ) -> str:
+        """Warm-bridge via the SIP Domain trunk. Iris stays in the call.
+        Passes the caller's E.164 as `sip_number` so the destination ATA
+        sees it as the From header and generates FSK caller-ID with that
+        number to the analog handset."""
+        if not FRONTDESK_TRUNK_ID:
+            log.error("Warm-bridge transfer requested but IRIS_FRONTDESK_TRUNK_ID not set")
+            return json.dumps({
+                "error": "Front-desk routing is not configured on the agent.",
+            })
+
+        room_name = self._room.name
+        log.info(
+            "Warm-bridge transfer: %s -> sip:%s (caller_phone=%s, room=%s)",
+            destination, sip_user, self._caller_phone, room_name,
+        )
+
+        try:
+            lk = api.LiveKitAPI()
+            try:
+                kwargs: dict = dict(
+                    sip_trunk_id=FRONTDESK_TRUNK_ID,
+                    sip_call_to=sip_user,
+                    room_name=room_name,
+                    participant_identity=f"transfer-{destination}",
+                    participant_name=label,
+                    play_dialtone=True,
+                    wait_until_answered=True,
+                    ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
+                )
+                # Override the From header with the original caller's number
+                # so the HT802 generates caller-ID FSK with that number on
+                # the analog handset's display. Twilio's SIP Domain doesn't
+                # gate From the way its PSTN Termination does.
+                if self._caller_phone:
+                    kwargs["sip_number"] = self._caller_phone
+                await lk.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(**kwargs)
+                )
+            finally:
+                await lk.aclose()
+        except Exception:
+            log.exception("Warm-bridge transfer to %s failed", destination)
+            return json.dumps({
+                "status": "no_answer",
+                "destination": destination,
+                "display": label,
+            })
+
+        log.info("Warm-bridge transfer to %s connected", destination)
+        return json.dumps({
+            "status": "connected",
+            "destination": destination,
+            "display": label,
+        })
+
+    async def _transfer_refer(
+        self, destination: str, sip_to: str, label: str
+    ) -> str:
+        """Blind SIP REFER on the inbound dialog. Iris drops off once Twilio
+        accepts the REFER. The destination's caller-ID is preserved by
+        Twilio's "Caller ID for Transfer Target = Transferee" trunk setting."""
         room_name = self._room.name
 
         # Find the inbound SIP participant (the caller). LiveKit-SIP names
@@ -490,8 +570,6 @@ class IrisAgent(Agent):
                     api.TransferSIPParticipantRequest(
                         participant_identity=sip_participant_identity,
                         room_name=room_name,
-                        # tel: URI for PSTN destinations; LiveKit-SIP forwards
-                        # this as the Refer-To header to Twilio.
                         transfer_to=f"tel:{sip_to}",
                         play_dialtone=True,
                         ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),

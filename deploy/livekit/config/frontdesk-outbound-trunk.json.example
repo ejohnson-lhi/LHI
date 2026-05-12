@@ -1,0 +1,9 @@
+{
+  "trunk": {
+    "name": "twilio-frontdesk-outbound",
+    "address": "lighthouseinn-frontdesk.sip.twilio.com",
+    "numbers": [],
+    "auth_username": "REPLACE_WITH_SIP_DOMAIN_CREDENTIAL_USERNAME",
+    "auth_password": "REPLACE_WITH_SIP_DOMAIN_CREDENTIAL_PASSWORD"
+  }
+}
