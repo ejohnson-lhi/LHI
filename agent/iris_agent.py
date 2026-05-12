@@ -488,7 +488,11 @@ class IrisAgent(Agent):
                         room_name=room_name,
                         participant_identity=f"transfer-{destination}",
                         participant_name=label,
-                        play_dialtone=True,
+                        # play_dialtone=False: the synthetic ringback beeps
+                        # are unpleasant for the caller. Iris's "connecting
+                        # you" announcement gives enough context; silence
+                        # while the destination's phone rings is fine.
+                        play_dialtone=False,
                         wait_until_answered=True,
                         ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
                     )
