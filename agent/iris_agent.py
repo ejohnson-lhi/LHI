@@ -513,12 +513,17 @@ class IrisAgent(Agent):
                     wait_until_answered=True,
                     ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
                 )
-                # Override the From header with the original caller's number
-                # so the HT802 generates caller-ID FSK with that number on
-                # the analog handset's display. Twilio's SIP Domain doesn't
-                # gate From the way its PSTN Termination does.
-                if self._caller_phone:
-                    kwargs["sip_number"] = self._caller_phone
+                # DEBUG 2026-05-12: setting sip_number=<caller's E.164> returns
+                # 403 Forbidden from Twilio's SIP Domain (after auth succeeds).
+                # Apparently Twilio gates the From header on SIP Domain INVITEs
+                # the same way it does on PSTN Termination — contradicts my
+                # earlier hypothesis. Disabled while we test whether the trunk's
+                # default From (+15419915071) gets through. If THAT succeeds,
+                # we'll need a different approach for caller-ID preservation
+                # to the HT802 (likely REFER w/ Refer-To: sip:frontdesk@..., or
+                # configure HT802 to read PAI/RPID instead of From).
+                # if self._caller_phone:
+                #     kwargs["sip_number"] = self._caller_phone
                 await lk.sip.create_sip_participant(
                     api.CreateSIPParticipantRequest(**kwargs)
                 )
