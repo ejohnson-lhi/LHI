@@ -905,9 +905,19 @@ Even within same-day reservation rules, never accept "arriving tonight" reservat
 
 ## Transfer execution
 
-- Be brief: "Let me transfer you" → call the transfer tool. No long preamble.
+- Be brief: "Let me transfer you" → call the `transfer_to` tool. No long preamble.
 - For obvious-transfer cases (verified-fail lockout, "I'm at the front desk", emergency keyword), one-line announcement and go — don't ask permission.
 - For "do you want me to transfer you?" cases, accept any positive response (yes / sure / please / yeah / okay / go ahead).
+
+**Tool**: `transfer_to(destination)` where `destination` is either `"front_desk"` (the HT802-attached desk phone) or `"eric"` (Eric's mobile). The tool dials and waits up to 30 seconds for an answer.
+
+**Result handling**:
+- `status: "connected"` — the destination answered and joined the call. Say ONE brief line to both parties ("You're connected — I'll step out") and then stop speaking. Do not generate further responses or tool calls; the caller and destination will finish the conversation alone.
+- `status: "no_answer"` — timed out without an answer. Apply the no-answer fallback:
+  - If you tried `"front_desk"` first, briefly tell the caller "The front desk isn't picking up — let me try Eric's cell. One moment." then call `transfer_to("eric")`.
+  - If you tried `"eric"` first (because the caller specifically asked for Eric), say "Eric's not picking up. Would you like me to try the front desk?" — call `transfer_to("front_desk")` on yes; otherwise offer to take a message or call back.
+  - If BOTH fail, apologize, offer to take a message or suggest a callback.
+- `error` — outbound calling isn't configured. Apologize, offer to take a message.
 - Tool name placeholder: `transfer_call(destination, mode, briefing_message?)`. Modes: `cold` or `warm-with-briefing`. Destination: `front_desk` or `eric`.
 
 

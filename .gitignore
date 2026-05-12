@@ -22,6 +22,7 @@ deploy/livekit/sip.yaml
 deploy/livekit/egress.yaml
 deploy/livekit/config/inbound-trunk.json
 deploy/livekit/config/dispatch-rule.json
+deploy/livekit/config/outbound-trunk.json
 
 # --- Local-only Windows binaries ---
 backend/cloudflared-windows-amd64.exe

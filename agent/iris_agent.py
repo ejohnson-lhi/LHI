@@ -35,7 +35,7 @@ import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
 import numpy as np
 import httpx
 from dotenv import load_dotenv
-from livekit import agents, rtc
+from livekit import agents, api, rtc
 from livekit.agents import Agent, AgentSession, JobContext, JobProcess, function_tool
 from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
 from livekit.plugins import anthropic, deepgram, silero
@@ -106,6 +106,30 @@ def _resolve_voice() -> str:
 # block (instructions for handling voice-switch and other admin commands).
 # Empty/unset = no admin recognized.
 ADMIN_PHONE = os.environ.get("IRIS_ADMIN_PHONE", "")
+
+# LiveKit outbound SIP trunk ID for placing transfer calls. Set in
+# /opt/iris-backend/agent/.env after creating the trunk on the droplet:
+#   lk sip outbound create deploy/livekit/config/outbound-trunk.json
+# (See the example template adjacent to the file.) If unset, the transfer
+# tool returns an error rather than crashing the agent.
+OUTBOUND_TRUNK_ID = os.environ.get("IRIS_OUTBOUND_TRUNK_ID", "")
+
+# Warm-transfer destinations the agent's transfer_to tool routes to.
+# Keys match the `destination` parameter the LLM passes (per the [Transfer
+# Scope Rules] prompt section). Values are (sip_call_to, friendly_label).
+# - "front_desk": HT802 ATA SIP-registered to Twilio (rings the desk phone).
+# - "eric": Eric's mobile via PSTN (Twilio routes to cellular).
+TRANSFER_TARGETS: dict[str, tuple[str, str]] = {
+    "front_desk": (
+        "sip:frontdesk@lighthouseinn-frontdesk.sip.twilio.com",
+        "the front desk",
+    ),
+    "eric": ("+15412286786", "Eric"),
+}
+
+# Max time to wait for the destination to pick up before treating as
+# no-answer and returning to the LLM so it can try the fallback.
+TRANSFER_RING_TIMEOUT_S = 30
 
 # Disk-backed TTS audio cache. LiveKit spawns a fresh worker subprocess for
 # each call (with num_idle_processes=1), so cache survives only across
@@ -409,6 +433,59 @@ class IrisAgent(Agent):
     async def inn_info(self, question: str) -> str:
         """Look up Lighthouse Inn details (room features, amenities, pet/smoking/parking/breakfast policy, local area, transit, hours, etc.). Use for any guest question not covered directly by your other tools or the inline system prompt."""
         return inn_info.lookup(question)
+
+    @function_tool
+    async def transfer_to(self, destination: str) -> str:
+        """Warm-transfer the caller to a human. `destination` is 'front_desk' (the HT802-attached desk phone) or 'eric' (Eric's mobile). Dials the destination and waits up to 30 seconds for an answer. Returns JSON: status='connected' (destination joined the call) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate. On connected, briefly tell the caller and the new participant 'You're connected — I'll step out.' and then say nothing more."""
+
+        if not OUTBOUND_TRUNK_ID:
+            log.error("Transfer requested but IRIS_OUTBOUND_TRUNK_ID not set")
+            return json.dumps({
+                "error": "Outbound calling is not configured on the agent. Cannot transfer.",
+            })
+        target = TRANSFER_TARGETS.get(destination)
+        if target is None:
+            return json.dumps({
+                "error": f"Unknown destination: {destination!r}",
+                "valid_destinations": list(TRANSFER_TARGETS),
+            })
+
+        sip_to, label = target
+        log.info("Transfer initiated: %s -> %s", destination, sip_to)
+
+        try:
+            lk = api.LiveKitAPI()
+            try:
+                await lk.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        sip_trunk_id=OUTBOUND_TRUNK_ID,
+                        sip_call_to=sip_to,
+                        room_name=self.session.room.name,
+                        participant_identity=f"transfer-{destination}",
+                        participant_name=label,
+                        # play_dialtone=True plays ringback into the room
+                        # so the caller hears something while we wait.
+                        play_dialtone=True,
+                        wait_until_answered=True,
+                        ringing_timeout=TRANSFER_RING_TIMEOUT_S,
+                    )
+                )
+            finally:
+                await lk.aclose()
+        except Exception as e:
+            log.warning("Transfer to %s failed: %s", destination, e)
+            return json.dumps({
+                "status": "no_answer",
+                "destination": destination,
+                "display": label,
+            })
+
+        log.info("Transfer to %s connected", destination)
+        return json.dumps({
+            "status": "connected",
+            "destination": destination,
+            "display": label,
+        })
 
     @function_tool
     async def admin_set_voice(self, voice: str) -> str:

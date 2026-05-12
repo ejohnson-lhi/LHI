@@ -1,0 +1,9 @@
+{
+  "trunk": {
+    "name": "twilio-outbound",
+    "address": "REPLACE_WITH_TWILIO_TERMINATION_URI",
+    "numbers": ["+15419973221"],
+    "auth_username": "",
+    "auth_password": ""
+  }
+}
