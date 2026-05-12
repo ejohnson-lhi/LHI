@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
@@ -480,7 +480,8 @@ class IrisAgent(Agent):
                         # so the caller hears something while we wait.
                         play_dialtone=True,
                         wait_until_answered=True,
-                        ringing_timeout=TRANSFER_RING_TIMEOUT_S,
+                        # protobuf Duration field — needs timedelta, not int.
+                        ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
                     )
                 )
             finally:
