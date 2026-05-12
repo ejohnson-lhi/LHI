@@ -117,14 +117,21 @@ OUTBOUND_TRUNK_ID = os.environ.get("IRIS_OUTBOUND_TRUNK_ID", "")
 # Warm-transfer destinations the agent's transfer_to tool routes to.
 # Keys match the `destination` parameter the LLM passes (per the [Transfer
 # Scope Rules] prompt section). Values are (sip_call_to, friendly_label).
-# - "front_desk": HT802 ATA SIP-registered to Twilio (rings the desk phone).
-# - "eric": Eric's mobile via PSTN (Twilio routes to cellular).
+#
+# sip_call_to must be a phone number (E.164) or a bare SIP user, NOT a
+# full SIP URI. LiveKit constructs the INVITE using the outbound trunk's
+# `address` field as the host. To reach a different host (e.g., the
+# HT802 SIP Domain at lighthouseinn-frontdesk.sip.twilio.com), we'd need
+# a second outbound trunk pointing at that host.
+#
+# Phase 1 (current): both targets route to Eric's cell. Until the second
+# trunk for the HT802 SIP Domain is set up, "front_desk" is temporarily
+# aliased to Eric so the transfer flow works end-to-end. The LLM still
+# distinguishes the two semantically; only the underlying number is the
+# same.
 TRANSFER_TARGETS: dict[str, tuple[str, str]] = {
-    "front_desk": (
-        "sip:frontdesk@lighthouseinn-frontdesk.sip.twilio.com",
-        "the front desk",
-    ),
-    "eric": ("+15412286786", "Eric"),
+    "front_desk": ("+15412286786", "the front desk"),
+    "eric":       ("+15412286786", "Eric"),
 }
 
 # Max time to wait for the destination to pick up before treating as
