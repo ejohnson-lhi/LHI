@@ -119,9 +119,16 @@ ADMIN_PHONE = os.environ.get("IRIS_ADMIN_PHONE", "")
 OUTBOUND_TRUNK_ID = os.environ.get("IRIS_OUTBOUND_TRUNK_ID", "")
 FRONTDESK_TRUNK_ID = os.environ.get("IRIS_FRONTDESK_TRUNK_ID", "")
 
-# Warm-transfer destinations. Both currently route to Eric's cell via the
-# PSTN trunk (front_desk is temporarily aliased to Eric until a working
-# HT802 routing path exists).
+# Warm-transfer destinations. Each entry is (call_to, label, trunk_id):
+#   - call_to: SIP user (for SIP-Domain trunk) or E.164 number (PSTN trunk)
+#   - label: friendly name the LLM uses when announcing the transfer
+#   - trunk_id: which trunk to dial through; resolved from env at import
+#
+# Routing rationale:
+#   - front_desk -> SIP Domain trunk to ring the HT802 (via TwiML Bin
+#     "HT802 Outbound Caller ID" on the SIP Domain's Voice URL — direct
+#     INVITEs without TwiML get 403 from Twilio).
+#   - eric -> PSTN trunk to Eric's cell.
 #
 # Why warm-bridge (create_sip_participant) instead of SIP REFER:
 #   The LiveKit-side recording captures the room's audio. With warm-bridge,
@@ -130,13 +137,12 @@ FRONTDESK_TRUNK_ID = os.environ.get("IRIS_FRONTDESK_TRUNK_ID", "")
 #   That's invaluable right now for iterating on the LLM prompt. With REFER,
 #   Iris drops at the moment Twilio accepts the REFER, ending the recording.
 #
-# Trade-off: the destination sees +15419915071 (Iris's Twilio DID) as
-# caller-ID, not the original caller's number. We accept that for now;
-# revisit once the prompt is stable enough that recording every transfer
-# is no longer essential.
-TRANSFER_TARGETS: dict[str, tuple[str, str]] = {
-    "front_desk": ("+15412286786", "the front desk"),
-    "eric":       ("+15412286786", "Eric"),
+# Trade-off: the destination sees the trunk's authorized DID (+15419915071)
+# as caller-ID, not the original caller's number. Revisit once the prompt
+# is stable enough that recording every transfer is no longer essential.
+TRANSFER_TARGETS: dict[str, tuple[str, str, str]] = {
+    "front_desk": ("frontdesk",    "the front desk", FRONTDESK_TRUNK_ID),
+    "eric":       ("+15412286786", "Eric",           OUTBOUND_TRUNK_ID),
 }
 
 # Max time to wait for the destination to pick up before treating as
@@ -459,11 +465,6 @@ class IrisAgent(Agent):
     async def transfer_to(self, destination: str) -> str:
         """Warm-transfer the caller to a human. `destination` is 'front_desk' or 'eric'. Iris stays on the call (silent) while the destination is connected, so the LiveKit recording captures the full conversation. The destination sees the hotel number as caller-ID, not the original caller's number. Returns JSON: status='connected' (destination joined the call) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate."""
 
-        if not OUTBOUND_TRUNK_ID:
-            log.error("Transfer requested but IRIS_OUTBOUND_TRUNK_ID not set")
-            return json.dumps({
-                "error": "Outbound calling is not configured on the agent. Cannot transfer.",
-            })
         target = TRANSFER_TARGETS.get(destination)
         if target is None:
             return json.dumps({
@@ -471,19 +472,30 @@ class IrisAgent(Agent):
                 "valid_destinations": list(TRANSFER_TARGETS),
             })
 
-        sip_to, label = target
+        sip_to, label, trunk_id = target
+        if not trunk_id:
+            log.error(
+                "Transfer to %s requested but trunk env var is empty",
+                destination,
+            )
+            return json.dumps({
+                "error": f"{destination} routing is not configured on the agent.",
+            })
         if self._room is None:
             log.error("Transfer requested but agent has no room reference")
             return json.dumps({"error": "Internal: no room available."})
         room_name = self._room.name
-        log.info("Warm-bridge transfer: %s -> %s (room=%s)", destination, sip_to, room_name)
+        log.info(
+            "Warm-bridge transfer: %s -> %s via %s (room=%s)",
+            destination, sip_to, trunk_id, room_name,
+        )
 
         try:
             lk = api.LiveKitAPI()
             try:
                 await lk.sip.create_sip_participant(
                     api.CreateSIPParticipantRequest(
-                        sip_trunk_id=OUTBOUND_TRUNK_ID,
+                        sip_trunk_id=trunk_id,
                         sip_call_to=sip_to,
                         room_name=room_name,
                         participant_identity=f"transfer-{destination}",
