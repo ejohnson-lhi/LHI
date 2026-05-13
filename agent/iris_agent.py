@@ -315,13 +315,11 @@ class IrisAgent(Agent):
         # Brief wait for the SIP audio bridge to settle. Without it the
         # first audio plays into a void on some carriers.
         await asyncio.sleep(0.3)
-        # Play a synthetic ringback tone first so the caller hears a
-        # familiar "one ring" before the agent speaks — LiveKit-SIP
-        # answers with 200 OK immediately so Twilio can't generate real
-        # PSTN ringback. The tone is pre-cached in prewarm(), so this is
-        # an instant cache hit, not a synthesis call.
-        log.info("Agent on_enter: playing ringback tone")
-        await self.session.say(RINGBACK_CACHE_KEY, allow_interruptions=False)
+        # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
+        # is now providing real ringback before LiveKit answers, so the
+        # synthesized one was layering on top. RINGBACK_CACHE_KEY and
+        # _generate_ringback_pcm are still defined upstream as dead code
+        # in case the silent-connect gap returns.)
         # Greeting uses the persona name for the current voice. Cache key
         # is voice-aware so this is also a cache hit (pre-rendered in
         # prewarm or entrypoint when voice changed).
