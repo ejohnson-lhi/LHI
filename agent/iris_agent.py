@@ -40,6 +40,25 @@ from livekit.agents import Agent, AgentSession, JobContext, JobProcess, function
 from livekit.agents.voice.turn import InterruptionOptions, TurnHandlingOptions
 from livekit.plugins import anthropic, deepgram, silero
 
+# StopResponse: raised from an Agent's on_user_turn_completed hook to stop
+# the framework from invoking the LLM for that turn. Used by IrisAgent's
+# silent (immediate-transfer) mode. Import path has wandered across
+# livekit-agents minor versions; try a few before giving up. If the class
+# can't be imported, we fall back to audio-output muting alone, which is
+# also belt-and-suspenders-correct for the silent mode.
+StopResponse = None
+for _p in (
+    "livekit.agents.voice.agent_activity",
+    "livekit.agents.voice",
+    "livekit.agents",
+):
+    try:
+        StopResponse = getattr(__import__(_p, fromlist=["StopResponse"]), "StopResponse")
+        break
+    except (ImportError, AttributeError):
+        continue
+del _p
+
 import inn_info
 from audio_cache import TTSAudioCache
 from iris_prompt import build_system_prompt
@@ -390,6 +409,16 @@ class IrisAgent(Agent):
         # +15419915071). Used to switch into immediate-transfer mode on
         # the production DID — see on_enter.
         self._called_number = called_number
+        # Silent mode: when the call arrived on the immediate-transfer DID,
+        # Iris must NOT generate any responses for the rest of the call.
+        # The previous version of the code only skipped the greeting in
+        # on_enter, but the LLM still fired on subsequent STT events and
+        # Iris's TTS audio leaked into the bridged human conversation
+        # between caller and front desk. Two-layer fix: (1) disable audio
+        # output via session.output.set_audio_enabled(False) in on_enter,
+        # and (2) override on_user_turn_completed to short-circuit the
+        # LLM-invocation pipeline via StopResponse.
+        self._silent = (called_number == IMMEDIATE_TRANSFER_DID)
         super().__init__(instructions=build_system_prompt(
             caller_phone=caller_phone,
             is_admin=self._is_admin,
@@ -399,8 +428,8 @@ class IrisAgent(Agent):
         if self._is_admin:
             log.info("Caller %s recognized as admin", caller_phone)
         log.info(
-            "Agent init: caller=%s called=%s persona=%s admin=%s",
-            caller_phone, called_number, persona, self._is_admin,
+            "Agent init: caller=%s called=%s persona=%s admin=%s silent=%s",
+            caller_phone, called_number, persona, self._is_admin, self._silent,
         )
 
     async def on_enter(self) -> None:
@@ -415,13 +444,44 @@ class IrisAgent(Agent):
         # the recording still captures all legs of the human conversation
         # — that's the whole point: collect real customer-to-front-desk
         # interactions to drive prompt development on the dev DID.
-        if self._called_number == IMMEDIATE_TRANSFER_DID:
+        if self._silent:
+            # MUST mute audio output BEFORE initiating the transfer, in case
+            # any subsequent STT event triggers an LLM response before
+            # transfer_to returns. Belt; on_user_turn_completed override is
+            # the suspenders.
+            try:
+                self.session.output.set_audio_enabled(False)
+                log.info("Silent mode: disabled session audio output")
+            except Exception:
+                log.exception("Could not disable audio output (continuing anyway)")
             log.info(
                 "Immediate-transfer mode: called=%s -> %s (skipping greeting)",
                 self._called_number, IMMEDIATE_TRANSFER_DESTINATION,
             )
             await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
             return
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """In silent (immediate-transfer) mode, prevent the LLM from being
+        invoked for any user turn. Without this, the framework's default
+        pipeline still calls the LLM after STT — wasting tokens and
+        polluting the transcript with phantom assistant messages even if
+        their TTS audio is muted by `session.output.set_audio_enabled(False)`.
+
+        Raising `StopResponse` is the framework-supported way to skip the
+        turn entirely. If the class couldn't be imported (different
+        livekit-agents version), we just return — audio output is muted
+        so the user-facing impact is the same; we only pay the (small)
+        cost of a wasted LLM call per turn.
+        """
+        if not self._silent:
+            return
+        text = getattr(new_message, "text_content", None)
+        if text is None and hasattr(new_message, "content"):
+            text = new_message.content
+        log.info("Silent mode: skipping LLM for user turn: %r", text or "")
+        if StopResponse is not None:
+            raise StopResponse()
 
         # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
         # is now providing real ringback before LiveKit answers, so the
