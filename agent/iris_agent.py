@@ -141,8 +141,16 @@ FRONTDESK_TRUNK_ID = os.environ.get("IRIS_FRONTDESK_TRUNK_ID", "")
 # as caller-ID, not the original caller's number. Revisit once the prompt
 # is stable enough that recording every transfer is no longer essential.
 TRANSFER_TARGETS: dict[str, tuple[str, str, str]] = {
+    # LLM-facing destinations. The LLM only sees these two in its tool
+    # docstring and chooses between them based on caller intent.
     "front_desk": ("frontdesk",    "the front desk", FRONTDESK_TRUNK_ID),
     "eric":       ("+15412286786", "Eric",           OUTBOUND_TRUNK_ID),
+    # Internal-only destination: production port (HT802 FXS Port 2,
+    # registered as `frontdesk2`). Used by the immediate-transfer code
+    # path in on_enter when the caller dialed IMMEDIATE_TRANSFER_DID.
+    # Not exposed to the LLM — the LLM should keep using "front_desk"
+    # for guest-requested transfers, which lands at port 1 (dev).
+    "front_desk_port2": ("frontdesk2", "the front desk", FRONTDESK_TRUNK_ID),
 }
 
 # Max time to wait for the destination to pick up before treating as
@@ -163,6 +171,9 @@ TRANSFER_RING_TIMEOUT_S = 30
 # based on which DID the call arrived on (read from SIP participant
 # attributes).
 IMMEDIATE_TRANSFER_DID = "+15419915070"
+# Which TRANSFER_TARGETS entry the immediate-transfer mode routes to.
+# Currently `front_desk_port2` (HT802 FXS Port 2 = production phone).
+IMMEDIATE_TRANSFER_DESTINATION = "front_desk_port2"
 
 # Disk-backed TTS audio cache. LiveKit spawns a fresh worker subprocess for
 # each call (with num_idle_processes=1), so cache survives only across
@@ -342,17 +353,17 @@ class IrisAgent(Agent):
 
         # Immediate-transfer DID: if the call arrived at the production
         # number (+15419915070), skip the AI greeting entirely and bridge
-        # the caller straight to the front desk. Iris stays silent in the
-        # room so the recording still captures all legs of the human
-        # conversation — that's the whole point: collect real
-        # customer-to-front-desk interactions to drive prompt development
-        # on the dev DID.
+        # the caller straight to the production front-desk phone (HT802
+        # FXS Port 2 = `frontdesk2`). Iris stays silent in the room so
+        # the recording still captures all legs of the human conversation
+        # — that's the whole point: collect real customer-to-front-desk
+        # interactions to drive prompt development on the dev DID.
         if self._called_number == IMMEDIATE_TRANSFER_DID:
             log.info(
-                "Immediate-transfer mode: called=%s -> front_desk (skipping greeting)",
-                self._called_number,
+                "Immediate-transfer mode: called=%s -> %s (skipping greeting)",
+                self._called_number, IMMEDIATE_TRANSFER_DESTINATION,
             )
-            await self.transfer_to("front_desk")
+            await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
             return
 
         # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
