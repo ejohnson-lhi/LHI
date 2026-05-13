@@ -149,6 +149,21 @@ TRANSFER_TARGETS: dict[str, tuple[str, str, str]] = {
 # no-answer and returning to the LLM so it can try the fallback.
 TRANSFER_RING_TIMEOUT_S = 30
 
+# Dual-DID setup: the hotel owns two sequential Twilio DIDs.
+#   +15419915071 (the "dev" / "Iris-engages" line):  Iris answers normally,
+#       runs through the full prompt flow, can engage the caller and use
+#       all tools. Used for development and capability exploration.
+#   +15419915070 (the "immediate-transfer" / "production" line, IMMEDIATE_TRANSFER_DID):
+#       on inbound, Iris immediately bridges the caller to the front desk
+#       with no AI greeting. Recording still captures all legs of the
+#       conversation, which is what feeds prompt development with real
+#       customer-to-front-desk interactions.
+# Both DIDs route to the same Twilio Elastic SIP Trunk and the same LiveKit
+# inbound trunk + dispatch rule. The agent branches behavior in `on_enter`
+# based on which DID the call arrived on (read from SIP participant
+# attributes).
+IMMEDIATE_TRANSFER_DID = "+15419915070"
+
 # Disk-backed TTS audio cache. LiveKit spawns a fresh worker subprocess for
 # each call (with num_idle_processes=1), so cache survives only across
 # calls via disk. Lives under ~/.cache/ since systemd's ProtectSystem=strict
@@ -295,6 +310,7 @@ class IrisAgent(Agent):
         caller_phone: str | None,
         persona: str = "Iris",
         room: rtc.Room | None = None,
+        called_number: str | None = None,
     ) -> None:
         self._is_admin = bool(ADMIN_PHONE) and caller_phone == ADMIN_PHONE
         self._persona = persona
@@ -302,6 +318,10 @@ class IrisAgent(Agent):
         # public attribute, so we capture ctx.room here. transfer_to needs
         # the room name to dial an outbound SIP participant into it.
         self._room = room
+        # The DID the caller actually dialed (e.g. +15419915070 vs
+        # +15419915071). Used to switch into immediate-transfer mode on
+        # the production DID — see on_enter.
+        self._called_number = called_number
         super().__init__(instructions=build_system_prompt(
             caller_phone=caller_phone,
             is_admin=self._is_admin,
@@ -310,11 +330,31 @@ class IrisAgent(Agent):
         self._caller_phone = caller_phone
         if self._is_admin:
             log.info("Caller %s recognized as admin", caller_phone)
+        log.info(
+            "Agent init: caller=%s called=%s persona=%s admin=%s",
+            caller_phone, called_number, persona, self._is_admin,
+        )
 
     async def on_enter(self) -> None:
         # Brief wait for the SIP audio bridge to settle. Without it the
         # first audio plays into a void on some carriers.
         await asyncio.sleep(0.3)
+
+        # Immediate-transfer DID: if the call arrived at the production
+        # number (+15419915070), skip the AI greeting entirely and bridge
+        # the caller straight to the front desk. Iris stays silent in the
+        # room so the recording still captures all legs of the human
+        # conversation — that's the whole point: collect real
+        # customer-to-front-desk interactions to drive prompt development
+        # on the dev DID.
+        if self._called_number == IMMEDIATE_TRANSFER_DID:
+            log.info(
+                "Immediate-transfer mode: called=%s -> front_desk (skipping greeting)",
+                self._called_number,
+            )
+            await self.transfer_to("front_desk")
+            return
+
         # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
         # is now providing real ringback before LiveKit answers, so the
         # synthesized one was layering on top. RINGBACK_CACHE_KEY and
@@ -648,12 +688,26 @@ async def entrypoint(ctx: JobContext) -> None:
     # Wait for the SIP participant to join the room so we can pull the
     # caller's phone number off their attributes. SIP participants come in
     # with `kind == PARTICIPANT_KIND_SIP` and a `sip.phoneNumber` attribute.
+    # We also pull the DID the caller dialed (`sip.trunkPhoneNumber` is
+    # the most reliable name across LiveKit-SIP versions) so the agent
+    # can branch behavior per-DID (see IMMEDIATE_TRANSFER_DID).
     participant = await ctx.wait_for_participant()
     caller_phone: str | None = None
+    called_number: str | None = None
     if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-        caller_phone = participant.attributes.get("sip.phoneNumber")
-    log.info("Caller participant=%s phone=%s kind=%s",
-             participant.identity, caller_phone, participant.kind)
+        attrs = participant.attributes
+        caller_phone = attrs.get("sip.phoneNumber")
+        # Try a few attribute names; LiveKit-SIP versions have varied.
+        called_number = (
+            attrs.get("sip.trunkPhoneNumber")
+            or attrs.get("sip.toNumber")
+            or attrs.get("sip.callee")
+        )
+        # Log all attributes once so we can verify the called-number
+        # attribute name and learn what else LiveKit exposes.
+        log.info("SIP participant attributes: %s", dict(attrs))
+    log.info("Caller participant=%s phone=%s called=%s kind=%s",
+             participant.identity, caller_phone, called_number, participant.kind)
 
     session = AgentSession(
         vad=silero.VAD.load(),
@@ -894,6 +948,7 @@ async def entrypoint(ctx: JobContext) -> None:
             caller_phone=caller_phone,
             persona=_persona_for(tts._opts.voice),
             room=ctx.room,
+            called_number=called_number,
         ),
     )
 
