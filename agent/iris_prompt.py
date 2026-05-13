@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Repo layout:  <repo>/AI_Prompts/...   <repo>/agent/iris_prompt.py
 PROMPTS_DIR = Path(__file__).parent.parent / "AI_Prompts"
-SYSTEM_PROMPT_FILE = PROMPTS_DIR / "Lighthouse_AI_system_prompt-2026may02.txt"
+SYSTEM_PROMPT_FILE = PROMPTS_DIR / "Lighthouse_AI_system_prompt.txt"
 # Knowledge base is now loaded by agent/inn_info.py and exposed as a tool
 # rather than inlined here. See build_system_prompt() docstring.
 

@@ -798,6 +798,13 @@ async def entrypoint(ctx: JobContext) -> None:
     # Metrics from the framework's STT / LLM / TTS instrumentation. Includes
     # TTFT, duration, token counts (including cache hits — important for
     # verifying prompt caching is working).
+    #
+    # Cache field locations: the Anthropic SDK puts cache_*_input_tokens on
+    # the response.usage object. LiveKit's Anthropic plugin may or may not
+    # promote those to top-level LLMMetrics attributes depending on version.
+    # We try BOTH locations and also dump the full attribute list once per
+    # metric kind so we can confirm which path holds the data.
+    _metrics_kinds_dumped: set[str] = set()
     @session.on("metrics_collected")
     def _on_metrics(ev) -> None:
         m = getattr(ev, "metrics", None)
@@ -812,6 +819,24 @@ async def entrypoint(ctx: JobContext) -> None:
             v = getattr(m, k, None)
             if v is not None:
                 attrs[k] = round(v, 3) if isinstance(v, float) else v
+        # Nested .usage object (Anthropic plugin path).
+        usage = getattr(m, "usage", None)
+        if usage is not None:
+            for k in ("cache_creation_input_tokens", "cache_read_input_tokens",
+                      "input_tokens", "output_tokens"):
+                v = getattr(usage, k, None)
+                if v is not None:
+                    attrs[f"usage.{k}"] = v
+        # First time we see each metric kind, dump every attribute name we
+        # find on it. Comment this block out once we've confirmed where the
+        # cache fields live in our LiveKit-agents version.
+        if kind not in _metrics_kinds_dumped:
+            _metrics_kinds_dumped.add(kind)
+            top = [a for a in dir(m) if not a.startswith("_")]
+            log.info("DEBUG metrics %s attributes: %s", kind, top)
+            if usage is not None:
+                u_attrs = [a for a in dir(usage) if not a.startswith("_")]
+                log.info("DEBUG metrics %s.usage attributes: %s", kind, u_attrs)
         if attrs:
             log.info("metrics %s: %s", kind, attrs)
             _record(f"metrics.{kind}", **attrs)
