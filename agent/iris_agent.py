@@ -796,15 +796,17 @@ async def entrypoint(ctx: JobContext) -> None:
         })
 
     # Metrics from the framework's STT / LLM / TTS instrumentation. Includes
-    # TTFT, duration, token counts (including cache hits — important for
-    # verifying prompt caching is working).
+    # TTFT, duration, token counts.
     #
-    # Cache field locations: the Anthropic SDK puts cache_*_input_tokens on
-    # the response.usage object. LiveKit's Anthropic plugin may or may not
-    # promote those to top-level LLMMetrics attributes depending on version.
-    # We try BOTH locations and also dump the full attribute list once per
-    # metric kind so we can confirm which path holds the data.
-    _metrics_kinds_dumped: set[str] = set()
+    # Prompt-caching field: in livekit-agents 1.5.8, the Anthropic plugin
+    # exposes the cache-read count as `prompt_cached_tokens` directly on
+    # the LLMMetrics object (not as `cache_read_input_tokens` on a nested
+    # `.usage` object as the raw Anthropic SDK does). There's no
+    # cache_creation field surfaced — we infer it as
+    # `prompt_tokens - prompt_cached_tokens` (= the portion the server
+    # actually had to process). For a healthy cache, prompt_cached_tokens
+    # should grow large on turn 2+ and stay roughly steady (~the size of
+    # the cached system prompt + tools) for the rest of the call.
     @session.on("metrics_collected")
     def _on_metrics(ev) -> None:
         m = getattr(ev, "metrics", None)
@@ -813,30 +815,18 @@ async def entrypoint(ctx: JobContext) -> None:
         kind = type(m).__name__
         attrs = {}
         for k in ("ttft", "duration", "prompt_tokens", "completion_tokens",
-                  "cache_creation_input_tokens", "cache_read_input_tokens",
+                  "prompt_cached_tokens", "total_tokens",
                   "input_tokens", "output_tokens", "audio_duration",
                   "characters_count", "tokens_per_second"):
             v = getattr(m, k, None)
             if v is not None:
                 attrs[k] = round(v, 3) if isinstance(v, float) else v
-        # Nested .usage object (Anthropic plugin path).
-        usage = getattr(m, "usage", None)
-        if usage is not None:
-            for k in ("cache_creation_input_tokens", "cache_read_input_tokens",
-                      "input_tokens", "output_tokens"):
-                v = getattr(usage, k, None)
-                if v is not None:
-                    attrs[f"usage.{k}"] = v
-        # First time we see each metric kind, dump every attribute name we
-        # find on it. Comment this block out once we've confirmed where the
-        # cache fields live in our LiveKit-agents version.
-        if kind not in _metrics_kinds_dumped:
-            _metrics_kinds_dumped.add(kind)
-            top = [a for a in dir(m) if not a.startswith("_")]
-            log.info("DEBUG metrics %s attributes: %s", kind, top)
-            if usage is not None:
-                u_attrs = [a for a in dir(usage) if not a.startswith("_")]
-                log.info("DEBUG metrics %s.usage attributes: %s", kind, u_attrs)
+        # Derived cache hit ratio for the LLM call. Helpful for spotting
+        # cache misses without doing math in the head.
+        if "prompt_cached_tokens" in attrs and "prompt_tokens" in attrs and attrs["prompt_tokens"]:
+            attrs["cache_hit_ratio"] = round(
+                attrs["prompt_cached_tokens"] / attrs["prompt_tokens"], 3
+            )
         if attrs:
             log.info("metrics %s: %s", kind, attrs)
             _record(f"metrics.{kind}", **attrs)
