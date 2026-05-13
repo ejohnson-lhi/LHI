@@ -690,7 +690,7 @@ def prewarm(proc: JobProcess) -> None:
     # Cache loads any previously-saved entries from disk on construction —
     # so the greeting (and accumulated LLM phrasings) survive worker
     # restarts between calls.
-    cache = TTSAudioCache(max_entries=500, persist_path=TTS_CACHE_PATH)
+    cache = TTSAudioCache(max_entries=1000, persist_path=TTS_CACHE_PATH)
     # Treat the WAV dir as a manifest: any cache entry whose corresponding
     # WAV is missing gets dropped. That's the "git push delete" workflow —
     # user listens, deletes bad WAVs, runs tools/push_deletions.bat, next
@@ -708,24 +708,40 @@ def prewarm(proc: JobProcess) -> None:
     log.info("Pre-rendering greeting chunks (skipped if already cached)...")
     for chunk in _greeting_chunks_for(persona):
         tts.prerender(chunk)
-    # Pre-render persistent openers. prerender() is a no-op for entries
-    # already in the cache (loaded from disk above), so this is fast on
-    # warm cold-starts and only pays the synth cost when a new phrase is
-    # added to PERSISTENT_OPENERS or after a cache wipe.
+    # Pre-render persistent openers — but in a BACKGROUND THREAD so we don't
+    # block prewarm. LiveKit Agents has a ~30s timeout on proc.initialize();
+    # synthesizing 36 phrases at ~0.8-1.4s each blows that budget and the
+    # framework kills the worker before it ever registers. Spawning a daemon
+    # thread lets prewarm return immediately, the worker registers as ready,
+    # and the openers render in parallel with whatever the agent is doing.
+    # The background thread calls cache.save() at the end so the new entries
+    # persist; subsequent prewarms find them already cached and skip them.
+    import threading
+    def _bg_prerender_openers() -> None:
+        rendered = skipped = 0
+        for phrase in PERSISTENT_OPENERS:
+            if tts.cache_key(phrase) in cache:
+                skipped += 1
+                continue
+            try:
+                tts.prerender(phrase)
+                rendered += 1
+            except Exception:
+                log.exception("Failed to prerender opener %r", phrase)
+        log.info(
+            "Persistent openers (background): %d rendered, %d already cached",
+            rendered, skipped,
+        )
+        if rendered:
+            cache.save()
+            log.info("Persisted %d new opener entries to disk", rendered)
     log.info(
-        "Pre-rendering %d persistent openers (skipped if already cached)...",
+        "Spawning background prerender of %d persistent openers (non-blocking)...",
         len(PERSISTENT_OPENERS),
     )
-    rendered = skipped = 0
-    for phrase in PERSISTENT_OPENERS:
-        if tts.cache_key(phrase) in cache:
-            skipped += 1
-        else:
-            tts.prerender(phrase)
-            rendered += 1
-    log.info(
-        "Persistent openers: %d rendered, %d already cached", rendered, skipped,
-    )
+    threading.Thread(
+        target=_bg_prerender_openers, daemon=True, name="prerender-openers",
+    ).start()
     # Ringback tone — synthesized from numpy (NOT via Kokoro), but stored
     # under the voice-aware cache key so on_enter's session.say() lookup
     # finds it. Inserted unconditionally on every prewarm so a stale
