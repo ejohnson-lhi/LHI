@@ -204,6 +204,63 @@ TRANSCRIPTS_DIR = Path(os.environ.get(
 # LLM-generated) so the greeting is consistent across calls.
 FIRST_MESSAGE_TEMPLATE = "Lighthouse Inn, this is {persona}, the AI assistant. How may I help you?"
 
+# Phrases to pre-render at worker prewarm. The goal: hit the TTS cache on
+# the FIRST sentence of an Iris response, which gates start-of-audio. Once
+# the first sentence plays, Kokoro can synthesize the rest in parallel.
+#
+# Curated from frequency analysis of ~77 transcripts (May 10-13, 2026):
+# every entry below appeared verbatim in at least two real calls, OR is a
+# system-controlled phrase (greeting, transfer status, voice admin) that
+# Iris emits directly without LLM phrasing variability.
+#
+# The cache persists to disk across worker / service / droplet restarts
+# (~/.cache/iris/tts_cache.pkl), so this prewarm pass is a one-time cost
+# on each new deploy; subsequent worker starts skip already-cached entries.
+PERSISTENT_OPENERS: tuple[str, ...] = (
+    # ----- Acknowledgments / fillers (high-frequency sentence starters) -----
+    "Of course.",
+    "Sure.",
+    "Got it.",
+    "Thank you.",
+    "One moment.",
+    "Let me check that for you.",
+    "I apologize.",
+    "You're right.",
+    "Sorry, I didn't catch that.",
+    "I'm sorry, I didn't quite catch that.",
+    "Could you say that again?",
+    # ----- Transfer flow (system-controlled exact strings) -----
+    "Let me transfer you to the front desk now.",
+    "Of course. Let me transfer you to the front desk now.",
+    "Sure, let me transfer you to the front desk now.",
+    "Okay, let me transfer you to the front desk.",
+    "Let me connect you to the front desk now.",
+    "Connecting you to the front desk now.",
+    "Connecting you to Eric now, one moment.",
+    "You're connected — I'll step out.",
+    "The front desk isn't picking up — let me try Eric's cell. One moment.",
+    "Eric's not picking up. Would you like me to try the front desk?",
+    # ----- Pet policy (highest-frequency hotel-fact answers) -----
+    "Yes, dogs are welcome!",
+    "Yes, we do allow dogs.",
+    "Yes, you can bring a dog.",
+    "Yes, we welcome dogs with a $20 fee per stay.",
+    "The pet fee is $20 per stay for dogs.",
+    "I'm sorry, but we don't accept cats.",
+    # ----- Hotel facts (frequent inn_info answers) -----
+    "Check-in is from 2 PM to 8 PM.",
+    "Check-out is at 11 AM.",
+    "We'd love to have you.",
+    # ----- Sign-off -----
+    "Is there anything else I can help you with today?",
+    "If you have any questions or need to make changes, please call us.",
+    # ----- Voice admin (system-controlled, exact strings) -----
+    "Voice set to Iris. It will apply to your next call.",
+    "Voice set to Henry. It will apply to your next call.",
+    "Voice set to Aoede. It will apply to your next call.",
+    "Voice set to Eric. It will apply to your next call.",
+)
+
 
 def _first_message_for(persona: str) -> str:
     return FIRST_MESSAGE_TEMPLATE.format(persona=persona)
@@ -651,6 +708,24 @@ def prewarm(proc: JobProcess) -> None:
     log.info("Pre-rendering greeting chunks (skipped if already cached)...")
     for chunk in _greeting_chunks_for(persona):
         tts.prerender(chunk)
+    # Pre-render persistent openers. prerender() is a no-op for entries
+    # already in the cache (loaded from disk above), so this is fast on
+    # warm cold-starts and only pays the synth cost when a new phrase is
+    # added to PERSISTENT_OPENERS or after a cache wipe.
+    log.info(
+        "Pre-rendering %d persistent openers (skipped if already cached)...",
+        len(PERSISTENT_OPENERS),
+    )
+    rendered = skipped = 0
+    for phrase in PERSISTENT_OPENERS:
+        if tts.cache_key(phrase) in cache:
+            skipped += 1
+        else:
+            tts.prerender(phrase)
+            rendered += 1
+    log.info(
+        "Persistent openers: %d rendered, %d already cached", rendered, skipped,
+    )
     # Ringback tone — synthesized from numpy (NOT via Kokoro), but stored
     # under the voice-aware cache key so on_enter's session.say() lookup
     # finds it. Inserted unconditionally on every prewarm so a stale
