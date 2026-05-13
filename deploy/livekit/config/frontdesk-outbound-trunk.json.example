@@ -2,7 +2,7 @@
   "trunk": {
     "name": "twilio-frontdesk-outbound",
     "address": "lighthouseinn-frontdesk.sip.twilio.com",
-    "numbers": [],
+    "numbers": ["+15419915071"],
     "auth_username": "REPLACE_WITH_SIP_DOMAIN_CREDENTIAL_USERNAME",
     "auth_password": "REPLACE_WITH_SIP_DOMAIN_CREDENTIAL_PASSWORD"
   }
