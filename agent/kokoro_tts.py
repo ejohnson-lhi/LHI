@@ -116,11 +116,12 @@ class KokoroTTS(tts.TTS):
 
         Different voices produce different audio for the same input text,
         so the voice has to be part of the key — otherwise switching
-        IRIS_VOICE would serve stale audio from the wrong voice. Format
-        is `[voice]text` so that two voices' entries can coexist in a
-        single cache file and survive voice switches.
+        IRIS_VOICE would serve stale audio from the wrong voice. The key
+        is also engine-prefixed (`[kokoro:voice]text`) so a future
+        ElevenLabs migration with an overlapping voice name can't return
+        Kokoro audio. CACHE_VERSION bumps on schema change drop old keys.
         """
-        return f"[{self._opts.voice}]{text}"
+        return f"[kokoro:{self._opts.voice}]{text}"
 
     def prerender(self, text: str) -> None:
         """Synthesize ``text`` synchronously and stash it in the cache.

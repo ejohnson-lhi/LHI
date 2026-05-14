@@ -61,6 +61,7 @@ del _p
 
 import inn_info
 from audio_cache import TTSAudioCache
+from intent_cache import DEFAULT_CACHE as INTENT_CACHE, IntentCallState
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
 
@@ -419,6 +420,13 @@ class IrisAgent(Agent):
         # and (2) override on_user_turn_completed to short-circuit the
         # LLM-invocation pipeline via StopResponse.
         self._silent = (called_number == IMMEDIATE_TRANSFER_DID)
+        # Intent-cache state: per-call. The cache fires on common static-fact
+        # questions (pet fee, check-in time, etc.) so the LLM is skipped on
+        # the easy turns. State tracks which response variants we've already
+        # used (so we don't immediately repeat) and whether the cache has
+        # been disabled for this call (after any tool call fires, we defer
+        # to the LLM for the rest of the conversation).
+        self._intent_state = IntentCallState()
         super().__init__(instructions=build_system_prompt(
             caller_phone=caller_phone,
             is_admin=self._is_admin,
@@ -478,24 +486,91 @@ class IrisAgent(Agent):
         await self.session.say(first_message, allow_interruptions=False)
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        """In silent (immediate-transfer) mode, prevent the LLM from being
-        invoked for any user turn. Without this, the framework's default
-        pipeline still calls the LLM after STT — wasting tokens and
-        polluting the transcript with phantom assistant messages even if
-        their TTS audio is muted by `session.output.set_audio_enabled(False)`.
+        """Two responsibilities, in priority order:
 
-        Raising `StopResponse` is the framework-supported way to skip the
-        turn entirely. If the class couldn't be imported (different
-        livekit-agents version), we just return — audio output is muted
-        so the user-facing impact is the same; we only pay the (small)
-        cost of a wasted LLM call per turn.
+        1. **Silent mode (immediate-transfer DID)**: skip the LLM entirely.
+           The framework's default pipeline would invoke the LLM after STT
+           and the assistant's audio would leak into the bridged human
+           conversation. Audio output is already muted via
+           `session.output.set_audio_enabled(False)` in on_enter; this hook
+           prevents the wasted LLM call + phantom assistant message in
+           chat history. Raising `StopResponse` is the supported way.
+
+        2. **Intent cache**: for normal calls, try to match the STT text
+           to a static-fact intent (pet fee, check-in time, WiFi, etc.).
+           On a hit, pick a response variant, speak it via `session.say()`,
+           and `raise StopResponse` to skip the LLM for this turn. On a
+           miss, return normally and let the LLM handle the turn.
         """
-        if not self._silent:
-            return
+        # Extract user text once (used by both paths).
         text = getattr(new_message, "text_content", None)
         if text is None and hasattr(new_message, "content"):
             text = new_message.content
-        log.info("Silent mode: skipping LLM for user turn: %r", text or "")
+        if isinstance(text, list):
+            text = " ".join(
+                getattr(b, "text", str(b)) for b in text if b is not None
+            )
+        text = (text or "").strip()
+
+        # Path 1: silent mode — short-circuit unconditionally.
+        if self._silent:
+            log.info("Silent mode: skipping LLM for user turn: %r", text)
+            if StopResponse is not None:
+                raise StopResponse()
+            return
+
+        # Track turn depth for the `skip_after_turn` guardrail.
+        self._intent_state.user_turn_count += 1
+
+        # If any tool has been called this conversation, disable the cache
+        # for the rest of the call — we're inside a caller-specific flow.
+        if not self._intent_state.disabled:
+            try:
+                for item in turn_ctx.items:
+                    if type(item).__name__ == "FunctionCall":
+                        self._intent_state.disabled = True
+                        log.info(
+                            "Intent cache disabled for rest of call "
+                            "(tool was called earlier)"
+                        )
+                        break
+            except Exception:
+                # `turn_ctx.items` API might differ across versions; safe
+                # to skip the check — worst case is a cache hit during a
+                # flow, which the guardrails should also catch.
+                pass
+
+        # Path 2: intent cache classify + speak.
+        if not text:
+            return
+        intent_id = INTENT_CACHE.classify(text, self._intent_state)
+        if intent_id is None:
+            return
+        chosen = INTENT_CACHE.pick_response(
+            intent_id,
+            persona=self._persona,
+            exclude_texts=self._intent_state.used_response_texts,
+        )
+        if not chosen:
+            return
+
+        log.info(
+            "Intent cache HIT: intent=%s, response=%r (turn %d)",
+            intent_id, chosen[:80], self._intent_state.user_turn_count,
+        )
+        self._intent_state.used_response_texts.add(chosen)
+        try:
+            # session.say() adds the assistant message to chat_ctx and
+            # plays the audio. The text is in the TTS cache (prewarmed),
+            # so playback starts ~300ms after this call.
+            await self.session.say(chosen, allow_interruptions=True)
+        except Exception:
+            log.exception(
+                "session.say() failed for cached intent %s; falling back to LLM",
+                intent_id,
+            )
+            return  # let the LLM handle it
+
         if StopResponse is not None:
             raise StopResponse()
 
@@ -776,10 +851,22 @@ def prewarm(proc: JobProcess) -> None:
     # and the openers render in parallel with whatever the agent is doing.
     # The background thread calls cache.save() at the end so the new entries
     # persist; subsequent prewarms find them already cached and skip them.
+    # Build the prewarm worklist: PERSISTENT_OPENERS (greeting, transfer
+    # flow, voice-admin confirmations) ∪ every response.text in the
+    # intent cache (pet_fee variants, check-in time variants, etc.).
+    # Deduplicate while preserving order — opener phrases first.
+    intent_response_texts = INTENT_CACHE.all_response_texts()
+    seen_phrases: set[str] = set()
+    prewarm_phrases: list[str] = []
+    for phrase in list(PERSISTENT_OPENERS) + intent_response_texts:
+        if phrase not in seen_phrases:
+            seen_phrases.add(phrase)
+            prewarm_phrases.append(phrase)
+
     import threading
-    def _bg_prerender_openers() -> None:
+    def _bg_prerender_phrases() -> None:
         rendered = skipped = 0
-        for phrase in PERSISTENT_OPENERS:
+        for phrase in prewarm_phrases:
             if tts.cache_key(phrase) in cache:
                 skipped += 1
                 continue
@@ -787,20 +874,25 @@ def prewarm(proc: JobProcess) -> None:
                 tts.prerender(phrase)
                 rendered += 1
             except Exception:
-                log.exception("Failed to prerender opener %r", phrase)
+                log.exception("Failed to prerender phrase %r", phrase)
         log.info(
-            "Persistent openers (background): %d rendered, %d already cached",
+            "Prewarm phrases (background): %d rendered, %d already cached "
+            "(openers=%d, intent_cache=%d, total=%d)",
             rendered, skipped,
+            len(PERSISTENT_OPENERS), len(intent_response_texts),
+            len(prewarm_phrases),
         )
         if rendered:
             cache.save()
-            log.info("Persisted %d new opener entries to disk", rendered)
+            log.info("Persisted %d new prewarm entries to disk", rendered)
     log.info(
-        "Spawning background prerender of %d persistent openers (non-blocking)...",
-        len(PERSISTENT_OPENERS),
+        "Spawning background prerender of %d phrases (%d openers + %d intent-cache responses, deduped to %d, non-blocking)...",
+        len(prewarm_phrases),
+        len(PERSISTENT_OPENERS), len(intent_response_texts),
+        len(prewarm_phrases),
     )
     threading.Thread(
-        target=_bg_prerender_openers, daemon=True, name="prerender-openers",
+        target=_bg_prerender_phrases, daemon=True, name="prerender-phrases",
     ).start()
     # Ringback tone — synthesized from numpy (NOT via Kokoro), but stored
     # under the voice-aware cache key so on_enter's session.say() lookup

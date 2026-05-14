@@ -1,0 +1,137 @@
+Total cacheable pairs: 33
+
+=== pet_fee: 18 pair(s) ===
+  Q: I bring a dog?
+  A: Yes, you can bring a dog. There's a twenty-dollar pet fee for the stay. Would you like to go ahead and book a room?
+
+  Q: Can I bring a dog?
+  A: Yes, you can bring a dog. There's a twenty-dollar pet fee for the stay. 
+
+What date would you like to check in?
+
+  Q: Can I bring it?
+  A: Yes, absolutely — you can bring your dog. There's a $20 pet fee for the stay.
+
+Were you looking to make a reservation?
+
+  Q: I bring a dog?
+  A: Yes, you can bring your dog. There's a twenty dollar pet fee for the stay.
+
+Would you like to make a reservation?
+
+  Q: Can I bring a dog?
+  A: Yes, dogs are welcome. There's a twenty dollar pet fee for the stay.
+
+Would you like to book a room?
+
+  Q: Can I bring a dog?
+  A: Yes, dogs are welcome! There's a $20 pet fee per stay. Would you like to make a reservation?
+
+  Q: Do you allow dogs?
+  A: Yes, we do welcome dogs with a $20 fee per stay. Are you looking to make a reservation?
+
+  Q: What's the tech fee?
+  A: The pet fee for dogs is $20 per stay. Were you interested in booking a room with us?
+
+  Q: What's the pet pee?
+  A: The pet fee is $20 per stay for dogs. Would you like to make a reservation?
+
+  Q: By the way, when you said the pet fee, you said twenty dollar instead of twenty dollars.
+  A: You're right — thank you for catching that. The pet fee is twenty dollars per stay.
+
+Now, what date would you like to check out?
+
+  Q: Do you allow dogs?
+  A: Yes, we welcome dogs with a $20 fee per stay. Just so you know, cats are not allowed.
+
+Were you looking to make a reservation?
+
+  Q: Do you allow dogs,
+  A: Yes, we do — dogs are welcome with a $20 fee per stay.
+
+Is there anything else I can help you with?
+
+  Q: Do you allow dogs?
+  A: Yes, dogs are welcome here with a $20 fee per stay.
+
+Would you like to make a reservation?
+
+  Q: What's the pet pee?
+  A: The pet fee is $20 per stay for dogs.
+
+Would you like to book a room?
+
+  Q: Petty should be twenty dollars, plural, not dollar, single.
+  A: You're absolutely right — thank you for catching that. The pet fee is $20 per stay for dogs.
+
+Is there anything else I can help you with?
+
+  Q: What's the pet peeve?
+  A: The pet fee is twenty dollars per stay for dogs.
+
+  Q: Do you accept pets?
+  A: Yes, dogs are welcome with a $20 fee per stay. However, we don't accept cats. Are you looking to bring a dog with you?
+
+=== pet_dogs: 5 pair(s) ===
+  Q: Hi. I still didn't have a ringtone. Now would you tell me if you allow dogs?
+  A: Yes, we do allow dogs — there's a twenty-dollar fee per stay. Cats aren't allowed, though. 
+
+Are you looking to make a reservation?
+
+  Q: Oh, hi. How are you doing?
+  A: I'm doing well, thank you! 
+
+Yes, dogs are welcome here with a twenty-dollar fee per stay. Would you like to make a reservation?
+
+  Q: Can I bring a dog?
+  A: Yes, dogs are welcome! There's a twenty-dollar fee per stay for dogs. 
+
+Are you looking to make a reservation?
+
+=== pet_cats: 0 pair(s) ===
+  (none)
+
+=== checkin_time: 5 pair(s) ===
+  Q: Yeah.
+  A: We'd love to have you. What date would you like to check in?
+
+  Q: Can I
+  A: I'd be happy to check pricing for you. What dates were you looking to check in and check out?
+
+=== checkout_time: 1 pair(s) ===
+  Q: Friday.
+  A: What date would you like to check out?
+
+=== wifi: 0 pair(s) ===
+  (none)
+
+=== breakfast: 0 pair(s) ===
+  (none)
+
+=== parking: 0 pair(s) ===
+  (none)
+
+=== pool: 0 pair(s) ===
+  (none)
+
+=== smoking: 0 pair(s) ===
+  (none)
+
+=== amenities: 0 pair(s) ===
+  (none)
+
+=== address: 0 pair(s) ===
+  (none)
+
+=== other: 4 pair(s) ===
+  Q: Five four one two two eight. Six seven eight six.
+  A: Got it — checking for Johnson with phone number ending in 6786. One moment.
+
+  Q: What's the tech fee?
+  A: I'm not sure what you're asking about. Could you clarify what fee you mean?
+
+  Q: What is the patch key?
+  A: Sorry, I didn't quite catch that. Could you repeat what you're asking about?
+
+  Q: Oh, hello. You accept that?
+  A: I'm sorry, I didn't quite catch that. Could you say that again?

@@ -26,31 +26,56 @@ echo === Local git status ===
 git status --short
 echo.
 
-set "MSG="
+REM Decide commit mode:
+REM   - If .deploy_msg exists and is non-empty: preview it, let user
+REM     accept/override/skip. Use `git commit -F file` so multi-line
+REM     content with quotes / parens / ampersands works correctly (the
+REM     old `-m "!MSG!"` form broke on embedded double quotes — git
+REM     would parse the rest of the message as filenames).
+REM   - If .deploy_msg missing/empty: prompt for a single-line message,
+REM     write it to .deploy_msg, then use `-F`.
+REM   - "skip" or blank override = push+deploy without commit.
+
+set "COMMIT_FROM_FILE=false"
+
 if exist "%MSG_FILE%" (
-    set /p MSG=<"%MSG_FILE%"
+    for %%I in ("%MSG_FILE%") do set "MSG_SIZE=%%~zI"
+    if !MSG_SIZE! GTR 0 (
+        echo Commit message from .deploy_msg:
+        echo ----------------------------------------
+        type "%MSG_FILE%"
+        echo.
+        echo ----------------------------------------
+        set "OVERRIDE="
+        set /p "OVERRIDE=Press Enter to use this, type a new message to override (single line), or 'skip' to push without committing: "
+        if /i "!OVERRIDE!"=="skip" (
+            set "COMMIT_FROM_FILE=false"
+        ) else if not "!OVERRIDE!"=="" (
+            REM Override: write to the file so git -F can read it.
+            > "%MSG_FILE%" echo !OVERRIDE!
+            set "COMMIT_FROM_FILE=true"
+        ) else (
+            set "COMMIT_FROM_FILE=true"
+        )
+    )
 )
 
-if not "!MSG!"=="" (
-    echo Commit message from .deploy_msg:
-    echo   !MSG!
-    echo.
-    set "OVERRIDE="
-    set /p "OVERRIDE=Press Enter to use this, type a new message to override, or 'skip' to push without committing: "
-    if /i "!OVERRIDE!"=="skip" (
-        set "MSG="
-    ) else if not "!OVERRIDE!"=="" (
-        set "MSG=!OVERRIDE!"
+if "%COMMIT_FROM_FILE%"=="false" (
+    if not exist "%MSG_FILE%" (
+        set "NEW_MSG="
+        set /p "NEW_MSG=Commit message (single line, blank to skip commit): "
+        if not "!NEW_MSG!"=="" (
+            > "%MSG_FILE%" echo !NEW_MSG!
+            set "COMMIT_FROM_FILE=true"
+        )
     )
-) else (
-    set /p "MSG=Commit message (blank to skip commit, just push+deploy): "
 )
 echo.
 
-if not "!MSG!"=="" (
+if "%COMMIT_FROM_FILE%"=="true" (
     echo === Staging and committing ===
     git add -A
-    git commit -m "!MSG!"
+    git commit -F "%MSG_FILE%"
     if errorlevel 1 (
         echo.
         echo Commit failed - nothing to commit, or other error.

@@ -49,7 +49,11 @@ log = logging.getLogger("audio_cache")
 #   3 - cache keys now include voice prefix "[voice]text" so multiple
 #       voices coexist without serving stale audio when switching;
 #       also "$NN" now -> "N dollar" (singular) for adjectival fit.
-CACHE_VERSION = 3
+#   4 - cache keys now engine-prefixed: "[kokoro:voice]text" so a future
+#       ElevenLabs migration (with potentially overlapping voice names)
+#       can't return stale-engine audio. The classifier filters by
+#       current persona separately; this is purely about audio bytes.
+CACHE_VERSION = 4
 
 
 class TTSAudioCache:

@@ -1,0 +1,593 @@
+{
+  "_doc": "Static-fact intent cache. STT output is lowercased and substring-matched against each intent's `trigger_phrases`. Longest-trigger-wins to disambiguate overlapping intents (e.g. 'pet fee' beats 'pet'). On hit: a response variant is picked at random (weighted, avoiding the most-recently-used response within the same call, and filtered to only those allowed for the agent's current persona). The picked text is spoken via the TTS audio cache, skipping the LLM entirely. The (user-STT-text, chosen-response-text) pair is injected into the LLM's chat history so subsequent turns have continuity — e.g. if the cache fires on 'do you allow dogs?' with a $20-fee answer, a later LLM-driven price quote will correctly include the pet fee.\n\nPhilosophy: only intents where the answer doesn't change with the date or who is calling. Reservation lookups, availability, and booking flows MUST go to the LLM. Most responses are bare factual answers — booking-funnel follow-ups are deliberately rare because the LLM has been overdoing them, and the sale should be a byproduct of good conversation rather than the goal of every turn.\n\nResponse schema: `text` (required), `weight` (optional, default 1.0), `personas` (optional list; if absent, response is persona-agnostic and used regardless of which voice/persona Iris is running as). A response with `personas: ['Iris']` will only be picked when Iris is the active persona; it'll be filtered out when running as Henry, Aoede, or Eric. Used to prevent mined responses containing 'Iris' / 'Henry' / 'Sadie' / 'Aoede' / 'Eric' from leaking into the wrong persona's mouth. Mining pipeline auto-flags any response containing a persona name; ungraded ones don't enter the cache until tagged or rewritten persona-agnostic.\n\nPrewarm: every response.text in this file gets pre-rendered into the TTS audio cache at agent startup (alongside PERSISTENT_OPENERS), so the very first use of any variant plays as a ~300ms cache hit rather than a 2-3s Kokoro synth.",
+  "version": 3,
+  "guardrails": {
+    "_doc": "Cache fires ONLY if all conditions pass. Otherwise fall through to the LLM.",
+    "min_chars": 4,
+    "min_words": 2,
+    "skip_if_recent_tool_call": true,
+    "_skip_if_recent_tool_call_doc": "Once any tool has been called in this conversation, the dialog is already inside a caller-specific or date-specific flow. Bail out of the cache to avoid disconnected answers.",
+    "skip_after_turn": 12,
+    "_skip_after_turn_doc": "After ~12 turns the conversation context is usually too deep for a canned answer to feel cohesive. Early-call factual Q&A is the sweet spot.",
+    "skip_if_user_text_contains": [
+      "reservation",
+      "booking",
+      "book a room",
+      "available",
+      "availability",
+      "any rooms",
+      "have a room",
+      "got a room"
+    ],
+    "_skip_if_user_text_contains_doc": "These words signal the caller is heading into a date/caller-specific flow (reservation lookup, availability check, booking). Always defer to the LLM."
+  },
+  "intents": {
+    "pet_fee": {
+      "_doc": "Caller asks specifically about pet/dog cost. Distinct from pet_dogs_allowed (yes/no policy question).",
+      "trigger_phrases": [
+        "pet fee", "pet's fee", "pets fee",
+        "dog fee", "dog's fee", "dogs fee",
+        "pet cost", "pet charge", "pet price", "pet rate",
+        "dog cost", "dog charge", "dog price", "dog rate",
+        "fee for a dog", "fee for the dog", "fee for my dog", "fee for dogs",
+        "fee for pets", "fee for a pet", "fee for the pet",
+        "fee to bring a dog", "fee to bring my dog", "fee to bring a pet",
+        "fee for bringing a dog", "fee for bringing a pet",
+        "charge for a dog", "charge for the dog", "charge for dogs",
+        "charge for pets", "charge for a pet",
+        "charge to bring a dog", "charge to bring a pet",
+        "cost for a dog", "cost for the dog", "cost for pets", "cost for a pet",
+        "cost to bring a dog", "cost to bring my dog", "cost of bringing a dog",
+        "cost of bringing a pet", "cost to have a dog", "cost to have a pet",
+        "price for a dog", "price for pets",
+        "how much for a dog", "how much for the dog", "how much for my dog",
+        "how much for pets", "how much for a pet", "how much for the pet",
+        "how much is a dog", "how much is the dog", "how much is the pet fee",
+        "how much does a dog cost", "how much do dogs cost",
+        "how much does a pet cost", "how much do pets cost",
+        "how much extra for a dog", "how much extra for a pet",
+        "how much do you charge for a dog", "how much do you charge for pets",
+        "do you charge for pets", "do you charge for dogs",
+        "do you charge for a dog", "do you charge for a pet",
+        "do you charge extra for pets", "do you charge extra for a dog",
+        "is there a pet fee", "is there a fee for pets",
+        "is there a fee for dogs", "is there a fee for a dog",
+        "is there a charge for pets", "is there a charge for dogs",
+        "is there an extra charge for pets", "is there an extra charge for dogs",
+        "any fee for pets", "any fee for dogs", "any charge for pets",
+        "additional fee for a dog", "additional fee for pets",
+        "additional charge for a dog", "additional charge for pets",
+        "extra fee for a dog", "extra fee for pets",
+        "extra charge for a dog", "extra charge for pets",
+        "extra cost for a dog", "extra cost for pets",
+        "what's the pet", "what is the pet fee", "what's the pet fee",
+        "what's the dog fee", "what is the dog fee",
+        "what's the charge for a dog", "what is the charge for a dog",
+        "what's the cost for a dog", "what is the cost for a dog",
+        "what do you charge for a dog", "what do you charge for pets"
+      ],
+      "_stt_mishearings_doc": "Common STT mishearings of 'pet fee' observed in real transcripts.",
+      "stt_mishearings": [
+        "pet pee", "pets pee", "pet peeve", "pet pea",
+        "tech fee", "tech key", "patch fee", "patch key"
+      ],
+      "responses": [
+        {"text": "The pet fee is twenty dollars per stay for dogs.", "weight": 1.0},
+        {"text": "Twenty dollars per stay for dogs.", "weight": 1.0},
+        {"text": "There's a twenty-dollar pet fee per stay.", "weight": 1.0},
+        {"text": "Twenty dollars per stay — and that covers up to two dogs for one week.", "weight": 0.7},
+        {"text": "It's twenty dollars per stay. Cats aren't allowed, by the way.", "weight": 0.5},
+        {"text": "Twenty dollars per stay for dogs. We don't accept cats.", "weight": 0.5}
+      ]
+    },
+    "pet_dogs_allowed": {
+      "_doc": "Caller asks if dogs/pets are allowed at all. Yes/no policy question.",
+      "trigger_phrases": [
+        "allow dogs", "allow a dog", "allow my dog", "allow pets", "allow a pet",
+        "accept dogs", "accept a dog", "accept my dog", "accept pets", "accept a pet",
+        "take dogs", "take a dog", "take pets", "take a pet",
+        "welcome dogs", "welcome a dog", "welcome pets",
+        "permit dogs", "permit pets",
+        "dogs allowed", "dog allowed", "pets allowed", "pet allowed",
+        "dogs welcome", "dog welcome", "pets welcome", "pet welcome",
+        "dogs okay", "dogs ok", "dog okay", "dog ok", "pets okay", "pet ok",
+        "are dogs alright", "are pets alright",
+        "can i bring a dog", "can i bring my dog", "can i bring dogs",
+        "can i bring a pet", "can i bring my pet", "can i bring pets",
+        "can my dog come", "can my dog stay", "can my pet stay",
+        "bring a dog", "bring my dog", "bring our dog",
+        "bring a pet", "bring my pet", "bring our pet",
+        "traveling with a dog", "traveling with my dog", "travelling with a dog",
+        "traveling with a pet", "traveling with our dog",
+        "with my dog", "with our dog", "with a dog", "with my pet",
+        "i have a dog", "we have a dog", "i've got a dog",
+        "got a dog with me", "got my dog with me",
+        "pet friendly", "pet-friendly", "dog friendly", "dog-friendly",
+        "dog rooms", "rooms for dogs", "rooms for pets",
+        "is it ok if i bring my dog", "is it okay if i bring my dog",
+        "is it ok to bring a dog", "is it okay to bring a dog",
+        "mind if i bring my dog", "mind if i bring a dog",
+        "ok to bring a dog", "okay to bring a dog"
+      ],
+      "responses": [
+        {"text": "Yes, dogs are welcome with a twenty-dollar fee per stay.", "weight": 1.0},
+        {"text": "Yes, we welcome dogs. There's a twenty-dollar pet fee per stay.", "weight": 1.0},
+        {"text": "Yes, you can bring a dog. The pet fee is twenty dollars per stay.", "weight": 1.0},
+        {"text": "Dogs are welcome here — twenty-dollar fee per stay.", "weight": 1.0},
+        {"text": "Yes, dogs are welcome. Twenty dollars per stay, and that covers up to two dogs.", "weight": 0.8},
+        {"text": "Dogs are welcome — twenty-dollar fee per stay. Cats aren't allowed, though.", "weight": 0.7},
+        {"text": "Yes, we're dog-friendly. Twenty dollars per stay.", "weight": 0.8}
+      ]
+    },
+    "pet_cats": {
+      "_doc": "Caller asks specifically about cats.",
+      "trigger_phrases": [
+        "allow cats", "allow a cat", "allow my cat",
+        "accept cats", "accept a cat", "accept my cat",
+        "take cats", "take a cat",
+        "welcome cats", "welcome a cat",
+        "permit cats",
+        "cats allowed", "cat allowed",
+        "cats welcome", "cat welcome",
+        "cats okay", "cats ok", "cat okay", "cat ok",
+        "can i bring a cat", "can i bring my cat", "can i bring cats",
+        "can my cat come", "can my cat stay",
+        "bring a cat", "bring my cat", "bring our cat",
+        "traveling with a cat", "traveling with my cat",
+        "with my cat", "with our cat", "with a cat",
+        "i have a cat", "we have a cat", "i've got a cat",
+        "cat friendly", "cat-friendly",
+        "is it ok if i bring my cat", "is it ok to bring a cat",
+        "mind if i bring my cat", "ok to bring a cat"
+      ],
+      "responses": [
+        {"text": "I'm sorry, but we don't accept cats.", "weight": 1.0},
+        {"text": "Unfortunately, cats aren't allowed.", "weight": 1.0},
+        {"text": "Sorry, cats aren't allowed. We do welcome dogs, though.", "weight": 0.8},
+        {"text": "No cats, unfortunately — but dogs are welcome.", "weight": 0.8}
+      ]
+    },
+    "pet_unattended": {
+      "_doc": "Caller asks if a dog can be left in the room alone.",
+      "trigger_phrases": [
+        "leave my dog", "leave the dog", "leave my pet", "leave the pet",
+        "leaving my dog", "leaving the dog", "leaving my pet",
+        "leave him alone", "leave her alone",
+        "dog alone", "dog by himself", "dog by herself",
+        "dog unattended", "pet unattended",
+        "dog in the room alone", "dog in my room alone",
+        "leave my dog in the room", "leave the dog in the room",
+        "leave my dog in the crate", "leave my dog in a crate",
+        "leave my dog in the kennel", "leave my dog in a kennel",
+        "can my dog stay in the room", "can i leave my dog",
+        "can i leave him in the room", "can i leave her in the room"
+      ],
+      "responses": [
+        {"text": "No, dogs can't be left unattended in the room — even in a kennel or crate. We ask that they stay with you.", "weight": 1.0},
+        {"text": "Please keep your dog with you — they can't be left alone in the room.", "weight": 1.0},
+        {"text": "Dogs need to stay with their owner — we ask that they not be left alone in the room.", "weight": 1.0}
+      ]
+    },
+    "pet_damage_liability": {
+      "_doc": "Caller asks about responsibility for pet-caused damage.",
+      "trigger_phrases": [
+        "liable for damage", "liable for damages",
+        "responsible for damage", "responsible for damages",
+        "what if my dog damages", "what if my dog ruins",
+        "if my dog makes a mess", "dog makes a mess",
+        "pet odor", "pet stain", "dog stain",
+        "extra cleaning fee", "deep cleaning fee"
+      ],
+      "responses": [
+        {"text": "Yes — the credit card on file may be charged for any pet-related damage, odor, stains, or extra cleaning. We just ask that you keep an eye on things.", "weight": 1.0},
+        {"text": "We do charge the card on file for any damage or extra cleaning caused by a pet.", "weight": 1.0}
+      ]
+    },
+    "checkin_time": {
+      "_doc": "Caller asks what time check-in is.",
+      "trigger_phrases": [
+        "what time is check in", "what time is check-in", "what time is checkin",
+        "what time can i check in", "what time can i checkin",
+        "what time check in", "what time check-in",
+        "what time should i check in",
+        "what's check in time", "what's check-in time", "what is check in time",
+        "what is check-in time", "what is the check-in time",
+        "when can i check in", "when do i check in", "when is check in",
+        "when is check-in", "when does check in start", "when does check-in start",
+        "how early can i check in", "how early can i arrive",
+        "earliest check in", "earliest check-in", "earliest i can check in",
+        "earliest i can arrive",
+        "check in time", "check-in time", "checkin time",
+        "check in hours", "check-in hours",
+        "when do you start check in", "when do you start check-in",
+        "what time should i arrive", "what time can i arrive",
+        "check in starts", "check-in starts"
+      ],
+      "responses": [
+        {"text": "Check-in is when the rooms are ready, typically around two PM until eight PM.", "weight": 1.0},
+        {"text": "You can check in once your room is ready — usually around two PM. We're at the desk till eight.", "weight": 1.0},
+        {"text": "Around two PM until eight. Sometimes rooms are ready earlier — feel free to call when you get to town.", "weight": 1.0},
+        {"text": "Two until eight PM. Call ahead if you'll arrive after eight.", "weight": 0.7},
+        {"text": "Two PM is typical, give or take depending on cleaning. Up till eight PM.", "weight": 0.8}
+      ]
+    },
+    "checkout_time": {
+      "_doc": "Caller asks what time check-out is.",
+      "trigger_phrases": [
+        "what time is check out", "what time is check-out", "what time is checkout",
+        "what time do i check out", "what time do i need to check out",
+        "what time check out", "what time check-out",
+        "what time should i check out", "what time must i check out",
+        "what's check out time", "what's check-out time",
+        "what is check out time", "what is check-out time",
+        "when do i check out", "when is check out", "when is check-out",
+        "when do i have to leave", "when must i leave",
+        "how late can i check out", "latest check out", "latest checkout",
+        "check out time", "check-out time", "checkout time",
+        "check out by", "check-out by"
+      ],
+      "responses": [
+        {"text": "Check-out is at eleven AM.", "weight": 1.0},
+        {"text": "Eleven in the morning.", "weight": 1.0},
+        {"text": "Eleven AM is check-out.", "weight": 1.0},
+        {"text": "Eleven AM — let us know in the morning if you need a bit more time.", "weight": 0.7}
+      ]
+    },
+    "wifi": {
+      "_doc": "Caller asks about Wi-Fi or internet access.",
+      "trigger_phrases": [
+        "wifi", "wi-fi", "wi fi", "wireless internet", "wireless",
+        "internet", "internet access", "internet connection",
+        "is there wifi", "is wifi free", "is there free wifi",
+        "do you have wifi", "do you have wi-fi", "do you have internet",
+        "free wifi", "free wi-fi", "free internet",
+        "network access", "network password", "wifi password", "wi-fi password",
+        "get online", "going online", "get on the internet"
+      ],
+      "responses": [
+        {"text": "Free Wi-Fi is available everywhere in the building.", "weight": 1.0},
+        {"text": "Yes — we have free Wi-Fi throughout the inn.", "weight": 1.0},
+        {"text": "Free Wi-Fi, available everywhere.", "weight": 1.0},
+        {"text": "Yes, free Wi-Fi all through the building.", "weight": 1.0}
+      ]
+    },
+    "breakfast": {
+      "_doc": "Caller asks about breakfast.",
+      "trigger_phrases": [
+        "breakfast", "breakfasts",
+        "is breakfast included", "is breakfast free",
+        "do you serve breakfast", "do you have breakfast",
+        "is there breakfast", "is there food",
+        "continental breakfast", "morning meal",
+        "what's for breakfast", "what is breakfast",
+        "breakfast time", "breakfast hours",
+        "when is breakfast", "what time is breakfast",
+        "breakfast included", "complimentary breakfast"
+      ],
+      "responses": [
+        {"text": "Yes, a homemade breakfast is included with your stay.", "weight": 1.0},
+        {"text": "Homemade breakfast, included with the stay.", "weight": 1.0},
+        {"text": "Yes — breakfast is homemade, and it's included.", "weight": 1.0},
+        {"text": "We do — a homemade breakfast comes with every stay.", "weight": 1.0}
+      ]
+    },
+    "coffee": {
+      "_doc": "Caller asks about coffee availability or in-room coffee.",
+      "trigger_phrases": [
+        "have any coffee", "got any coffee",
+        "offer coffee", "serve coffee",
+        "is there coffee", "is coffee available",
+        "in-room coffee", "in room coffee",
+        "coffee in the room", "coffee in my room",
+        "coffee maker", "coffee pot",
+        "do the rooms have coffee", "do rooms have coffee",
+        "coffee in the morning", "morning coffee"
+      ],
+      "responses": [
+        {"text": "Instant coffee is in the lobby twenty-four seven, and brewed coffee is in the dining room in the morning and through the day.", "weight": 1.0},
+        {"text": "Instant in the lobby anytime, plus brewed in the dining room mornings and afternoons.", "weight": 1.0},
+        {"text": "Coffee in the lobby twenty-four seven, brewed coffee in the dining room during the day.", "weight": 1.0},
+        {"text": "Not in the rooms, but instant is in the lobby anytime and brewed is in the dining room mornings.", "weight": 0.9}
+      ]
+    },
+    "parking": {
+      "_doc": "Caller asks about parking.",
+      "trigger_phrases": [
+        "parking", "park my car", "park my truck",
+        "park my rv", "park my motorhome",
+        "is parking free", "free parking",
+        "valet", "valet parking",
+        "where do i park", "where can i park",
+        "do you have parking", "is there parking",
+        "parking lot", "self parking", "self-parking",
+        "park on site", "parking on site",
+        "overnight parking"
+      ],
+      "responses": [
+        {"text": "Yes — free self-parking, on site.", "weight": 1.0},
+        {"text": "Free self-parking, right at the inn.", "weight": 1.0},
+        {"text": "Self-parking is free and on site.", "weight": 1.0}
+      ]
+    },
+    "trailer_parking": {
+      "_doc": "Caller asks about trailer or RV parking specifically.",
+      "trigger_phrases": [
+        "trailer parking", "park a trailer", "park my trailer",
+        "park an rv", "park my rv", "rv parking",
+        "park a motorhome", "park my motorhome",
+        "long vehicle parking", "extra long parking"
+      ],
+      "responses": [
+        {"text": "Yes — trailer-length parking is available for rooms twenty-five and twenty-seven. There's also trailer parking in the front lot and on the street in back.", "weight": 1.0},
+        {"text": "Trailer parking is available — rooms twenty-five and twenty-seven have trailer-length spots, plus more space in the front lot and on the street behind the inn.", "weight": 1.0}
+      ]
+    },
+    "smoking": {
+      "_doc": "Caller asks about smoking policy.",
+      "trigger_phrases": [
+        "can i smoke", "may i smoke",
+        "smoking allowed", "is smoking allowed",
+        "smoking room", "smoking rooms",
+        "smoke in the room", "smoke in my room",
+        "smoking policy", "smoke free",
+        "no smoking",
+        "cannabis", "marijuana", "weed",
+        "vape", "vaping",
+        "smoke outside"
+      ],
+      "responses": [
+        {"text": "Smoking isn't allowed in the rooms — that includes cannabis. There's a three-hundred-dollar fee if smoking is detected.", "weight": 1.0},
+        {"text": "No smoking inside the rooms, please. A three-hundred-dollar fee applies if it's detected.", "weight": 1.0},
+        {"text": "We're a non-smoking inn — including cannabis. A three-hundred-dollar fee applies if there's evidence of smoking inside.", "weight": 1.0}
+      ]
+    },
+    "pool_spa_gym": {
+      "_doc": "Caller asks about pool, hot tub, spa, gym, fitness facilities.",
+      "trigger_phrases": [
+        "swimming pool", "pool",
+        "hot tub", "hottub", "jacuzzi",
+        "is there a pool", "do you have a pool",
+        "spa", "is there a spa", "do you have a spa",
+        "gym", "fitness center", "workout room",
+        "exercise room", "exercise equipment",
+        "is there a gym", "do you have a gym"
+      ],
+      "responses": [
+        {"text": "We don't have a pool, hot tub, or gym on site.", "weight": 1.0},
+        {"text": "No pool or hot tub, sorry — we're a smaller historic inn.", "weight": 1.0},
+        {"text": "No pool, spa, or gym here. The inn focuses on the historic rooms and the included breakfast.", "weight": 0.9}
+      ]
+    },
+    "ev_charging": {
+      "_doc": "Caller asks about EV charging on site.",
+      "trigger_phrases": [
+        "ev charging", "ev charger", "ev station",
+        "electric car charging", "electric vehicle charging",
+        "charge my electric car", "charge my electric vehicle",
+        "tesla charger", "tesla charging", "tesla destination",
+        "charge my tesla", "charge my ev",
+        "j1772", "level 2 charger", "supercharger",
+        "plug in my car", "plug-in"
+      ],
+      "responses": [
+        {"text": "No on-site EV charging — but there are public chargers nearby in Florence, including a Tesla Destination Charger.", "weight": 1.0},
+        {"text": "We don't have EV charging here, but there are public chargers in town a short drive away.", "weight": 1.0}
+      ]
+    },
+    "ice_machine": {
+      "_doc": "Caller asks about ice availability.",
+      "trigger_phrases": [
+        "ice machine", "ice maker",
+        "get ice", "get some ice",
+        "where's the ice", "where is the ice",
+        "is there ice", "do you have ice"
+      ],
+      "responses": [
+        {"text": "Yes, we have plenty of ice for your coolers and drinks.", "weight": 1.0},
+        {"text": "Yep, ice is available — plenty for coolers or drinks.", "weight": 1.0}
+      ]
+    },
+    "in_room_amenities": {
+      "_doc": "Caller asks about microwave, fridge, kitchen, stove. Static facts: rooms have microwaves and mini-fridges, no stoves.",
+      "trigger_phrases": [
+        "microwave", "microwaves",
+        "fridge", "mini fridge", "mini-fridge", "refrigerator",
+        "kitchen in the room", "kitchen in my room", "kitchens in the rooms",
+        "kitchenette", "do rooms have kitchens",
+        "stove", "stove top", "cooktop", "burner"
+      ],
+      "responses": [
+        {"text": "All our rooms have microwaves and mini-fridges. No stoves, though.", "weight": 1.0},
+        {"text": "Every room has a microwave and a mini-fridge — no stove.", "weight": 1.0},
+        {"text": "Microwaves and mini-fridges in every room. We don't have stoves.", "weight": 1.0}
+      ]
+    },
+    "safes_in_rooms": {
+      "_doc": "Caller asks about in-room safes.",
+      "trigger_phrases": [
+        "room safe", "in-room safe", "in room safe",
+        "safe in the room", "safe in my room",
+        "safes in the rooms"
+      ],
+      "responses": [
+        {"text": "The rooms don't have safes.", "weight": 1.0},
+        {"text": "No in-room safes, unfortunately.", "weight": 1.0}
+      ]
+    },
+    "ai_identity": {
+      "_doc": "Caller checks whether they're talking to a real person. KB design note: keep these emphatic and unsoftened — callers want a clear AI acknowledgment to reduce the uncanny-valley effect.",
+      "trigger_phrases": [
+        "are you a robot", "are you robot",
+        "are you an a.i.", "are you ai", "are you a.i.",
+        "are you a bot", "are you bot",
+        "are you a computer", "are you computer",
+        "are you a machine",
+        "am i talking to a robot", "am i talking to ai",
+        "am i talking to a computer", "am i talking to a machine",
+        "am i talking to a real person", "am i talking to a person",
+        "am i talking to a human",
+        "are you a real person", "are you a real human",
+        "are you human", "are you a human",
+        "is this a recording", "is this a robot",
+        "is this an automated system", "is this automated",
+        "are you real"
+      ],
+      "responses": [
+        {"text": "Yes. I'm an artificial intelligence trained to answer the phones and make reservations.", "weight": 1.0},
+        {"text": "Yes — I'm an A I, trained to help with questions and reservations.", "weight": 1.0},
+        {"text": "Yes, I'm software — an A I trained to take calls and book rooms.", "weight": 1.0}
+      ]
+    },
+    "_speak_to_human_DISABLED": {
+      "_doc": "DISABLED for Phase 1: the cache would speak \"transferring you now\" but no transfer actually happens (the cache-hit path doesn't call transfer_to). Result: caller hears the line but stays on the line with Iris saying nothing. The LLM-driven path handles this correctly because it calls the transfer tool. Phase 2 will add a `post_action: transfer_to_front_desk` field to this intent and the cache-hit path will execute it after speaking. Until then, the underscore prefix excludes this from the active intents map.",
+      "trigger_phrases": [
+        "speak to a person", "speak to a real person",
+        "speak to a human", "speak to a real human",
+        "speak to someone", "speak with someone", "speak with a person",
+        "talk to a person", "talk to a real person",
+        "talk to a human", "talk to a real human",
+        "talk to someone", "talk with someone",
+        "get me a person", "get a person on the line", "get someone on the line",
+        "transfer me", "transfer me to a person", "transfer me to a human",
+        "transfer me to the front desk", "transfer to front desk",
+        "the front desk", "front desk please",
+        "let me speak to", "let me talk to",
+        "real person please", "real human please"
+      ],
+      "responses": [
+        {"text": "Of course. Let me transfer you to the front desk now.", "weight": 1.0},
+        {"text": "Sure, let me transfer you to the front desk now.", "weight": 1.0},
+        {"text": "Of course — connecting you to the front desk.", "weight": 1.0}
+      ]
+    },
+    "multi_day_discount": {
+      "_doc": "Caller asks about discounts for longer stays.",
+      "trigger_phrases": [
+        "multi day discount", "multi-day discount",
+        "multi night discount", "multi-night discount",
+        "discount for multiple nights",
+        "discount for a week", "weekly discount",
+        "longer stay discount", "long stay discount",
+        "is there a discount", "any discounts",
+        "discount for staying longer"
+      ],
+      "responses": [
+        {"text": "Yes — we offer discounts for two-day, three-day, four-day, five-day, and weekly stays.", "weight": 1.0},
+        {"text": "Yes, longer stays get a discount — two-night, three-night, on up through weekly rates.", "weight": 1.0}
+      ]
+    },
+    "senior_aarp_discount": {
+      "_doc": "Caller asks about senior or AARP discount.",
+      "trigger_phrases": [
+        "senior discount", "senior rate", "senior rates",
+        "aarp discount", "aarp rate", "aarp",
+        "discount for seniors", "discount for senior citizens",
+        "do you offer aarp", "do you have aarp"
+      ],
+      "responses": [
+        {"text": "Yes — we offer a five-percent discount to anyone who books over the phone, and that includes AARP and senior callers automatically.", "weight": 1.0},
+        {"text": "Booking over the phone gets you a five-percent discount automatically — that covers AARP and senior rates.", "weight": 1.0}
+      ]
+    },
+    "weekly_rate": {
+      "_doc": "Caller asks about weekly rates.",
+      "trigger_phrases": [
+        "weekly rate", "weekly rates",
+        "rate for a week", "price for a week",
+        "weekly stay", "stay for a week",
+        "discount weekly", "weekly discount"
+      ],
+      "responses": [
+        {"text": "Yes — we offer discounted weekly rates for stays of seven nights or longer.", "weight": 1.0},
+        {"text": "Yes, weekly rates are available for stays of seven nights or more.", "weight": 1.0}
+      ]
+    },
+    "fresh_linens": {
+      "_doc": "Caller asks about fresh linens / towels mid-stay.",
+      "trigger_phrases": [
+        "fresh linens", "fresh towels", "fresh sheets",
+        "change linens", "change the linens", "change towels",
+        "new linens", "new towels", "new sheets",
+        "swap towels", "swap linens",
+        "housekeeping",
+        "clean towels", "clean sheets"
+      ],
+      "responses": [
+        {"text": "Yes, fresh linens are available during your stay — just request them in the morning.", "weight": 1.0},
+        {"text": "Sure — request fresh linens in the morning and housekeeping will swap them out.", "weight": 1.0}
+      ]
+    },
+    "credit_card_required": {
+      "_doc": "Caller asks if a credit card is required to book.",
+      "trigger_phrases": [
+        "credit card to book", "credit card to hold",
+        "do you need a credit card", "need a credit card to reserve",
+        "card on file", "card to hold the room",
+        "card required", "credit card required",
+        "deposit required", "security deposit",
+        "hold on the card", "hold on my card", "hold on credit card"
+      ],
+      "responses": [
+        {"text": "Yes — we need a credit card to guarantee the reservation. A two-hundred-fifty-dollar hold may be placed as a security deposit.", "weight": 1.0},
+        {"text": "Yes, a credit card is required to hold the room. There's a two-hundred-fifty-dollar security hold.", "weight": 1.0}
+      ]
+    },
+    "cash_payment": {
+      "_doc": "Caller asks if cash is accepted.",
+      "trigger_phrases": [
+        "pay with cash", "pay in cash", "paying with cash",
+        "cash only", "do you take cash", "do you accept cash",
+        "cash okay", "cash ok"
+      ],
+      "responses": [
+        {"text": "Yes, you can pay with cash at check-in. We still need a credit card on file, and either a two-hundred-dollar hold on it or a two-hundred-dollar cash deposit refunded at checkout.", "weight": 1.0}
+      ]
+    },
+    "near_river": {
+      "_doc": "Caller asks how close the inn is to the river or Old Town.",
+      "trigger_phrases": [
+        "near the river", "close to the river", "from the river",
+        "how far is the river",
+        "old town", "near old town", "close to old town",
+        "in old town"
+      ],
+      "responses": [
+        {"text": "The inn is one block from the river and right in Old Town Florence.", "weight": 1.0},
+        {"text": "One block from the river, in the Old Town area.", "weight": 1.0}
+      ]
+    },
+    "who_else_can_i_talk_to": {
+      "_doc": "Caller asks if there are other people/agents they can talk to. Persona-specific responses: each persona names the OTHER personas + a real human. The pick filters by current persona automatically.",
+      "trigger_phrases": [
+        "who else can i talk to", "who else can i speak to",
+        "is there someone else", "anyone else i can talk to",
+        "anyone else i can speak to",
+        "is there anyone else", "another agent",
+        "different agent", "different assistant",
+        "any other ai", "any other a.i.",
+        "talk to a different person", "speak to a different person"
+      ],
+      "responses": [
+        {"text": "I'm Iris, but you can also talk to Henry, or I can transfer you to a real person at the front desk.", "weight": 1.0, "personas": ["Iris"]},
+        {"text": "I'm Iris — there's also Henry, or I can transfer you to the front desk.", "weight": 1.0, "personas": ["Iris"]},
+        {"text": "I'm Henry, but you can also talk to Iris, or I can transfer you to a real person at the front desk.", "weight": 1.0, "personas": ["Henry"]},
+        {"text": "I'm Henry — there's also Iris, or I can transfer you to the front desk.", "weight": 1.0, "personas": ["Henry"]},
+        {"text": "I'm Aoede, but you can also talk to Iris or Henry, or I can transfer you to a real person at the front desk.", "weight": 1.0, "personas": ["Aoede"]},
+        {"text": "I'm Eric, but you can also talk to Iris or Henry, or I can transfer you to a real person at the front desk.", "weight": 1.0, "personas": ["Eric"]}
+      ]
+    },
+    "how_to_book": {
+      "_doc": "Caller asks how to make a reservation. Cache fires only as a soft handoff — the actual booking flow goes to the LLM on the next turn.",
+      "trigger_phrases": [
+        "how do i book", "how can i book", "how to book",
+        "how do i make a reservation", "how do i reserve",
+        "how can i make a reservation", "how can i reserve",
+        "ways to book", "booking options"
+      ],
+      "responses": [
+        {"text": "You can book directly with me on the phone right now — that gets you the best rate. We're also on our website and on Booking dot com.", "weight": 1.0},
+        {"text": "I can book it for you right now over the phone — that's the best rate. You can also book online at our website or on Booking dot com.", "weight": 1.0}
+      ]
+    }
+  }
+}
