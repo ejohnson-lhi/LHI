@@ -1,0 +1,31 @@
+# Diarization batch transcription dependencies.
+#
+# WhisperX bundles faster-whisper (CTranslate2-optimized Whisper) and
+# pyannote diarization in one package. PyTorch is the heavy install
+# (~2 GB) — pinned to the CPU-only build to keep the droplet's disk
+# usage and Memory footprint reasonable. If a GPU is added later,
+# swap to torch+cu*.
+#
+# Pinning versions because pyannote model + library compatibility is
+# brittle across major versions; tested working set below.
+
+whisperx==3.1.5
+pyannote.audio==3.1.1
+
+# Torch CPU-only (let pip pick the latest compatible torch within whisperx's
+# constraints; we tell pip to prefer the CPU index for the wheel).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchaudio
+
+# numpy for fingerprint dot products and saving .npy profiles.
+numpy
+
+# faster-whisper transitively, but pinned for explicitness.
+faster-whisper
+
+# Audio I/O — soundfile for embedding inference reads.
+soundfile
+
+# Used by enroll_speaker.py for clean audio loading + resampling.
+librosa

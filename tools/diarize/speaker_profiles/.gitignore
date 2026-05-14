@@ -1,0 +1,6 @@
+# Speaker voice fingerprints — never commit these.
+# They're biometric data and identify specific humans.
+*.npy
+
+# Keep the directory itself tracked.
+!.gitignore

@@ -10,7 +10,8 @@
     "roomConfig": {
       "egress": {
         "tracks": {
-          "filepath": "/out/{room_name}-{track_id}-{time}.ogg"
+          "_filepath_doc": "{publisher_identity} encodes the speaker leg in the filename so the diarize batch can tell Iris from caller from frontdesk2 without listening to the audio first. Iris's identity is the LiveKit-assigned agent-* string; SIP participants (caller, frontdesk2) use their SIP identity.",
+          "filepath": "/out/{room_name}-{publisher_identity}-{track_id}-{time}.ogg"
         }
       }
     }
