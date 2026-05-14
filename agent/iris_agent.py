@@ -461,6 +461,22 @@ class IrisAgent(Agent):
             await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
             return
 
+        # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
+        # is now providing real ringback before LiveKit answers, so the
+        # synthesized one was layering on top. RINGBACK_CACHE_KEY and
+        # _generate_ringback_pcm are still defined upstream as dead code
+        # in case the silent-connect gap returns.)
+        # Greeting uses the persona name for the current voice. Cache key
+        # is voice-aware so this is also a cache hit (pre-rendered in
+        # prewarm or entrypoint when voice changed).
+        voice = self.session.tts._opts.voice
+        persona = _persona_for(voice)
+        first_message = _first_message_for(persona)
+        log.info("Agent on_enter: speaking first message (voice=%s, persona=%s)", voice, persona)
+        # allow_interruptions=False so the greeting plays even if the
+        # caller speaks first.
+        await self.session.say(first_message, allow_interruptions=False)
+
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         """In silent (immediate-transfer) mode, prevent the LLM from being
         invoked for any user turn. Without this, the framework's default
@@ -482,22 +498,6 @@ class IrisAgent(Agent):
         log.info("Silent mode: skipping LLM for user turn: %r", text or "")
         if StopResponse is not None:
             raise StopResponse()
-
-        # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
-        # is now providing real ringback before LiveKit answers, so the
-        # synthesized one was layering on top. RINGBACK_CACHE_KEY and
-        # _generate_ringback_pcm are still defined upstream as dead code
-        # in case the silent-connect gap returns.)
-        # Greeting uses the persona name for the current voice. Cache key
-        # is voice-aware so this is also a cache hit (pre-rendered in
-        # prewarm or entrypoint when voice changed).
-        voice = self.session.tts._opts.voice
-        persona = _persona_for(voice)
-        first_message = _first_message_for(persona)
-        log.info("Agent on_enter: speaking first message (voice=%s, persona=%s)", voice, persona)
-        # allow_interruptions=False so the greeting plays even if the
-        # caller speaks first.
-        await self.session.say(first_message, allow_interruptions=False)
 
     # -------------------------------------------------------------------------
     # Tools — JSON return values, all proxied to backend's existing handlers.
