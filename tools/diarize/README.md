@@ -40,18 +40,20 @@ OGG ─► WhisperX (Whisper + pyannote)
 ```bash
 cd /opt/iris-backend/tools/diarize
 
-# Separate venv — heavy deps (PyTorch ~2 GB), keep out of the agent's runtime.
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-
-# pyannote models are gated behind an accept-license click on HuggingFace.
-# Create a free HF account, accept the licenses on these two pages:
+# Before anything else: open these two URLs in a browser (logged into HF)
+# and click "Agree and access repository" — the model downloads 401
+# without this:
 #   https://huggingface.co/pyannote/speaker-diarization-3.1
 #   https://huggingface.co/pyannote/embedding
-# Then create a Read token at https://huggingface.co/settings/tokens
-# and paste it here:
+
+# Run the setup script. Creates .venv (separate from the agent's runtime
+# venv — heavy deps like PyTorch ~2 GB), installs requirements.
+bash setup.sh
+
+# Critical: activate the venv so huggingface-cli is on PATH:
+source .venv/bin/activate
+
+# Paste a Read token from https://huggingface.co/settings/tokens
 huggingface-cli login
 
 # Pre-fetch the models so the first run isn't slow:
@@ -129,7 +131,25 @@ Downstream: `tools/mine_intents.py` reads this format and applies speaker weight
 
 ## File-naming context
 
-The egress filename template at `deploy/livekit/config/dispatch-rule.json.example` includes `{publisher_identity}` so each per-track OGG carries the leg identity. Once that config is applied to LiveKit's dispatch rule, new calls produce filenames like:
+The egress filename template at `deploy/livekit/config/dispatch-rule.json.example` includes `{publisher_identity}` so each per-track OGG carries the leg identity. To apply the updated rule:
+
+```bash
+cd /opt/iris-backend
+
+# See the current rule and note its ID:
+lk sip dispatch-rule list
+
+# Copy + fill in the real ST_xxx trunk ID:
+cp deploy/livekit/config/dispatch-rule.json.example deploy/livekit/config/dispatch-rule.json
+# edit deploy/livekit/config/dispatch-rule.json — replace ST_REPLACE_WITH_REAL_TRUNK_ID
+# (dispatch-rule.json is gitignored — the trunk ID stays out of the repo)
+
+# livekit-cli does not have an in-place update, so delete + recreate:
+lk sip dispatch-rule delete <rule-id-from-list>
+lk sip dispatch-rule create deploy/livekit/config/dispatch-rule.json
+```
+
+After that, new calls produce filenames like:
 
 - `iris-call-..._<caller_phone>-TR_...ogg` — caller leg
 - `iris-call-..._frontdesk2-TR_...ogg` — hotel front-desk leg (silent-mode 5070 only)
