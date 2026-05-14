@@ -326,10 +326,19 @@ def main() -> int:
     )
 
     log.info("Loading pyannote diarization pipeline ...")
-    diarize_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=HF_TOKEN,
-    )
+    # pyannote.audio 4.x renamed `use_auth_token` to `token` in
+    # Pipeline.from_pretrained (Model.from_pretrained still accepts both).
+    # Try the new name first, fall back for 3.x compatibility.
+    try:
+        diarize_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            token=HF_TOKEN,
+        )
+    except TypeError:
+        diarize_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=HF_TOKEN,
+        )
     # Pipeline.to() exists in pyannote 3.x and 4.x.
     try:
         diarize_pipeline.to(torch.device(WHISPER_DEVICE))
@@ -340,9 +349,16 @@ def main() -> int:
         )
 
     log.info("Loading pyannote speaker embedding model ...")
-    emb_model = Model.from_pretrained(
-        "pyannote/embedding", use_auth_token=HF_TOKEN,
-    )
+    # Same compatibility shim as above. Model.from_pretrained accepts
+    # both names today, but use the canonical 4.x name for forward compat.
+    try:
+        emb_model = Model.from_pretrained(
+            "pyannote/embedding", token=HF_TOKEN,
+        )
+    except TypeError:
+        emb_model = Model.from_pretrained(
+            "pyannote/embedding", use_auth_token=HF_TOKEN,
+        )
     embedding_inference = Inference(
         emb_model, window="whole",
         device=torch.device(WHISPER_DEVICE),

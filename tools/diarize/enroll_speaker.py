@@ -41,10 +41,18 @@ def enroll(name: str, audio_path: Path) -> Path:
     # `window="whole"` averages the embedding over the whole clip — best
     # for enrollment where we want a single representative vector.
     print(f"Loading pyannote/embedding model ...")
-    model = Model.from_pretrained(
-        "pyannote/embedding",
-        use_auth_token=HF_TOKEN,
-    )
+    # pyannote.audio 4.x renamed `use_auth_token` to `token`. Try the new
+    # name first, fall back to the old one for 3.x compatibility.
+    try:
+        model = Model.from_pretrained(
+            "pyannote/embedding",
+            token=HF_TOKEN,
+        )
+    except TypeError:
+        model = Model.from_pretrained(
+            "pyannote/embedding",
+            use_auth_token=HF_TOKEN,
+        )
     # Send to CPU explicitly. (Override to "cuda" if GPU is available.)
     device = torch.device("cpu")
     inference = Inference(model, window="whole", device=device)
