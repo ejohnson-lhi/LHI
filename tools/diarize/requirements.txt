@@ -8,9 +8,33 @@
 #
 # Pinning versions because pyannote model + library compatibility is
 # brittle across major versions; tested working set below.
+#
+# SYSTEM DEPENDENCIES (Debian/Ubuntu):
+#   sudo apt install -y pkg-config ffmpeg \
+#       libavformat-dev libavcodec-dev libavdevice-dev \
+#       libavutil-dev libswresample-dev libswscale-dev libavfilter-dev
+#
+# These are needed because the av==11.* version transitively pinned by
+# whisperx 3.1.5 → faster-whisper 1.0.1 has no Python 3.12 prebuilt
+# wheel on PyPI, so pip falls back to building PyAV from source which
+# needs pkg-config + ffmpeg dev headers. ffmpeg itself is also required
+# at runtime by whisperx.load_audio() for transcoding non-WAV inputs.
 
-whisperx==3.1.5
-pyannote.audio==3.1.1
+# NOTE: whisperx was removed from this list — its 3.1.5 release was
+# yanked (unofficial third-party upload) and has a hardcoded VAD model
+# URL that's been moved and returns HTTP 301. We use the underlying
+# components directly instead: faster-whisper (CTranslate2-optimized
+# Whisper, listed below) for transcription + pyannote.audio for
+# diarization + speaker embedding. faster-whisper has its own VAD
+# (vad_filter=True). Less wrapper code, fewer broken URLs.
+
+# pyannote.audio 4.0+ works with our diarize_batch.py since we call
+# Pipeline.from_pretrained() directly. The 4.x embedder is WeSpeaker
+# 512-dim (vs 3.x ECAPA-TDNN 192-dim). Cosine similarity normalizes
+# internally so either works, BUT enrolled profiles must use the same
+# embedder version as the batch run — re-enroll if you upgrade across
+# the 3-to-4 boundary.
+pyannote.audio>=3.3.0
 
 # Torch CPU-only (let pip pick the latest compatible torch within whisperx's
 # constraints; we tell pip to prefer the CPU index for the wheel).

@@ -19,6 +19,23 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
+# Sanity-check system dependencies. PyAV (transitively pulled in by
+# faster-whisper) builds from source on Python 3.12 because the
+# pinned av==11.* has no prebuilt wheel; the build needs pkg-config
+# and ffmpeg dev headers. Fail fast with a clear message instead of
+# the cryptic "Getting requirements to build wheel did not run
+# successfully" deep inside pip.
+if ! command -v pkg-config >/dev/null 2>&1; then
+    echo "ERROR: pkg-config not installed. Run:" >&2
+    echo "  sudo apt install -y pkg-config ffmpeg libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev libavfilter-dev" >&2
+    exit 1
+fi
+if ! pkg-config --exists libavformat 2>/dev/null; then
+    echo "ERROR: ffmpeg dev headers not installed. Run:" >&2
+    echo "  sudo apt install -y pkg-config ffmpeg libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev libavfilter-dev" >&2
+    exit 1
+fi
+
 if [ ! -d ".venv" ]; then
     echo "Creating venv ..."
     python3 -m venv .venv

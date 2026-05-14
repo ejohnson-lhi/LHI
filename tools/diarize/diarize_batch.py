@@ -10,17 +10,22 @@ Run manually:
 
 Or via cron (see README.md).
 
-Pipeline:
-  1. WhisperX large-v3 (int8) → segments with timestamps
-  2. Word-level alignment (wav2vec2)
-  3. pyannote 3.1 diarization → speaker labels per segment
-  4. pyannote embedding per anonymous speaker → match to
-     speaker_profiles/*.npy by cosine similarity
-  5. Emit enriched JSON with matched_name per segment
-
-Threshold for "known speaker" match defaults to 0.55 (cosine sim).
-Below that, the speaker stays "unknown". The threshold can be tuned via
-the MATCH_THRESHOLD env var.
+Pipeline (refactored to use library primitives directly — no whisperx
+wrapper, which had hardcoded URLs that broke when servers moved):
+  1. faster-whisper large-v3 (int8) + built-in VAD → segments with
+     timestamps and text
+  2. pyannote.audio Pipeline (speaker-diarization-3.1) → annotated
+     time-line with anonymous speaker labels (SPEAKER_00, _01, ...)
+  3. For each transcription segment, find the speaker label whose
+     diarization turns cover the most of that segment's duration
+  4. Per anonymous speaker, extract a representative audio sample
+     (concatenated turns, capped at 30s) and compute a pyannote
+     embedding → match against enrolled speaker_profiles/*.npy via
+     cosine similarity. Threshold (default 0.55) controls "known vs
+     unknown" cutoff. Note for pyannote 4.x: the WeSpeaker embedder
+     produces 512-dim vectors that are NOT pre-normalized; cosine
+     normalizes internally so this is correct, but if you migrate
+     between embedder versions you'll need to re-enroll everyone.
 """
 from __future__ import annotations
 
@@ -28,10 +33,12 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
 log = logging.getLogger("diarize_batch")
 logging.basicConfig(
@@ -52,6 +59,7 @@ MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.55"))
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8")
+TARGET_SR = 16000  # pyannote and Whisper both want 16 kHz mono
 
 
 # =============================================================================
@@ -82,9 +90,15 @@ def load_profiles() -> dict[str, np.ndarray]:
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity in [-1, 1]. Both inputs treated as 1-D."""
+    """Cosine similarity in [-1, 1]. Both inputs treated as 1-D.
+    Normalizes internally so non-normalized embeddings (e.g. pyannote 4.x
+    WeSpeaker 512-dim vectors) work the same as normalized ones (3.x
+    ECAPA-TDNN 192-dim vectors). Both vectors must be from the same
+    embedder, however."""
     a = a.reshape(-1).astype(np.float32)
     b = b.reshape(-1).astype(np.float32)
+    if a.shape != b.shape:
+        return 0.0
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
     if na < 1e-9 or nb < 1e-9:
         return 0.0
@@ -109,35 +123,54 @@ def best_match(
 
 
 # =============================================================================
-# Audio handling — extract per-speaker audio for embedding
+# Speaker-segment assignment
 # =============================================================================
+
+def assign_speaker(
+    segment_start: float,
+    segment_end: float,
+    diarization,
+) -> str | None:
+    """For a (start, end) interval, return the speaker label whose
+    diarization turns cover the most of that interval. None if no
+    overlap.
+
+    `diarization` is a `pyannote.core.Annotation` instance — yields
+    (turn: Segment, _, label) tuples via .itertracks(yield_label=True).
+    """
+    overlaps: dict[str, float] = {}
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        overlap_start = max(turn.start, segment_start)
+        overlap_end = min(turn.end, segment_end)
+        if overlap_end > overlap_start:
+            overlaps[speaker] = overlaps.get(speaker, 0.0) + (overlap_end - overlap_start)
+    if not overlaps:
+        return None
+    return max(overlaps.items(), key=lambda kv: kv[1])[0]
+
 
 def speaker_audio_samples(
     audio: np.ndarray,
     sample_rate: int,
-    segments: list[dict],
+    diarization,
     max_seconds_per_speaker: float = 30.0,
 ) -> dict[str, np.ndarray]:
-    """For each anonymous speaker label (SPEAKER_00, _01, ...), return
-    concatenated audio samples up to max_seconds_per_speaker. Used as
-    input to the embedding model — embeddings stabilize quickly past
-    ~10-15 seconds of speech, so 30s gives headroom without ballooning
-    memory."""
+    """For each speaker in the diarization, return concatenated audio
+    samples up to max_seconds_per_speaker. Used to compute one embedding
+    per speaker for fingerprint matching. Embeddings stabilize past
+    ~10-15s of speech so 30s is plenty without ballooning memory."""
     by_speaker: dict[str, list[np.ndarray]] = {}
     duration_so_far: dict[str, float] = {}
-    for seg in segments:
-        spk = seg.get("speaker")
-        if not spk:
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        if duration_so_far.get(speaker, 0.0) >= max_seconds_per_speaker:
             continue
-        if duration_so_far.get(spk, 0.0) >= max_seconds_per_speaker:
-            continue
-        start_sample = int(seg["start"] * sample_rate)
-        end_sample = int(seg["end"] * sample_rate)
+        start_sample = int(turn.start * sample_rate)
+        end_sample = int(turn.end * sample_rate)
         chunk = audio[start_sample:end_sample]
         if chunk.size == 0:
             continue
-        by_speaker.setdefault(spk, []).append(chunk)
-        duration_so_far[spk] = duration_so_far.get(spk, 0.0) + (seg["end"] - seg["start"])
+        by_speaker.setdefault(speaker, []).append(chunk)
+        duration_so_far[speaker] = duration_so_far.get(speaker, 0.0) + (turn.end - turn.start)
     return {spk: np.concatenate(chunks) for spk, chunks in by_speaker.items() if chunks}
 
 
@@ -151,63 +184,58 @@ def process_one(
     asr_model,
     diarize_pipeline,
     embedding_inference,
-    align_model_cache: dict,
 ) -> dict:
     """Process a single OGG. Returns the enriched-transcript dict."""
-    import whisperx
+    import librosa
 
     log.info("Loading audio: %s", ogg_path.name)
-    audio = whisperx.load_audio(str(ogg_path))
-    duration = len(audio) / 16000.0  # whisperx loads at 16 kHz
+    # librosa.load() does ffmpeg-backed decoding + automatic resample.
+    audio, sr = librosa.load(str(ogg_path), sr=TARGET_SR, mono=True)
+    duration = len(audio) / sr
 
-    # ---- 1. Transcribe ---------------------------------------------------
+    # ---- 1. Transcribe with faster-whisper (built-in VAD filter) ---------
     log.info("  Transcribing (Whisper %s, %s/%s)...",
              WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE)
-    result = asr_model.transcribe(audio, batch_size=16)
-    language = result.get("language", "en")
-
-    # ---- 2. Word-level alignment (gives precise timestamps for
-    #        diarization assignment) ----
-    align_key = language
-    if align_key not in align_model_cache:
-        am, am_meta = whisperx.load_align_model(
-            language_code=align_key, device=WHISPER_DEVICE,
-        )
-        align_model_cache[align_key] = (am, am_meta)
-    align_model, align_meta = align_model_cache[align_key]
-    log.info("  Aligning words ...")
-    aligned = whisperx.align(
-        result["segments"], align_model, align_meta, audio,
-        device=WHISPER_DEVICE, return_char_alignments=False,
+    fw_segments_iter, info = asr_model.transcribe(
+        str(ogg_path),
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
     )
+    # faster-whisper returns a generator; materialize so we can iterate twice.
+    fw_segments = list(fw_segments_iter)
+    language = getattr(info, "language", "en")
 
-    # ---- 3. Diarize ------------------------------------------------------
+    # ---- 2. Diarize with pyannote.audio Pipeline ---------------------
     log.info("  Diarizing speakers ...")
-    diarize_segments = diarize_pipeline(str(ogg_path))
-    assigned = whisperx.assign_word_speakers(diarize_segments, aligned)
-    segments = assigned.get("segments", [])
+    diarization = diarize_pipeline(str(ogg_path))
 
-    # Strip word-level entries — too verbose for the transcript JSON.
-    for seg in segments:
-        seg.pop("words", None)
+    # ---- 3. Combine: assign a speaker label to each whisper segment ------
+    segments = []
+    for fs in fw_segments:
+        spk = assign_speaker(fs.start, fs.end, diarization)
+        segments.append({
+            "start": round(fs.start, 2),
+            "end": round(fs.end, 2),
+            "text": (fs.text or "").strip(),
+            "speaker": spk,
+        })
 
-    # ---- 4. Embed each anonymous speaker, match to enrolled profile ----
+    # ---- 4. Embed each anonymous speaker, match to enrolled profile -----
     speakers_present: dict[str, dict] = {}
     if profiles:
         log.info("  Computing speaker embeddings + matching to %d profiles ...",
                  len(profiles))
-        # pyannote Inference works from a file path or an in-memory waveform.
-        # Easiest: dump each speaker's concatenated audio to a temp wav and
-        # feed the path in. Alternatively, build a SlidingWindowFeature.
-        import tempfile
-        import soundfile as sf
-
-        by_speaker_audio = speaker_audio_samples(audio, 16000, segments)
+        by_speaker_audio = speaker_audio_samples(audio, sr, diarization)
         for spk_label, samples in by_speaker_audio.items():
+            # Write the speaker's concatenated audio to a temp wav so
+            # the pyannote Inference can read it from disk (its file-path
+            # interface is more reliable than the in-memory waveform one
+            # across pyannote versions).
             with tempfile.NamedTemporaryFile(
                 suffix=".wav", delete=False,
             ) as tmp:
-                sf.write(tmp.name, samples, 16000)
+                sf.write(tmp.name, samples, sr)
                 tmp_path = tmp.name
             try:
                 emb = embedding_inference(tmp_path)
@@ -216,7 +244,8 @@ def process_one(
                 speakers_present[spk_label] = {
                     "matched_name": matched_name,
                     "match_score": round(score, 3),
-                    "audio_seconds": round(len(samples) / 16000.0, 2),
+                    "audio_seconds": round(len(samples) / sr, 2),
+                    "embedding_dim": int(emb.size),
                 }
             finally:
                 try:
@@ -234,20 +263,19 @@ def process_one(
                     "audio_seconds": None,
                 }
 
-    # ---- 5. Annotate each segment with the matched name ---------------
+    # ---- 5. Annotate each segment with the matched name ------------------
     for seg in segments:
         spk = seg.get("speaker")
-        info = speakers_present.get(spk) if spk else None
-        if info:
-            seg["matched_name"] = info["matched_name"]
-            seg["match_score"] = info["match_score"]
+        info_d = speakers_present.get(spk) if spk else None
+        if info_d:
+            seg["matched_name"] = info_d["matched_name"]
+            seg["match_score"] = info_d["match_score"]
         else:
             seg["matched_name"] = "unknown"
             seg["match_score"] = 0.0
 
-    # Compact speakers_present for the top-level summary.
     speakers_summary = {
-        spk: info["matched_name"] for spk, info in speakers_present.items()
+        spk: data["matched_name"] for spk, data in speakers_present.items()
     }
 
     return {
@@ -287,22 +315,31 @@ def main() -> int:
     profiles = load_profiles()
 
     # Heavy imports + model loads happen once for the whole batch.
-    import whisperx
-    from pyannote.audio import Model, Inference
+    from faster_whisper import WhisperModel
+    from pyannote.audio import Model, Inference, Pipeline
+    import torch
 
-    log.info("Loading WhisperX model: %s (%s/%s) ...",
+    log.info("Loading faster-whisper model: %s (%s/%s) ...",
              WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE)
-    asr_model = whisperx.load_model(
+    asr_model = WhisperModel(
         WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE,
     )
 
-    log.info("Loading diarization pipeline ...")
-    diarize_pipeline = whisperx.DiarizationPipeline(
-        use_auth_token=HF_TOKEN, device=WHISPER_DEVICE,
+    log.info("Loading pyannote diarization pipeline ...")
+    diarize_pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=HF_TOKEN,
     )
+    # Pipeline.to() exists in pyannote 3.x and 4.x.
+    try:
+        diarize_pipeline.to(torch.device(WHISPER_DEVICE))
+    except Exception:
+        log.warning(
+            "Could not move diarization pipeline to %s; defaults will apply.",
+            WHISPER_DEVICE,
+        )
 
-    log.info("Loading speaker embedding model ...")
-    import torch
+    log.info("Loading pyannote speaker embedding model ...")
     emb_model = Model.from_pretrained(
         "pyannote/embedding", use_auth_token=HF_TOKEN,
     )
@@ -311,15 +348,12 @@ def main() -> int:
         device=torch.device(WHISPER_DEVICE),
     )
 
-    align_model_cache: dict = {}
-
     succeeded = failed = 0
     for ogg in pending:
         try:
             t0 = datetime.now()
             enriched = process_one(
-                ogg, profiles, asr_model, diarize_pipeline,
-                embedding_inference, align_model_cache,
+                ogg, profiles, asr_model, diarize_pipeline, embedding_inference,
             )
             out_json = OUTPUT_DIR / f"{ogg.stem}.json"
             out_json.write_text(

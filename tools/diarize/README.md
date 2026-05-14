@@ -38,6 +38,15 @@ OGG ─► WhisperX (Whisper + pyannote)
 ## One-time setup (on the droplet)
 
 ```bash
+# 1. System dependencies (one-time, sudo required). PyAV builds from
+# source on Python 3.12 because the pinned av==11.x doesn't have a
+# prebuilt wheel for cp312; the build needs pkg-config plus ffmpeg
+# dev headers. ffmpeg itself is also needed at runtime for non-WAV
+# audio input. setup.sh checks for these and refuses to run without.
+sudo apt install -y pkg-config ffmpeg \
+    libavformat-dev libavcodec-dev libavdevice-dev \
+    libavutil-dev libswresample-dev libswscale-dev libavfilter-dev
+
 cd /opt/iris-backend/tools/diarize
 
 # Before anything else: open these two URLs in a browser (logged into HF)

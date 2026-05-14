@@ -51,14 +51,20 @@ def enroll(name: str, audio_path: Path) -> Path:
 
     print(f"Computing embedding from {audio_path.name} ...")
     embedding = inference(str(audio_path))
-    # pyannote returns a numpy array shape (1, 192) or (192,) depending
-    # on version. Normalize to flat 1-D so cosine math is symmetric with
-    # the runtime path in diarize_batch.py.
+    # pyannote returns a numpy array. Normalize shape to flat 1-D so
+    # cosine math is symmetric with the runtime path in diarize_batch.py.
+    # Embedding dimension depends on pyannote.audio version:
+    #   3.x (ECAPA-TDNN):  192-dim, L2-normalized so norm ≈ 1.0
+    #   4.x (WeSpeaker):   512-dim, NOT pre-normalized (norm varies widely)
+    # The cosine matcher in diarize_batch.py normalizes internally, so
+    # either format works as long as enrollment + batch both use the
+    # same embedding model (which they do — both load pyannote/embedding).
     arr = np.asarray(embedding).reshape(-1)
-    if arr.size != 192:
+    if arr.size not in (192, 256, 512):
         print(
-            f"WARNING: expected 192-dim embedding, got {arr.size}-dim. "
-            f"Profile saved but match logic may not work as expected.",
+            f"WARNING: unexpected embedding dimension {arr.size}. "
+            f"Known good dims: 192 (pyannote 3.x), 512 (pyannote 4.x). "
+            f"Profile saved but match logic may misbehave.",
             file=sys.stderr,
         )
 
@@ -67,7 +73,7 @@ def enroll(name: str, audio_path: Path) -> Path:
     norm = float(np.linalg.norm(arr))
     print(f"Enrolled {name!r} → {out}")
     print(f"  Dim: {arr.size}")
-    print(f"  Norm: {norm:.3f}  (typical ~1.0 after pyannote normalization)")
+    print(f"  Norm: {norm:.3f}  (pyannote 3.x ≈ 1.0, pyannote 4.x can be 100s — cosine matcher normalizes anyway)")
     return out
 
 
