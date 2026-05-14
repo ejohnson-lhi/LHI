@@ -18,8 +18,29 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Any
+
+
+# Sentence splitter for prewarm. LiveKit's TTS pipeline chunks at sentence
+# boundaries (. / ? / !) before each chunk is looked up in the audio cache.
+# So prerendering must produce the SAME chunks the speak path will request —
+# otherwise the cache hits on the multi-sentence text we stored never fire
+# (we stored 1 entry, the speak path looks up 2 sub-entries).
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_into_chunks(text: str) -> list[str]:
+    """Split `text` into the same chunks LiveKit's TTS pipeline will request.
+
+    Empirically (see transcripts) the framework splits at end-of-sentence
+    punctuation (`. ` / `? ` / `! `). The terminal punctuation stays with
+    the preceding sentence; leading whitespace on the next chunk is stripped.
+    Single-sentence inputs return a 1-element list (just the original text).
+    """
+    chunks = _SENTENCE_SPLIT_RE.split(text.strip())
+    return [c.strip() for c in chunks if c.strip()]
 
 log = logging.getLogger("intent_cache")
 
@@ -117,7 +138,7 @@ class IntentCache:
 
     def all_response_texts(self) -> list[str]:
         """Flat de-duplicated list of every response.text across every intent.
-        Used by the prewarm step to know what audio to render."""
+        These are the strings session.say() is called with."""
         seen: set[str] = set()
         out: list[str] = []
         for intent in self.intents.values():
@@ -126,6 +147,26 @@ class IntentCache:
                 if isinstance(text, str) and text and text not in seen:
                     seen.add(text)
                     out.append(text)
+        return out
+
+    def all_response_chunks(self) -> list[str]:
+        """De-duplicated list of every SENTENCE inside every response.text.
+        Used by the prewarm step. LiveKit chunks multi-sentence responses
+        at periods before looking up the audio cache, so prerendering must
+        match the chunks — not the original whole-response strings.
+
+        e.g. response "It's twenty dollars per stay. Cats aren't allowed,
+        by the way." becomes two chunks, each prewarmed separately. When
+        the cache fires and session.say() is called with the full text,
+        both sub-chunk lookups hit cache and there's no synthesis pause
+        between sentences."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for text in self.all_response_texts():
+            for chunk in split_into_chunks(text):
+                if chunk and chunk not in seen:
+                    seen.add(chunk)
+                    out.append(chunk)
         return out
 
     # ----- classification -----

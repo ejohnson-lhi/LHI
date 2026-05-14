@@ -852,43 +852,103 @@ def prewarm(proc: JobProcess) -> None:
     # The background thread calls cache.save() at the end so the new entries
     # persist; subsequent prewarms find them already cached and skip them.
     # Build the prewarm worklist: PERSISTENT_OPENERS (greeting, transfer
-    # flow, voice-admin confirmations) ∪ every response.text in the
-    # intent cache (pet_fee variants, check-in time variants, etc.).
-    # Deduplicate while preserving order — opener phrases first.
-    intent_response_texts = INTENT_CACHE.all_response_texts()
+    # flow, voice-admin confirmations) ∪ every SENTENCE inside every
+    # response.text in the intent cache. Critical: prerender at the
+    # sentence chunk level, NOT the full multi-sentence response level.
+    # LiveKit's TTS pipeline splits multi-sentence responses on period/?/!
+    # before each chunk is looked up in the audio cache. If we prerender
+    # the full "It's $20 per stay. Cats aren't allowed, by the way." as
+    # one entry, the speak path looks up TWO sub-chunks neither of which
+    # match — both miss, both synthesize cold, and the caller hears a
+    # 4-5s pause between the two sentences. Splitting at prewarm time
+    # so the chunk keys line up with what the speak path will ask for.
+    intent_response_chunks = INTENT_CACHE.all_response_chunks()
     seen_phrases: set[str] = set()
     prewarm_phrases: list[str] = []
-    for phrase in list(PERSISTENT_OPENERS) + intent_response_texts:
+    for phrase in list(PERSISTENT_OPENERS) + intent_response_chunks:
         if phrase not in seen_phrases:
             seen_phrases.add(phrase)
             prewarm_phrases.append(phrase)
 
     import threading
+    import time
+    # Stash an in-progress marker so the transcript can show "not yet done"
+    # if a call completes before prewarm finishes. Replaced with the final
+    # stats dict once the thread completes.
+    proc.userdata["prewarm_stats"] = {
+        "status": "running",
+        "total_phrases": len(prewarm_phrases),
+        "started_at": datetime.now().isoformat(),
+    }
+
     def _bg_prerender_phrases() -> None:
-        rendered = skipped = 0
-        for phrase in prewarm_phrases:
+        start = time.monotonic()
+        rendered = skipped = failed = 0
+        synth_seconds = 0.0
+        total = len(prewarm_phrases)
+        last_progress_log = start
+        for i, phrase in enumerate(prewarm_phrases, 1):
             if tts.cache_key(phrase) in cache:
                 skipped += 1
                 continue
             try:
+                t0 = time.monotonic()
                 tts.prerender(phrase)
+                synth_seconds += time.monotonic() - t0
                 rendered += 1
             except Exception:
+                failed += 1
                 log.exception("Failed to prerender phrase %r", phrase)
+            # Progress log every 15s of wall time so journalctl shows how
+            # far prewarm has gotten without waiting for the final summary.
+            now = time.monotonic()
+            if now - last_progress_log > 15.0:
+                pct = round(100 * i / total) if total else 0
+                log.info(
+                    "Prewarm progress: %d/%d (%d%%) — rendered=%d skipped=%d failed=%d, %.1fs elapsed",
+                    i, total, pct, rendered, skipped, failed, now - start,
+                )
+                last_progress_log = now
+        elapsed = time.monotonic() - start
+        avg_synth = (synth_seconds / rendered) if rendered else 0.0
         log.info(
-            "Prewarm phrases (background): %d rendered, %d already cached "
-            "(openers=%d, intent_cache=%d, total=%d)",
-            rendered, skipped,
-            len(PERSISTENT_OPENERS), len(intent_response_texts),
+            "Prewarm DONE in %.1fs (synth time %.1fs, avg %.2fs/phrase): "
+            "rendered=%d skipped=%d failed=%d "
+            "(openers=%d, intent_cache_chunks=%d, total=%d)",
+            elapsed, synth_seconds, avg_synth,
+            rendered, skipped, failed,
+            len(PERSISTENT_OPENERS), len(intent_response_chunks),
             len(prewarm_phrases),
         )
+        save_seconds = 0.0
         if rendered:
+            t0 = time.monotonic()
             cache.save()
-            log.info("Persisted %d new prewarm entries to disk", rendered)
+            save_seconds = time.monotonic() - t0
+            log.info(
+                "Persisted %d new prewarm entries to disk in %.2fs",
+                rendered, save_seconds,
+            )
+        # Replace the running marker with the completion stats. Read by
+        # write_transcript() to embed in the per-call JSON.
+        proc.userdata["prewarm_stats"] = {
+            "status": "done",
+            "elapsed_seconds": round(elapsed, 2),
+            "synth_seconds": round(synth_seconds, 2),
+            "save_seconds": round(save_seconds, 2),
+            "avg_synth_seconds": round(avg_synth, 3),
+            "rendered": rendered,
+            "skipped": skipped,
+            "failed": failed,
+            "total": len(prewarm_phrases),
+            "openers": len(PERSISTENT_OPENERS),
+            "intent_cache_chunks": len(intent_response_chunks),
+            "finished_at": datetime.now().isoformat(),
+        }
     log.info(
-        "Spawning background prerender of %d phrases (%d openers + %d intent-cache responses, deduped to %d, non-blocking)...",
+        "Spawning background prerender of %d phrases (%d openers + %d intent-cache sentence chunks, deduped to %d, non-blocking)...",
         len(prewarm_phrases),
-        len(PERSISTENT_OPENERS), len(intent_response_texts),
+        len(PERSISTENT_OPENERS), len(intent_response_chunks),
         len(prewarm_phrases),
     )
     threading.Thread(
@@ -1166,6 +1226,13 @@ async def entrypoint(ctx: JobContext) -> None:
             tts = ctx.proc.userdata.get("kokoro_tts")
             cache_stats = tts.cache_stats() if tts is not None else None
 
+            # Background prewarm thread's timing. If status == "running",
+            # this call started before prewarm finished, which means some
+            # TTS lookups during the call may have synthesized cold even
+            # though the phrase is in our prewarm list. Once status ==
+            # "done", subsequent calls find everything in the disk pickle.
+            prewarm_stats = ctx.proc.userdata.get("prewarm_stats")
+
             transcript = {
                 "room": ctx.room.name,
                 "caller_phone": caller_phone,
@@ -1175,6 +1242,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 "item_count": len(items),
                 "event_count": len(events),
                 "tts_cache_stats": cache_stats,
+                "prewarm_stats": prewarm_stats,
                 "events": events,
                 "items": items,
             }

@@ -26,15 +26,20 @@ echo === Local git status ===
 git status --short
 echo.
 
-REM Decide commit mode:
-REM   - If .deploy_msg exists and is non-empty: preview it, let user
-REM     accept/override/skip. Use `git commit -F file` so multi-line
-REM     content with quotes / parens / ampersands works correctly (the
-REM     old `-m "!MSG!"` form broke on embedded double quotes — git
-REM     would parse the rest of the message as filenames).
-REM   - If .deploy_msg missing/empty: prompt for a single-line message,
-REM     write it to .deploy_msg, then use `-F`.
-REM   - "skip" or blank override = push+deploy without commit.
+REM Commit mode — non-interactive by default to avoid the Enter-key tax:
+REM   - If .deploy_msg exists and is non-empty: preview it for context,
+REM     commit with `git commit -F file` (no quote/paren/ampersand issues),
+REM     and continue without prompting.
+REM   - If .deploy_msg is missing or empty: skip commit silently, still
+REM     push and deploy in case earlier work hasn't been pushed yet.
+REM
+REM To override the commit message: edit tools/.deploy_msg before running.
+REM To skip a commit entirely: delete tools/.deploy_msg before running.
+REM To pass an interactive override at runtime: run `deploy.bat -i`.
+
+set "INTERACTIVE=false"
+if /i "%~1"=="-i" set "INTERACTIVE=true"
+if /i "%~1"=="--interactive" set "INTERACTIVE=true"
 
 set "COMMIT_FROM_FILE=false"
 
@@ -46,26 +51,19 @@ if exist "%MSG_FILE%" (
         type "%MSG_FILE%"
         echo.
         echo ----------------------------------------
-        set "OVERRIDE="
-        set /p "OVERRIDE=Press Enter to use this, type a new message to override (single line), or 'skip' to push without committing: "
-        if /i "!OVERRIDE!"=="skip" (
-            set "COMMIT_FROM_FILE=false"
-        ) else if not "!OVERRIDE!"=="" (
-            REM Override: write to the file so git -F can read it.
-            > "%MSG_FILE%" echo !OVERRIDE!
-            set "COMMIT_FROM_FILE=true"
+        if "!INTERACTIVE!"=="true" (
+            set "OVERRIDE="
+            set /p "OVERRIDE=Press Enter to use this, type a new message to override (single line), or 'skip' to push without committing: "
+            if /i "!OVERRIDE!"=="skip" (
+                set "COMMIT_FROM_FILE=false"
+            ) else if not "!OVERRIDE!"=="" (
+                > "%MSG_FILE%" echo !OVERRIDE!
+                set "COMMIT_FROM_FILE=true"
+            ) else (
+                set "COMMIT_FROM_FILE=true"
+            )
         ) else (
-            set "COMMIT_FROM_FILE=true"
-        )
-    )
-)
-
-if "%COMMIT_FROM_FILE%"=="false" (
-    if not exist "%MSG_FILE%" (
-        set "NEW_MSG="
-        set /p "NEW_MSG=Commit message (single line, blank to skip commit): "
-        if not "!NEW_MSG!"=="" (
-            > "%MSG_FILE%" echo !NEW_MSG!
+            REM Non-interactive: just commit with whatever's in the file.
             set "COMMIT_FROM_FILE=true"
         )
     )

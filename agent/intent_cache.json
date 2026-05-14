@@ -66,10 +66,12 @@
         "what's the cost for a dog", "what is the cost for a dog",
         "what do you charge for a dog", "what do you charge for pets"
       ],
-      "_stt_mishearings_doc": "Common STT mishearings of 'pet fee' observed in real transcripts.",
+      "_stt_mishearings_doc": "Common STT mishearings of 'pet fee' observed in real transcripts. Add new ones here when they appear.",
       "stt_mishearings": [
         "pet pee", "pets pee", "pet peeve", "pet pea",
-        "tech fee", "tech key", "patch fee", "patch key"
+        "tech fee", "tech key", "test fee", "test key",
+        "patch fee", "patch key", "pet key",
+        "pepsi", "the pepsi", "what's the pepsi"
       ],
       "responses": [
         {"text": "The pet fee is twenty dollars per stay for dogs.", "weight": 1.0},
