@@ -123,6 +123,35 @@ def best_match(
 
 
 # =============================================================================
+# pyannote 3.x vs 4.x compatibility shim
+# =============================================================================
+
+def extract_annotation(diarize_output):
+    """Return a pyannote.core.Annotation that supports .itertracks().
+
+    pyannote.audio 3.x: Pipeline.__call__ returns an Annotation directly.
+    pyannote.audio 4.x: Pipeline.__call__ returns a DiarizeOutput wrapper
+    that exposes the Annotation under one of several attribute names
+    (speaker_diarization / diarization / annotation depending on
+    minor version). We try them all rather than hard-pinning either
+    library version."""
+    if diarize_output is None:
+        raise ValueError("Diarization pipeline returned None")
+    # 3.x path: it IS the Annotation already.
+    if hasattr(diarize_output, "itertracks"):
+        return diarize_output
+    # 4.x path: extract from wrapper.
+    for attr in ("speaker_diarization", "diarization", "annotation"):
+        ann = getattr(diarize_output, attr, None)
+        if ann is not None and hasattr(ann, "itertracks"):
+            return ann
+    raise ValueError(
+        f"Could not extract Annotation from {type(diarize_output).__name__}; "
+        f"available attrs: {sorted(a for a in dir(diarize_output) if not a.startswith('_'))}"
+    )
+
+
+# =============================================================================
 # Speaker-segment assignment
 # =============================================================================
 
@@ -207,8 +236,18 @@ def process_one(
     language = getattr(info, "language", "en")
 
     # ---- 2. Diarize with pyannote.audio Pipeline ---------------------
+    # Pass the librosa-loaded waveform as an in-memory dict instead of
+    # the file path. pyannote 4.x's internal file loader has strict
+    # sample-count validation that fails on many OGG files (decoded
+    # length doesn't match expected length to the sample). librosa is
+    # more permissive about decoding edge cases. Format pyannote wants:
+    # {"waveform": Tensor[channels, samples], "sample_rate": int}
+    import torch as _torch
     log.info("  Diarizing speakers ...")
-    diarization = diarize_pipeline(str(ogg_path))
+    waveform_tensor = _torch.from_numpy(audio).unsqueeze(0).to(_torch.float32)
+    diarize_input = {"waveform": waveform_tensor, "sample_rate": sr}
+    diarize_result = diarize_pipeline(diarize_input)
+    diarization = extract_annotation(diarize_result)
 
     # ---- 3. Combine: assign a speaker label to each whisper segment ------
     segments = []
