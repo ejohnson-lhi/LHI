@@ -463,10 +463,38 @@ class IrisAgent(Agent):
             except Exception:
                 log.exception("Could not disable audio output (continuing anyway)")
             log.info(
-                "Immediate-transfer mode: called=%s -> %s (skipping greeting)",
+                "Immediate-transfer mode: called=%s -> %s (skipping greeting); room=%s",
                 self._called_number, IMMEDIATE_TRANSFER_DESTINATION,
+                self._room.name if self._room is not None else "<unknown>",
             )
-            await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
+            # Diagnostic instrumentation 2026-05-15: production incident
+            # where the audio bridge sometimes fails to relay RTP for
+            # external callers even when both legs are SIP-connected
+            # (Twilio shows both legs "Completed"; caller and frontdesk2
+            # both pick up; both hear silence). Wrap transfer_to() with
+            # explicit timing + exception logging so docker logs from
+            # the livekit-sip container can be correlated with Python-
+            # side state.
+            import time as _time
+            _transfer_t0 = _time.monotonic()
+            log.info("transfer_to: starting (dest=%s)", IMMEDIATE_TRANSFER_DESTINATION)
+            try:
+                _transfer_result = await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
+                _transfer_elapsed = _time.monotonic() - _transfer_t0
+                log.info(
+                    "transfer_to: returned (elapsed=%.2fs, result=%r)",
+                    _transfer_elapsed, _transfer_result,
+                )
+            except Exception as _transfer_exc:
+                _transfer_elapsed = _time.monotonic() - _transfer_t0
+                log.exception(
+                    "transfer_to: EXCEPTION after %.2fs: %s",
+                    _transfer_elapsed, _transfer_exc,
+                )
+                # Re-raise so the framework knows the transfer failed.
+                # If we swallow the exception, the call sits in a half-
+                # bridged state and the caller hears silence even longer.
+                raise
             return
 
         # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
@@ -972,6 +1000,52 @@ def prewarm(proc: JobProcess) -> None:
 async def entrypoint(ctx: JobContext) -> None:
     log.info("Job received for room %s", ctx.room.name)
     await ctx.connect()
+
+    # Diagnostic instrumentation 2026-05-15: log every participant
+    # join/leave on this room so we can correlate Python-side state
+    # with LiveKit-SIP bridge state. For silent-mode 5070 transfers
+    # we expect to see (1) the inbound SIP caller joining first, then
+    # (2) the outbound SIP participant (frontdesk2) joining once the
+    # transfer completes. If we see (2) join but audio doesn't flow,
+    # the bug is in livekit-sip's RTP relay, not in our agent code.
+    @ctx.room.on("participant_connected")
+    def _on_pc(participant) -> None:
+        log.info(
+            "ROOM: participant_connected identity=%s kind=%s sid=%s attrs=%s",
+            getattr(participant, "identity", "<unknown>"),
+            getattr(participant, "kind", "<unknown>"),
+            getattr(participant, "sid", "<unknown>"),
+            dict(getattr(participant, "attributes", {}) or {}),
+        )
+
+    @ctx.room.on("participant_disconnected")
+    def _on_pd(participant) -> None:
+        log.info(
+            "ROOM: participant_disconnected identity=%s kind=%s sid=%s reason=%s",
+            getattr(participant, "identity", "<unknown>"),
+            getattr(participant, "kind", "<unknown>"),
+            getattr(participant, "sid", "<unknown>"),
+            getattr(participant, "disconnect_reason", "<unknown>"),
+        )
+
+    @ctx.room.on("track_subscribed")
+    def _on_ts(track, publication, participant) -> None:
+        log.info(
+            "ROOM: track_subscribed from=%s kind=%s source=%s muted=%s",
+            getattr(participant, "identity", "<unknown>"),
+            getattr(track, "kind", "<unknown>"),
+            getattr(publication, "source", "<unknown>"),
+            getattr(publication, "muted", "<unknown>"),
+        )
+
+    @ctx.room.on("track_unsubscribed")
+    def _on_tu(track, publication, participant) -> None:
+        log.info(
+            "ROOM: track_unsubscribed from=%s kind=%s source=%s",
+            getattr(participant, "identity", "<unknown>"),
+            getattr(track, "kind", "<unknown>"),
+            getattr(publication, "source", "<unknown>"),
+        )
 
     # Re-read voice state file in case admin_set_voice was called by an
     # earlier call AFTER this worker finished prewarming. Without this,
