@@ -453,10 +453,38 @@ class IrisAgent(Agent):
         # — that's the whole point: collect real customer-to-front-desk
         # interactions to drive prompt development on the dev DID.
         if self._silent:
-            # MUST mute audio output BEFORE initiating the transfer, in case
-            # any subsequent STT event triggers an LLM response before
-            # transfer_to returns. Belt; on_user_turn_completed override is
-            # the suspenders.
+            # PRODUCTION INCIDENT 2026-05-14/15: SIP transfer to frontdesk2
+            # takes 11-16 seconds end-to-end (mostly waiting for the human
+            # to walk over and pick up port 2). With Iris muted during that
+            # window, callers heard total silence and concluded the line
+            # was dead — most hung up within 13 seconds, leaving the front
+            # desk picking up to dead air. Sarah Hibbs (real guest) called
+            # 3 times trying to get her room key; +17074794717 tried 6+
+            # times in 5 hours; data showed the pattern unambiguously
+            # (caller-disconnect at t=13.7s, transfer-completion at t=15.95s).
+            #
+            # Fix: replace dead air with audible cues BEFORE muting:
+            #   (1) Synthetic ringback tone — sounds like a normal phone
+            #       ringing, signals "your call is being routed."
+            #   (2) Verbal handoff — explicit "Connecting you to the front
+            #       desk now." so caller knows what's happening.
+            # Both are cached at prewarm so they play instantly without
+            # synthesis delay. After speaking, we mute as before; future
+            # STT-triggered LLM responses still get suppressed by the
+            # on_user_turn_completed StopResponse override.
+            try:
+                await self.session.say(RINGBACK_CACHE_KEY, allow_interruptions=False)
+                log.info("Silent mode: played synthetic ringback")
+            except Exception:
+                log.exception("Could not play ringback (continuing anyway)")
+            HANDOFF_PHRASE = "Connecting you to the front desk now."
+            try:
+                await self.session.say(HANDOFF_PHRASE, allow_interruptions=False)
+                log.info("Silent mode: spoke verbal handoff")
+            except Exception:
+                log.exception("Could not speak handoff (continuing anyway)")
+            # NOW mute audio output, so any later STT-triggered LLM
+            # response doesn't leak into the bridged human conversation.
             try:
                 self.session.output.set_audio_enabled(False)
                 log.info("Silent mode: disabled session audio output")
