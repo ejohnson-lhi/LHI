@@ -188,9 +188,9 @@ TRANSFER_RING_TIMEOUT_S = 30
 # sentence plays as a cache hit (audio starts ~0.3s after the failure
 # instead of waiting on Kokoro synthesis).
 TRANSFER_FALLBACK_PHRASE = (
-    "I'm sorry, the front desk isn't picking up. "
-    "I can take a message and have someone call you back, "
-    "or I can try Eric's cell. Which would you prefer?"
+    "I apologize. The front desk isn't picking up. "
+    "I can take a message, or I can try Eric's cell. "
+    "Which would you prefer?"
 )
 
 # Dual-DID setup: the hotel owns two sequential Twilio DIDs.
@@ -276,13 +276,15 @@ PERSISTENT_OPENERS: tuple[str, ...] = (
     "You're connected — I'll step out.",
     "The front desk isn't picking up — let me try Eric's cell. One moment.",
     "Eric's not picking up. Would you like me to try the front desk?",
-    # Silent-mode (Port 2) Phase 2 escalation — sentence-split components of
-    # ESCALATE_PHRASE in on_enter. Prewarming the FIRST sentence in particular
-    # means audio starts ~0.3s after un-muting instead of ~1-2s waiting for
-    # Kokoro to synthesize, which matters because the caller just sat
-    # through up to 30s of dead-air ring.
-    "I'm sorry, the front desk isn't picking up.",
-    "I can take a message and have someone call you back, or I can try Eric's cell.",
+    # Sentence-split components of TRANSFER_FALLBACK_PHRASE — spoken when
+    # a transfer attempt fails (Port 2 silent-mode escalation or the
+    # speak_to_human post-action no-answer path). Restructured 5/17 into
+    # four short sentences (was three with a long comma-joined first
+    # sentence) after a test heard a mid-word stutter inside "front" —
+    # shorter chunks cache and stream more cleanly under CPU pressure.
+    # "I apologize." is reused from the existing acknowledgments block above.
+    "The front desk isn't picking up.",
+    "I can take a message, or I can try Eric's cell.",
     "Which would you prefer?",
     # ----- Pet policy (highest-frequency hotel-fact answers) -----
     "Yes, dogs are welcome!",
