@@ -453,6 +453,9 @@
         "get me a person", "get a person on the line", "get someone on the line",
         "transfer me", "transfer me to a person", "transfer me to a human",
         "transfer me to the front desk", "transfer to front desk",
+        "connect me to", "connect me with",
+        "put me through", "put me through to",
+        "talk to the front desk",
         "real person please", "real human please"
       ],
       "responses": [

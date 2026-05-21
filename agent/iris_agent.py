@@ -1004,6 +1004,26 @@ class IrisAgent(Agent):
 
         await _stop_ringback()
         log.info("Transfer to %s connected", destination)
+
+        # Auto-mute Iris's audio output and set _silent so subsequent STT
+        # turns short-circuit before the LLM. Without this, the LLM kept
+        # getting invoked on each STT event during the human-to-human
+        # conversation and, despite the [Transfer Scope Rules] prompt
+        # instructing it to stop responding, eventually broke in with
+        # phantom lines like "I'm sorry, I'm still on the line"
+        # (observed in production testing 2026-05-17). The LLM may still
+        # generate its prompt-mandated "You're connected — I'll step out"
+        # line via the tool-return path, but with output muted the caller
+        # never hears it — small UX loss for robust silencing. The egress
+        # recording captures all room audio regardless of Iris's mute
+        # state, so the human conversation is still preserved.
+        try:
+            self.session.output.set_audio_enabled(False)
+            log.info("Connected transfer: muted Iris audio output")
+        except Exception:
+            log.exception("Could not mute audio output after connected transfer")
+        self._silent = True
+
         return json.dumps({
             "status": "connected",
             "destination": destination,
