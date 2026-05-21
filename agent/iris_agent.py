@@ -507,13 +507,17 @@ class IrisAgent(Agent):
                 log.info("Silent mode: spoke verbal handoff")
             except Exception:
                 log.exception("Could not speak handoff (continuing anyway)")
-            # NOW mute audio output, so any later STT-triggered LLM
-            # response doesn't leak into the bridged human conversation.
-            try:
-                self.session.output.set_audio_enabled(False)
-                log.info("Silent mode: disabled session audio output")
-            except Exception:
-                log.exception("Could not disable audio output (continuing anyway)")
+            # Early-mute removed 2026-05-17: muting here silenced the
+            # ringback loop inside transfer_to during the SIP wait, so
+            # callers heard the verbal handoff and then ~30s of dead air
+            # before the Phase 2 escalation. Two newer mechanisms now
+            # cover the original "Iris audio must not leak into the
+            # bridged human conversation" concern: (1) on_user_turn_completed
+            # short-circuits via StopResponse while self._silent is True,
+            # so the LLM is never invoked during the ring or after the
+            # connect; (2) transfer_to's connected branch calls
+            # set_audio_enabled(False) deterministically once the human
+            # picks up. Both are belt-and-suspenders against TTS leakage.
             log.info(
                 "Immediate-transfer mode: called=%s -> %s (skipping greeting); room=%s",
                 self._called_number, IMMEDIATE_TRANSFER_DESTINATION,
