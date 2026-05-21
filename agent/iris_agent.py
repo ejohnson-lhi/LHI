@@ -177,6 +177,22 @@ TRANSFER_TARGETS: dict[str, tuple[str, str, str]] = {
 # no-answer and returning to the LLM so it can try the fallback.
 TRANSFER_RING_TIMEOUT_S = 30
 
+# Spoken when a transfer attempt does NOT connect (no_answer or exception)
+# and the conversation needs to recover gracefully. Used in two places that
+# both need to offer a deterministic next step to the caller:
+#   1. on_enter silent-mode (Port 2) escalation after immediate-transfer
+#      fails — un-mutes Iris and falls into conversational mode.
+#   2. on_user_turn_completed cache-driven transfer (speak_to_human intent)
+#      after transfer_to fails — keeps the call conversational.
+# Sentence-split chunks are added to PERSISTENT_OPENERS so the first
+# sentence plays as a cache hit (audio starts ~0.3s after the failure
+# instead of waiting on Kokoro synthesis).
+TRANSFER_FALLBACK_PHRASE = (
+    "I'm sorry, the front desk isn't picking up. "
+    "I can take a message and have someone call you back, "
+    "or I can try Eric's cell. Which would you prefer?"
+)
+
 # Dual-DID setup: the hotel owns two sequential Twilio DIDs.
 #   +15419915071 (the "dev" / "Iris-engages" line):  Iris answers normally,
 #       runs through the full prompt flow, can engage the caller and use
@@ -260,6 +276,14 @@ PERSISTENT_OPENERS: tuple[str, ...] = (
     "You're connected — I'll step out.",
     "The front desk isn't picking up — let me try Eric's cell. One moment.",
     "Eric's not picking up. Would you like me to try the front desk?",
+    # Silent-mode (Port 2) Phase 2 escalation — sentence-split components of
+    # ESCALATE_PHRASE in on_enter. Prewarming the FIRST sentence in particular
+    # means audio starts ~0.3s after un-muting instead of ~1-2s waiting for
+    # Kokoro to synthesize, which matters because the caller just sat
+    # through up to 30s of dead-air ring.
+    "I'm sorry, the front desk isn't picking up.",
+    "I can take a message and have someone call you back, or I can try Eric's cell.",
+    "Which would you prefer?",
     # ----- Pet policy (highest-frequency hotel-fact answers) -----
     "Yes, dogs are welcome!",
     "Yes, we do allow dogs.",
@@ -506,6 +530,7 @@ class IrisAgent(Agent):
             import time as _time
             _transfer_t0 = _time.monotonic()
             log.info("transfer_to: starting (dest=%s)", IMMEDIATE_TRANSFER_DESTINATION)
+            _status: str = ""
             try:
                 _transfer_result = await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
                 _transfer_elapsed = _time.monotonic() - _transfer_t0
@@ -513,16 +538,51 @@ class IrisAgent(Agent):
                     "transfer_to: returned (elapsed=%.2fs, result=%r)",
                     _transfer_elapsed, _transfer_result,
                 )
+                try:
+                    _result_obj = json.loads(_transfer_result) if _transfer_result else {}
+                except (json.JSONDecodeError, TypeError):
+                    _result_obj = {}
+                _status = _result_obj.get("status", "")
             except Exception as _transfer_exc:
                 _transfer_elapsed = _time.monotonic() - _transfer_t0
                 log.exception(
                     "transfer_to: EXCEPTION after %.2fs: %s",
                     _transfer_elapsed, _transfer_exc,
                 )
-                # Re-raise so the framework knows the transfer failed.
-                # If we swallow the exception, the call sits in a half-
-                # bridged state and the caller hears silence even longer.
-                raise
+                _status = "exception"
+
+            if _status == "connected":
+                # Transfer succeeded — destination joined the room and the
+                # human leg is in control. Iris stays silent/muted; the
+                # framework keeps the recording going via the egress.
+                return
+
+            # Phase 2 escalation: transfer did NOT connect (no_answer,
+            # exception, or some other non-connect outcome). Without this
+            # block, Iris would stay muted forever and the caller would
+            # sit in silence — same failure mode as the original Port 2
+            # incident, just one layer deeper. Un-mute, drop the silent
+            # flag so subsequent user turns invoke the LLM, and speak a
+            # graceful fallback that gives the caller an actionable next
+            # step (message or Eric's cell).
+            log.warning(
+                "Silent-mode transfer did not connect (status=%r); "
+                "escalating to conversational mode",
+                _status,
+            )
+            try:
+                self.session.output.set_audio_enabled(True)
+                log.info("Silent mode: re-enabled session audio output")
+            except Exception:
+                log.exception("Could not re-enable audio output")
+            # Flip the flag so on_user_turn_completed stops short-circuiting
+            # the LLM. From this point the call behaves like a normal Port 1
+            # conversation, just without the initial greeting.
+            self._silent = False
+            try:
+                await self.session.say(TRANSFER_FALLBACK_PHRASE, allow_interruptions=True)
+            except Exception:
+                log.exception("Could not speak silent-mode escalation message")
             return
 
         # (Synthetic ringback tone removed 2026-05-13 — Twilio's PSTN side
@@ -627,8 +687,82 @@ class IrisAgent(Agent):
             )
             return  # let the LLM handle it
 
+        # Optional post-action: e.g. speak_to_human's response is "Let me
+        # transfer you" — the canned text is just the verbal handoff; the
+        # actual transfer fires here. Disable the cache for the rest of the
+        # call so subsequent STT turns during/after the transfer don't try
+        # to classify on top of an in-flight or completed bridge.
+        post_action = INTENT_CACHE.get_post_action(intent_id)
+        if post_action == "transfer_to_front_desk":
+            self._intent_state.disabled = True
+            await self._execute_transfer_with_fallback("front_desk")
+        elif post_action:
+            log.warning(
+                "Intent %s declared unknown post_action %r — ignoring",
+                intent_id, post_action,
+            )
+
         if StopResponse is not None:
             raise StopResponse()
+
+    async def _execute_transfer_with_fallback(self, destination: str) -> None:
+        """Trigger a warm transfer and handle the outcome deterministically.
+
+        On `connected`: mute Iris's audio output and set self._silent so
+        subsequent STT turns short-circuit before the LLM — the human leg
+        is now driving the conversation and Iris must not interject.
+
+        On any non-connected outcome (no_answer, exception, malformed
+        response): leave Iris conversational and speak TRANSFER_FALLBACK_PHRASE
+        so the caller has an explicit next step (message or Eric's cell).
+
+        While the transfer is ringing, self._silent is set to True so any
+        STT-triggered user turns during the wait don't speak on top of the
+        ringback loop running inside transfer_to. The flag is restored to
+        its prior value on failure.
+        """
+        prev_silent = self._silent
+        # Silence the call during the ring wait. transfer_to's background
+        # ringback loop runs unaffected — it's the only audio that should
+        # play between now and either pickup or no_answer.
+        self._silent = True
+        status = ""
+        try:
+            result_json = await self.transfer_to(destination)
+            try:
+                result_obj = json.loads(result_json) if result_json else {}
+            except (json.JSONDecodeError, TypeError):
+                result_obj = {}
+            status = result_obj.get("status", "")
+        except Exception:
+            log.exception("transfer_to(%s) from intent post-action raised", destination)
+            status = "exception"
+
+        if status == "connected":
+            log.info(
+                "Post-action transfer to %s connected; muting Iris for the rest of the call",
+                destination,
+            )
+            try:
+                self.session.output.set_audio_enabled(False)
+            except Exception:
+                log.exception("Could not mute audio after connected transfer")
+            # Leave self._silent = True so future user turns skip the LLM.
+            return
+
+        log.warning(
+            "Post-action transfer to %s did not connect (status=%r); offering fallback",
+            destination, status,
+        )
+        # Restore conversational mode so the LLM (and intent cache where
+        # appropriate) can handle the caller's next response.
+        self._silent = prev_silent
+        try:
+            await self.session.say(
+                TRANSFER_FALLBACK_PHRASE, allow_interruptions=True,
+            )
+        except Exception:
+            log.exception("Could not speak transfer fallback phrase")
 
     # -------------------------------------------------------------------------
     # Tools — JSON return values, all proxied to backend's existing handlers.
@@ -787,6 +921,57 @@ class IrisAgent(Agent):
             destination, sip_to, trunk_id, room_name,
         )
 
+        # Background ringback during the SIP ring wait. Same rationale as
+        # the silent-mode (Port 2) fix: callers will hang up after ~13s of
+        # dead air on what feels like a dropped call. Looping the cached
+        # ringback (1.5s tone + ~3.5s pause) approximates US ring cadence
+        # (2s on / 4s off) so the caller hears the line is alive while the
+        # destination phone rings.
+        async def _ringback_loop():
+            # add_to_chat_ctx=False keeps the "__ringback_tone__" sentinel
+            # out of the LLM's chat history. Without it, every ring would
+            # show up as an assistant message and could confuse subsequent
+            # LLM turns (e.g., the no_answer fallback turn). Falls back to
+            # the basic call signature if the installed livekit-agents
+            # version predates that kwarg.
+            try:
+                while True:
+                    try:
+                        try:
+                            await self.session.say(
+                                RINGBACK_CACHE_KEY,
+                                allow_interruptions=False,
+                                add_to_chat_ctx=False,
+                            )
+                        except TypeError:
+                            await self.session.say(
+                                RINGBACK_CACHE_KEY,
+                                allow_interruptions=False,
+                            )
+                    except Exception:
+                        log.exception(
+                            "Ringback say() failed; stopping loop"
+                        )
+                        return
+                    await asyncio.sleep(3.5)
+            except asyncio.CancelledError:
+                raise
+
+        ringback_task: asyncio.Task | None = None
+        try:
+            ringback_task = asyncio.create_task(_ringback_loop())
+        except Exception:
+            log.exception("Could not start ringback loop (continuing silently)")
+
+        async def _stop_ringback() -> None:
+            if ringback_task is None or ringback_task.done():
+                return
+            ringback_task.cancel()
+            try:
+                await ringback_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         try:
             lk = api.LiveKitAPI()
             try:
@@ -797,10 +982,10 @@ class IrisAgent(Agent):
                         room_name=room_name,
                         participant_identity=f"transfer-{destination}",
                         participant_name=label,
-                        # play_dialtone=False: the synthetic ringback beeps
-                        # are unpleasant for the caller. Iris's "connecting
-                        # you" announcement gives enough context; silence
-                        # while the destination's phone rings is fine.
+                        # play_dialtone=False: we play our own synthetic
+                        # ringback in the background loop above. Letting
+                        # LiveKit also play dialtone would double-stack
+                        # tones on the caller's line.
                         play_dialtone=False,
                         wait_until_answered=True,
                         ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
@@ -810,12 +995,14 @@ class IrisAgent(Agent):
                 await lk.aclose()
         except Exception:
             log.exception("Transfer to %s failed", destination)
+            await _stop_ringback()
             return json.dumps({
                 "status": "no_answer",
                 "destination": destination,
                 "display": label,
             })
 
+        await _stop_ringback()
         log.info("Transfer to %s connected", destination)
         return json.dumps({
             "status": "connected",

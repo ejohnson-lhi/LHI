@@ -440,8 +440,9 @@
         {"text": "Yes, I'm software — an A I trained to take calls and book rooms.", "weight": 1.0}
       ]
     },
-    "_speak_to_human_DISABLED": {
-      "_doc": "DISABLED for Phase 1: the cache would speak \"transferring you now\" but no transfer actually happens (the cache-hit path doesn't call transfer_to). Result: caller hears the line but stays on the line with Iris saying nothing. The LLM-driven path handles this correctly because it calls the transfer tool. Phase 2 will add a `post_action: transfer_to_front_desk` field to this intent and the cache-hit path will execute it after speaking. Until then, the underscore prefix excludes this from the active intents map.",
+    "speak_to_human": {
+      "_doc": "Caller explicitly asks for a human / person / the front desk. Cache speaks the verbal handoff (\"Let me transfer you to the front desk now.\") and the post_action field then triggers the actual transfer via IrisAgent._execute_transfer_with_fallback. On connected: Iris mutes and steps out. On no_answer: TRANSFER_FALLBACK_PHRASE is spoken so the caller has an explicit next step (message or Eric's cell). Triggers deliberately exclude bare-noun phrases like 'the front desk' / 'let me speak to' that produce too many false positives in non-transfer contexts (e.g. 'tell the front desk', 'let me speak to my wife').",
+      "post_action": "transfer_to_front_desk",
       "trigger_phrases": [
         "speak to a person", "speak to a real person",
         "speak to a human", "speak to a real human",
@@ -452,8 +453,6 @@
         "get me a person", "get a person on the line", "get someone on the line",
         "transfer me", "transfer me to a person", "transfer me to a human",
         "transfer me to the front desk", "transfer to front desk",
-        "the front desk", "front desk please",
-        "let me speak to", "let me talk to",
         "real person please", "real human please"
       ],
       "responses": [

@@ -210,6 +210,28 @@ class IntentCache:
                 return intent_id
         return None
 
+    # ----- post-action lookup -----
+
+    def get_post_action(self, intent_id: str) -> str | None:
+        """Optional `post_action` field on an intent: a string identifier
+        the cache-hit path executes after speaking the response. Currently
+        recognized by IrisAgent:
+
+          - "transfer_to_front_desk": invokes self.transfer_to("front_desk")
+            after speaking, then either mutes (on connected) or speaks the
+            standard fallback (on no_answer).
+
+        Returns None if the intent has no post_action, the intent doesn't
+        exist, or the field isn't a string.
+        """
+        intent = self.intents.get(intent_id)
+        if not isinstance(intent, dict):
+            return None
+        action = intent.get("post_action")
+        if isinstance(action, str) and action:
+            return action
+        return None
+
     # ----- response picking -----
 
     def pick_response(

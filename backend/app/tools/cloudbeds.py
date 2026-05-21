@@ -25,20 +25,96 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.cloudbeds_api_key}"}
 
 
+import phonenumbers
+
+
+def _looks_like_junk_phone(digits: str) -> bool:
+    """Reject sequences that parse OK but are obviously not real numbers:
+    all the same digit (5555555555), trivially short (<7 digits), or stuck
+    at zero. Belt-and-suspenders -- libphonenumber already rejects most
+    bad NANP numbers, but international validation is looser and these
+    patterns are never legitimate."""
+    if len(digits) < 7:
+        return True
+    if len(set(digits)) == 1:  # 1111111111, 0000000000
+        return True
+    return False
+
+
 def normalize_phone_e164(raw: str | None, default_country_code: str = "1") -> str | None:
-    """Normalize to E.164 (+15417295563). Returns None if not parseable."""
+    """Normalize to E.164 (+15417295563) using libphonenumber. Returns None if
+    the input doesn't parse to a valid number for any region, or trips the
+    junk-pattern filter (all-same-digit, etc.).
+
+    The `default_country_code` parameter is preserved for back-compat -- only
+    "1" (US/NANP, the property's region) is honored. Numbers typed with a
+    leading "+" are parsed against any region.
+    """
     if not raw:
         return None
-    cleaned = re.sub(r"[^\d+]", "", raw)
-    if cleaned.startswith("+"):
-        digits = cleaned[1:]
-        return f"+{digits}" if 7 <= len(digits) <= 15 else None
-    digits = re.sub(r"\D", "", cleaned)
-    if len(digits) == 10:
-        return f"+{default_country_code}{digits}"
-    if len(digits) == 11 and digits.startswith(default_country_code):
-        return f"+{digits}"
-    return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    # Cheap junk filter before invoking phonenumbers -- catches "1", "0000000",
+    # "9999999999", etc. without paying for a parse.
+    digits_only = re.sub(r"\D", "", raw)
+    if _looks_like_junk_phone(digits_only):
+        return None
+
+    region = "US" if default_country_code == "1" else None
+    try:
+        parsed = phonenumbers.parse(raw, None if raw.startswith("+") else region)
+    except phonenumbers.NumberParseException:
+        return None
+    if not phonenumbers.is_valid_number(parsed):
+        return None
+    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+
+
+def format_phone_display(raw: str | None) -> str:
+    """Pretty-print a phone using our house style:
+
+    NANP (+1, 10 nat digits): "(541)-555-7890"
+    Other:                    "+44-7911-123-456" (country code, then national
+                              digits in groups of 3 with the last group
+                              taking 3-4 digits)
+
+    Validation goes through libphonenumber (normalize_phone_e164). On invalid
+    input we return what the guest typed unchanged -- pre-fill stays editable
+    so they can fix the typo rather than having their input vanish.
+    """
+    if not raw:
+        return ""
+    e164 = normalize_phone_e164(raw)
+    if not e164:
+        return str(raw).strip()
+    # Parse once more to split country code from national number cleanly.
+    try:
+        parsed = phonenumbers.parse(e164, None)
+    except phonenumbers.NumberParseException:
+        return e164  # shouldn't happen -- e164 came from libphonenumber
+    cc = str(parsed.country_code)
+    nat = str(parsed.national_number)
+
+    # NANP -- the property's home region.
+    if cc == "1" and len(nat) == 10:
+        return f"({nat[0:3]})-{nat[3:6]}-{nat[6:10]}"
+
+    # Everything else: hyphen-separated groups of 3, with a trailing
+    # 1-digit group merged into the previous one to avoid orphan digits
+    # ("+44-791-112-345-6" -> "+44-791-112-3456").
+    if not nat:
+        return f"+{cc}"
+    groups: list[str] = []
+    i = 0
+    while i < len(nat):
+        groups.append(nat[i:i + 3])
+        i += 3
+    if len(groups) >= 2 and len(groups[-1]) == 1:
+        groups[-2] += groups[-1]
+        groups.pop()
+    return f"+{cc}-" + "-".join(groups)
 
 
 async def _get(endpoint: str, params: dict[str, Any] | None = None) -> dict | None:
@@ -167,11 +243,55 @@ def _summarize_reservation(reservation: dict) -> dict:
     source_id = reservation.get("sourceID")
     start_iso = reservation.get("startDate")
     end_iso = reservation.get("endDate")
+    # Cloudbeds returns guest contact fields either at the top level (newer
+    # endpoints) or nested in guestList (older shape). Try top-level first,
+    # fall back to the first guest in the list -- mirrors the GX-26 wrapper's
+    # well-tested behavior. Same fallback used for guestID.
+    guest_id = reservation.get("guestID") or ""
+    main_guest: dict | None = None
+    guest_list = reservation.get("guestList") or {}
+    if isinstance(guest_list, dict):
+        for gid, g in guest_list.items():
+            if isinstance(g, dict):
+                if not guest_id:
+                    guest_id = gid
+                if main_guest is None:
+                    main_guest = g
+                if g.get("isMainGuest"):
+                    main_guest = g
+                    break
+
+    def _g(field: str) -> str | None:
+        """Read a guest field: top-level first, then main_guest."""
+        v = reservation.get(field)
+        if v:
+            return v
+        if main_guest is not None:
+            v = main_guest.get(field)
+            if v:
+                return v
+        return None
+
     return {
         "reservation_id": reservation.get("reservationID"),
+        "guest_id": guest_id or None,
         "guest_name": reservation.get("guestName"),
+        "guest_first_name": _g("guestFirstName"),
+        "guest_last_name": _g("guestLastName"),
+        "guest_email": _g("guestEmail"),
+        # NOTE Cloudbeds asymmetry: read as guestAddress, write as guestAddress1.
+        "guest_address": _g("guestAddress"),
+        "guest_address2": _g("guestAddress2"),
+        "guest_city": _g("guestCity"),
+        "guest_state": _g("guestState"),
+        "guest_zip": _g("guestZip"),
+        "guest_country": _g("guestCountry"),
+        "guest_phone": _g("guestPhone"),
+        "guest_cell_phone": _g("guestCellPhone"),
         "check_in": _format_iso_date_long(start_iso),
         "check_out": _format_iso_date_long(end_iso),
+        "start_iso": start_iso,
+        "end_iso": end_iso,
         "stay_phase": _stay_phase(start_iso, end_iso),
         "status": reservation.get("status"),
         "source": reservation.get("sourceName") or reservation.get("source"),
@@ -189,6 +309,9 @@ def _summarize_reservation(reservation: dict) -> dict:
         "room_name": room_name,
         "door_code": door_code,
         "balance_due": reservation.get("balance"),
+        # cards_on_file shape: list of {"cardID": "...", "cardNumber": "1234", "cardType": "visa"}.
+        # cardNumber is last 4 only (PCI-safe). Empty list if no cards.
+        "cards_on_file": reservation.get("cardsOnFile") or [],
     }
 
 
@@ -649,6 +772,336 @@ async def modify_reservation(
         reservation_id, new_check_out, estimated_arrival_time,
     )
     return {"success": True, "reservation_id": reservation_id}
+
+
+async def put_guest_contact(
+    *,
+    guest_id: str,
+    address1: str | None = None,
+    address2: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    zip_code: str | None = None,
+    country: str | None = None,
+    phone: str | None = None,
+    cell_phone: str | None = None,
+    email: str | None = None,
+) -> dict:
+    """Update guest contact fields via Cloudbeds putGuest.
+
+    Only fields passed as non-None are sent -- omitted keys leave whatever
+    Cloudbeds currently has untouched. (Sending an empty string would CLEAR
+    the field on their side.) Returns {"success": True} or
+    {"success": False, "error": "..."}. Never raises.
+
+    Field-name note: Cloudbeds is asymmetric -- reads expose `guestAddress`,
+    writes use `guestAddress1`. Same with guestAddress2 for an optional
+    second address line. Verified against the GX-26 B4J wrapper that's been
+    in production against this property.
+    """
+    if not settings.cloudbeds_api_key:
+        return {"success": False, "error": "Cloudbeds API key not configured."}
+    if not guest_id:
+        return {"success": False, "error": "guest_id is required."}
+
+    # Cloudbeds form-encoded API quirk: sending guestX="" is SILENTLY IGNORED
+    # (field keeps prior value). Sending guestX=" " (single space) stores an
+    # empty string -- i.e., actually clears the field. Empirically verified
+    # 2026-05-21 against putGuest. So caller passes "" to mean "clear", and
+    # we translate to a single space on the wire.
+    def _cb_value(v: str | None) -> str | None:
+        if v is None:
+            return None  # caller said "don't update"
+        return " " if v == "" else v  # "" -> " " (clear); otherwise verbatim
+
+    form: dict[str, str] = {
+        "propertyID": settings.cloudbeds_property_id,
+        "guestID": guest_id,
+    }
+    if (v := _cb_value(address1)) is not None: form["guestAddress1"] = v
+    if (v := _cb_value(address2)) is not None: form["guestAddress2"] = v
+    if (v := _cb_value(city)) is not None: form["guestCity"] = v
+    if (v := _cb_value(state)) is not None: form["guestState"] = v
+    if (v := _cb_value(zip_code)) is not None: form["guestZip"] = v
+    if (v := _cb_value(country)) is not None: form["guestCountry"] = v
+    if (v := _cb_value(phone)) is not None: form["guestPhone"] = v
+    if (v := _cb_value(cell_phone)) is not None: form["guestCellPhone"] = v
+    if (v := _cb_value(email)) is not None: form["guestEmail"] = v
+
+    if len(form) <= 2:  # only propertyID + guestID -> nothing to update
+        return {"success": False, "error": "No fields to update."}
+
+    url = f"{CLOUDBEDS_BASE_URL}/putGuest"
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            response = await client.put(url, data=form, headers=_auth_headers())
+    except httpx.TimeoutException:
+        log.warning("Cloudbeds putGuest timed out")
+        return {"success": False, "error": "Update timed out."}
+    except httpx.HTTPError as e:
+        log.warning("Cloudbeds putGuest HTTP error: %s", e)
+        return {"success": False, "error": str(e)}
+
+    if response.status_code != 200:
+        log.warning("Cloudbeds putGuest HTTP %s: %s", response.status_code, response.text[:300])
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+
+    body = response.json()
+    if not body.get("success", False):
+        log.warning("Cloudbeds putGuest success=false: %s", str(body)[:500])
+        return {"success": False, "error": body.get("message") or "Cloudbeds rejected the update."}
+
+    log.info("put_guest_contact: updated guest %s (fields=%s)", guest_id, sorted(form.keys()))
+    return {"success": True, "guest_id": guest_id}
+
+
+async def post_item(reservation_id: str, item_id: str, quantity: int = 1) -> dict:
+    """Add a fee/item line to a reservation's folio via Cloudbeds postItem.
+
+    Returns {"success": True, "sold_product_id": "..."} or
+    {"success": False, "error": "..."}. The soldProductID is what you'd
+    pass to postVoidItem later to remove this charge.
+
+    `quantity` multiplies the per-unit cost configured for the item in
+    Cloudbeds (so itemID=dog-fee + quantity=2 charges 2 x the unit price).
+    """
+    if not settings.cloudbeds_api_key:
+        return {"success": False, "error": "Cloudbeds API key not configured."}
+    if not item_id:
+        return {"success": False, "error": "item_id is required."}
+    if quantity < 1:
+        return {"success": False, "error": "quantity must be >= 1."}
+    form = {
+        "propertyID": settings.cloudbeds_property_id,
+        "reservationID": reservation_id,
+        "itemID": item_id,
+        "itemQuantity": str(quantity),
+    }
+    url = f"{CLOUDBEDS_BASE_URL}/postItem"
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, data=form, headers=_auth_headers())
+    except httpx.TimeoutException:
+        log.warning("Cloudbeds postItem timed out (res=%s item=%s)", reservation_id, item_id)
+        return {"success": False, "error": "Charge add timed out."}
+    except httpx.HTTPError as e:
+        log.warning("Cloudbeds postItem HTTP error: %s", e)
+        return {"success": False, "error": str(e)}
+    if response.status_code != 200:
+        log.warning("Cloudbeds postItem HTTP %s: %s", response.status_code, response.text[:300])
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    body = response.json()
+    if not body.get("success", False):
+        log.warning("Cloudbeds postItem success=false: %s", str(body)[:500])
+        return {"success": False, "error": body.get("message") or "Cloudbeds rejected the item."}
+    sold_id = (body.get("data") or {}).get("soldProductID") or body.get("soldProductID") or ""
+    log.info("post_item: res=%s item=%s qty=%d -> sold_product_id=%s",
+             reservation_id, item_id, quantity, sold_id)
+    return {"success": True, "sold_product_id": sold_id}
+
+
+def detect_card_type_from_pan(pan: str) -> str | None:
+    """Identify the card brand from the leading digits (BIN ranges).
+    Returns one of 'visa' / 'mastercard' / 'amex' / 'discover' / 'diners' /
+    'jcb', or None when unrecognized. Used so we can populate Cloudbeds'
+    cardType field even when the caller hasn't passed it -- matches GX-26
+    which always sends a brand."""
+    if not pan or not pan.isdigit():
+        return None
+    if pan.startswith("4"):
+        return "visa"
+    if pan[:2] in {"51", "52", "53", "54", "55"} or (len(pan) >= 4 and 2221 <= int(pan[:4]) <= 2720):
+        return "mastercard"
+    if pan[:2] in {"34", "37"}:
+        return "amex"
+    if pan.startswith("6011") or pan.startswith("65") or pan[:3] in {"644", "645", "646", "647", "648", "649"}:
+        return "discover"
+    if pan[:2] in {"36", "38", "39"} or pan[:3] in {"300", "301", "302", "303", "304", "305"}:
+        return "diners"
+    if pan.startswith("35"):
+        return "jcb"
+    return None
+
+
+async def post_credit_card(
+    reservation_id: str,
+    *,
+    # Raw-card path (the GX-26-proven flow). Cloudbeds tokenizes internally
+    # against their Stripe Connect account. Cards on properties using the
+    # StripePlatformGateway with cloudbedsPayments=True don't need a Stripe
+    # SDK on our side -- Cloudbeds owns the merchant relationship.
+    card_number: str | None = None,
+    card_expiration: str | None = None,   # "MM/YY", e.g. "09/27"
+    card_cvv: str | None = None,
+    card_holder_name: str | None = None,
+    card_type: str | None = None,
+    card_address_zip: str | None = None,
+    # Stripe SDK path (alternate). Use only if the property exposes a Stripe
+    # Elements / Payment Element setup tied to their Connect Account.
+    payment_method_id: str | None = None,
+    return_url: str | None = None,
+) -> dict:
+    """Attach a credit card to a Cloudbeds reservation via postCreditCard.
+    Two mutually-exclusive paths:
+      * Raw-card fields (card_number + card_expiration + card_cvv + holder)
+        -- Cloudbeds tokenizes internally. PCI scope sits on our backend
+        during the in-flight POST only. NEVER LOGGED, never persisted.
+      * payment_method_id from Stripe.js -- when a Stripe SDK is wired up.
+
+    Returns {"success": True, "card_id": "..."} or
+    {"success": False, "error": "...", "requires_3ds": bool, "redirect_url": "..."}.
+
+    Caller MUST scrub the raw values from local variables after this returns
+    (Python's GC will eventually, but explicit is safer for audit purposes).
+    """
+    if not settings.cloudbeds_api_key:
+        return {"success": False, "error": "Cloudbeds API key not configured."}
+    form = {
+        "propertyID": settings.cloudbeds_property_id,
+        "reservationID": reservation_id,
+    }
+    if payment_method_id:
+        form["paymentMethodId"] = payment_method_id
+    elif card_number and card_expiration and card_cvv:
+        form["cardNumber"] = card_number
+        form["cardExpiration"] = card_expiration
+        form["cardCvv"] = card_cvv
+        if card_holder_name:
+            form["cardHolderName"] = card_holder_name
+        if card_type:
+            form["cardType"] = card_type
+        if card_address_zip:
+            form["cardAddressZip"] = card_address_zip
+    else:
+        return {"success": False, "error": "Either raw card fields or payment_method_id is required."}
+    if return_url:
+        form["returnUrl"] = return_url
+    url = f"{CLOUDBEDS_BASE_URL}/postCreditCard"
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, data=form, headers=_auth_headers())
+    except httpx.TimeoutException:
+        log.warning("Cloudbeds postCreditCard timed out (res=%s)", reservation_id)
+        return {"success": False, "error": "Card attach timed out."}
+    except httpx.HTTPError as e:
+        log.warning("Cloudbeds postCreditCard HTTP error: %s", e)
+        return {"success": False, "error": str(e)}
+    if response.status_code != 200:
+        log.warning("Cloudbeds postCreditCard HTTP %s body=%s sent_keys=%s",
+                    response.status_code, response.text[:500], sorted(form.keys()))
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    body = response.json()
+    if not body.get("success", False):
+        # Log FULL body + the keys we sent (NOT values -- PCI) so we can
+        # diagnose what Cloudbeds actually objected to. Their public message
+        # is often just "An unexpected error occurred"; detail is in `data`
+        # or `errors` if present.
+        log.warning(
+            "Cloudbeds postCreditCard FAIL body=%s sent_keys=%s",
+            str(body)[:1000], sorted(form.keys()),
+        )
+        # 3DS challenge surfaces as a redirect URL in the response in some
+        # cases -- forward it so the caller can navigate the guest there.
+        data = body.get("data") or {}
+        return {
+            "success": False,
+            "error": body.get("message") or "Cloudbeds rejected the card.",
+            "requires_3ds": bool(data.get("redirectUrl")),
+            "redirect_url": data.get("redirectUrl"),
+        }
+    data = body.get("data") or {}
+    card_id = data.get("cardID") or data.get("cardId") or ""
+    log.info("post_credit_card: res=%s card_id=%s last4=%s",
+             reservation_id, card_id, data.get("cardNumber", "?"))
+    return {"success": True, "card_id": str(card_id)}
+
+
+async def post_reservation_document(
+    reservation_id: str,
+    pdf_bytes: bytes,
+    filename: str,
+) -> dict:
+    """Attach a PDF file to a Cloudbeds reservation via the
+    postReservationDocument endpoint (multipart upload).
+
+    Returns {"success": True, "doc_id": "..."} or
+    {"success": False, "error": "..."}. The doc_id is whatever Cloudbeds
+    returns (varies by API version) and is stored for future reference.
+    """
+    if not settings.cloudbeds_api_key:
+        return {"success": False, "error": "Cloudbeds API key not configured."}
+    if not pdf_bytes:
+        return {"success": False, "error": "Empty PDF payload."}
+    url = f"{CLOUDBEDS_BASE_URL}/postReservationDocument"
+    # propertyID + reservationID go in the form, the PDF goes as the 'file'
+    # multipart part. httpx assembles it correctly when we use files=.
+    data = {
+        "propertyID": settings.cloudbeds_property_id,
+        "reservationID": reservation_id,
+    }
+    files = {"file": (filename, pdf_bytes, "application/pdf")}
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, data=data, files=files, headers=_auth_headers())
+    except httpx.TimeoutException:
+        log.warning("Cloudbeds postReservationDocument timed out (res=%s)", reservation_id)
+        return {"success": False, "error": "Upload timed out."}
+    except httpx.HTTPError as e:
+        log.warning("Cloudbeds postReservationDocument HTTP error: %s", e)
+        return {"success": False, "error": str(e)}
+    if response.status_code != 200:
+        log.warning("Cloudbeds postReservationDocument HTTP %s: %s",
+                    response.status_code, response.text[:300])
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    body = response.json()
+    if not body.get("success", False):
+        log.warning("Cloudbeds postReservationDocument success=false: %s", str(body)[:500])
+        return {"success": False, "error": body.get("message") or "Cloudbeds rejected the upload."}
+    # Various API versions return different identifier shapes; we just
+    # forward whatever's in the response for later debugging.
+    doc_id = (body.get("data") or {}).get("id") or body.get("documentID") or ""
+    log.info("post_reservation_document: res=%s file=%s bytes=%d doc_id=%s",
+             reservation_id, filename, len(pdf_bytes), doc_id)
+    return {"success": True, "doc_id": str(doc_id)}
+
+
+async def post_void_item(reservation_id: str, sold_product_id: str) -> dict:
+    """Void a previously-posted item via Cloudbeds postVoidItem.
+
+    Returns {"success": True} or {"success": False, "error": "..."}.
+    Voiding a non-existent / already-voided ID returns success=false from
+    Cloudbeds; callers can usually treat that as best-effort cleanup and
+    continue (we surface the error string for inspection).
+    """
+    if not settings.cloudbeds_api_key:
+        return {"success": False, "error": "Cloudbeds API key not configured."}
+    if not sold_product_id:
+        return {"success": False, "error": "sold_product_id is required."}
+    form = {
+        "propertyID": settings.cloudbeds_property_id,
+        "reservationID": reservation_id,
+        "soldProductID": sold_product_id,
+    }
+    url = f"{CLOUDBEDS_BASE_URL}/postVoidItem"
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, data=form, headers=_auth_headers())
+    except httpx.TimeoutException:
+        log.warning("Cloudbeds postVoidItem timed out (res=%s sold=%s)", reservation_id, sold_product_id)
+        return {"success": False, "error": "Void timed out."}
+    except httpx.HTTPError as e:
+        log.warning("Cloudbeds postVoidItem HTTP error: %s", e)
+        return {"success": False, "error": str(e)}
+    if response.status_code != 200:
+        log.warning("Cloudbeds postVoidItem HTTP %s: %s", response.status_code, response.text[:300])
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    body = response.json()
+    if not body.get("success", False):
+        log.warning("Cloudbeds postVoidItem success=false (res=%s sold=%s): %s",
+                    reservation_id, sold_product_id, str(body)[:300])
+        return {"success": False, "error": body.get("message") or "Void rejected by Cloudbeds."}
+    log.info("post_void_item: res=%s sold=%s OK", reservation_id, sold_product_id)
+    return {"success": True}
 
 
 async def cancel_reservation(reservation_id: str, reason: str | None = None) -> dict:

@@ -13,7 +13,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.routes import admin, incoming_call, llm, vapi_tools
+from app.db.database import init_db
+from app.routes import admin, incoming_call, llm, portal, vapi_tools
+
+# Ensure SQLAlchemy sees all models before init_db's metadata.create_all runs.
+# Importing the module is enough — the class registers itself with Base.
+import app.models.portal_token  # noqa: F401
+import app.models.sms_consent  # noqa: F401
+import app.models.pet_declaration  # noqa: F401
+import app.models.signature_agreement  # noqa: F401
 
 logging.basicConfig(
     level=settings.log_level,
@@ -27,6 +35,7 @@ async def lifespan(app: FastAPI):
     """Startup/shutdown hooks."""
     log.info(f"Starting Lighthouse backend in {settings.app_env} mode")
     log.info(f"Database: {settings.database_url}")
+    await init_db()
     yield
     log.info("Shutting down Lighthouse backend")
 
@@ -82,3 +91,11 @@ async def root():
         "docs": "/docs",
         "health": "/health",
     }
+
+
+# Portal router registered LAST so its `/h{stem}` greedy route doesn't
+# shadow `/health` and any future literal routes. FastAPI matches in
+# registration order; the literal routes above win when the path matches.
+# Portal serves /portal/* (DCS-facing) and /c/*, /g/*, /h* (guest-facing)
+# under their own access controls.
+app.include_router(portal.router, tags=["portal"])

@@ -62,6 +62,45 @@ async def send_sms(to: str, body: str, *, from_: str | None = None) -> dict:
     return {"success": True, "sid": sid, "status": body_json.get("status")}
 
 
+async def get_message_status(message_sid: str) -> dict:
+    """Look up delivery status for a previously-sent message by SID.
+
+    Returns the relevant Twilio fields: status, error_code, error_message,
+    to, from, date_sent, date_updated. status is one of:
+      accepted, queued, sending, sent, receiving, received, delivered,
+      undelivered, failed, read, scheduled, canceled.
+    """
+    if not settings.twilio_account_sid or not settings.twilio_auth_token:
+        return {"success": False, "error": "Twilio credentials not configured."}
+
+    url = (f"https://api.twilio.com/2010-04-01/Accounts/"
+           f"{settings.twilio_account_sid}/Messages/{message_sid}.json")
+    auth = (settings.twilio_account_sid, settings.twilio_auth_token)
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, auth=auth)
+    except httpx.HTTPError as e:
+        return {"success": False, "error": str(e)}
+
+    if response.status_code == 404:
+        return {"success": False, "error": "SID not found on this account."}
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+
+    body = response.json()
+    return {
+        "success": True,
+        "sid": body.get("sid"),
+        "status": body.get("status"),
+        "error_code": body.get("error_code"),
+        "error_message": body.get("error_message"),
+        "to": body.get("to"),
+        "from": body.get("from"),
+        "date_sent": body.get("date_sent"),
+        "date_updated": body.get("date_updated"),
+    }
+
+
 async def send_sms_to_eric(message: str) -> dict:
     """Send a routine notification SMS to Eric's cell.
 
