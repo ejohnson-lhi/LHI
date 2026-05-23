@@ -20,6 +20,8 @@ dependencies = [
     "phonenumbers>=9.0",
     "reportlab>=4.0",
     "stripe>=15.0",
+    "playwright>=1.40",
+    "pyotp>=2.9",
 ]
 
 [project.optional-dependencies]

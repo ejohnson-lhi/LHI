@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.db.database import init_db
-from app.routes import admin, incoming_call, llm, portal, vapi_tools
+from app.routes import admin, dcs_relay, incoming_call, llm, portal, vapi_tools
 
 # Ensure SQLAlchemy sees all models before init_db's metadata.create_all runs.
 # Importing the module is enough — the class registers itself with Base.
@@ -22,6 +22,7 @@ import app.models.portal_token  # noqa: F401
 import app.models.sms_consent  # noqa: F401
 import app.models.pet_declaration  # noqa: F401
 import app.models.signature_agreement  # noqa: F401
+import app.models.pay_by_link  # noqa: F401
 
 logging.basicConfig(
     level=settings.log_level,
@@ -54,6 +55,13 @@ app.include_router(vapi_tools.router, prefix="/tools", tags=["vapi-tools"])
 app.include_router(incoming_call.router, prefix="/twilio", tags=["twilio"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(llm.router, prefix="/llm", tags=["custom-llm"])
+
+# DCS tunnel relay — stable URL on the droplet that 302-redirects into the
+# hotel's current ngrok tunnel. Registered before portal so its literal
+# /dcs and /portal/dcs-tunnel routes aren't shadowed; the catch-all
+# /dcs/{path} is namespaced under /dcs/ so it can't collide with portal's
+# /c/, /g/, /h* routes.
+app.include_router(dcs_relay.router, tags=["dcs-relay"])
 
 
 @app.exception_handler(RequestValidationError)

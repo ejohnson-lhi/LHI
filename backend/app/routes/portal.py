@@ -688,6 +688,24 @@ form.contact.sign .sig-hint { font-size: 12px; color: #94a3b8;
     border-radius: 6px; background: #fff; }
 #stripe-card-error { color: #b91c1c; font-size: 13px; min-height: 18px;
     margin-top: 6px; }
+.add-card-btn { display: inline-block; padding: 12px 22px;
+    background: #2563eb; color: white; border-radius: 6px;
+    font-size: 15px; font-weight: 600; text-decoration: none;
+    margin-top: 6px; cursor: pointer; }
+.add-card-btn:hover { background: #1d4ed8; }
+.card-link-frame { width: 100%; height: 700px; border: 1px solid #cbd5e1;
+    border-radius: 8px; margin-top: 16px; background: #fff; }
+.card-link-fallback { background: #fef3c7; border-left: 3px solid #f59e0b;
+    border-radius: 6px; padding: 12px 14px; margin-top: 16px;
+    color: #78350f; font-size: 14px; }
+.card-link-loading { padding: 40px 20px; text-align: center; color: #64748b; }
+.card-link-loading .spinner {
+    display: inline-block; width: 32px; height: 32px;
+    border: 3px solid #e2e8f0; border-top-color: #2563eb;
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin-bottom: 10px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .footer { text-align: center; color: #94a3b8; font-size: 12px; margin: 20px 0 8px; }
 .footer a { color: #64748b; }
 """
@@ -1371,75 +1389,33 @@ def _render_card_block(
             'your scheduled arrival.</p>'
         )
 
-    # Contextual error (rendered inline above the form) so the guest sees
-    # WHY their last attempt failed without scrolling back up to the banner.
-    # NEVER includes card data.
+    # Inline error message (passed when something went wrong on the last attempt).
     error_html = ""
     if error_message:
         error_html = (
             f'<div class="gated-prompt" style="margin:6px 0 14px;">'
-            f'<strong>That card didn\'t go through.</strong> '
-            f'Our payment processor said: <em>{_esc(error_message)}</em>. '
-            f'Please double-check the card number, expiration date, and CVV, '
-            f'then try again. If it keeps failing, call the front desk at '
-            f'<a href="tel:{settings.hotel_phone_tel}">{settings.hotel_phone_display}</a> '
-            f'and we\'ll sort it out.'
+            f'<strong>That didn\'t go through.</strong> {_esc(error_message)}. '
+            f'If it keeps failing, call the front desk at '
+            f'<a href="tel:{settings.hotel_phone_tel}">{settings.hotel_phone_display}</a>.'
             f'</div>'
         )
 
-    # Raw-card form: Cloudbeds tokenizes server-side. The form posts over
-    # HTTPS to our backend, which forwards immediately to Cloudbeds'
-    # postCreditCard and scrubs the local variables. autocomplete attributes
-    # let the OS / password manager fill in the standard way. We don't
-    # store PAN/CVV anywhere -- not in logs, not in DB, not in error pages.
-    # SAFE fields (name + zip) get pre-filled on retry; sensitive fields
-    # (PAN, exp, CVV) are always blank.
-    raw_form = f"""
-<form class="contact card" method="post" action="{action_url}" novalidate autocomplete="on">
-    <label for="card_holder_name">Cardholder name</label>
-    <input type="text" id="card_holder_name" name="card_holder_name"
-           value="{_esc(name_value)}" autocomplete="cc-name" />
-
-    <label for="card_number">Card number</label>
-    <input type="text" id="card_number" name="card_number"
-           autocomplete="cc-number" inputmode="numeric"
-           pattern="[\\d\\s\\-]{{13,23}}"
-           title="13-19 digit card number" required />
-
-    <div class="row">
-        <div>
-            <label for="exp_month">Exp month</label>
-            <input type="text" id="exp_month" name="exp_month"
-                   autocomplete="cc-exp-month" inputmode="numeric"
-                   maxlength="2" pattern="[01]?\\d" required />
-        </div>
-        <div>
-            <label for="exp_year">Exp year</label>
-            <input type="text" id="exp_year" name="exp_year"
-                   autocomplete="cc-exp-year" inputmode="numeric"
-                   maxlength="4" pattern="\\d{{2,4}}" required />
-        </div>
-        <div>
-            <label for="card_cvv">CVV</label>
-            <input type="text" id="card_cvv" name="card_cvv"
-                   autocomplete="cc-csc" inputmode="numeric"
-                   maxlength="4" pattern="\\d{{3,4}}" required />
-        </div>
-    </div>
-
-    <label for="card_address_zip">Billing ZIP (optional)</label>
-    <input type="text" id="card_address_zip" name="card_address_zip"
-           value="{_esc(zip_value)}"
-           autocomplete="postal-code" maxlength="10" />
-
-    <button type="submit">Add card</button>
-</form>
+    # Add-card UX: we open a Cloudbeds-hosted Pay-by-Link page (generated via
+    # backend automation against the Cloudbeds dashboard). The guest enters
+    # their card on Cloudbeds' page; we don't touch raw PAN/CVV here. The
+    # button below kicks off the generation and either embeds the resulting
+    # link as an iframe (if Cloudbeds allows framing) OR opens it in a new
+    # tab (fallback). Generation takes 10-30s; the receiving page shows a
+    # spinner while it runs.
+    card_link_url = action_url.replace("/cards", "/card-link")
+    add_card_block = f"""
+<a href="{card_link_url}" class="add-card-btn">Add a card</a>
 <p class="card-info" style="margin-top:10px; font-size:12px;">
-    Card details are sent securely to our reservation system and tokenized
-    immediately. We never store your card number.
+    You'll be taken to our reservation system's secure payment page to enter
+    your card. We never handle the card number ourselves.
 </p>
 """
-    return card_list_html + intro + error_html + raw_form
+    return card_list_html + intro + error_html + add_card_block
 
 
 async def _latest_signature_agreement(db: AsyncSession, reservation_id: str):
@@ -2893,3 +2869,164 @@ async def post_card_by_prefix(
         ),
         status_code=303,
     )
+
+
+# ---- Cloudbeds Pay-by-Link (UI-automation generated) -----------------------
+
+async def _get_or_generate_pay_by_link(
+    reservation_id: str, request: Request, db: AsyncSession,
+) -> dict:
+    """Return a usable Pay-by-Link URL for this reservation. Uses the cached
+    one when it exists + hasn't expired; otherwise drives the Cloudbeds
+    dashboard via Playwright to mint a new one. Always writes a row to
+    pay_by_link (success or failure) so we have audit history."""
+    from app.models.pay_by_link import PayByLink
+    from app.tools.cloudbeds_browser import generate_pay_by_link
+    from sqlalchemy import select
+
+    # Cached link still good?
+    stmt = (
+        select(PayByLink)
+        .where(PayByLink.reservation_id == reservation_id)
+        .where(PayByLink.url.is_not(None))
+        .order_by(PayByLink.id.desc())
+        .limit(1)
+    )
+    cached = (await db.execute(stmt)).scalar_one_or_none()
+    if cached and cached.expires_at and cached.expires_at > datetime.utcnow():
+        log.info("portal: pay-by-link cache HIT for res=%s (expires %s)",
+                 reservation_id, cached.expires_at.isoformat())
+        return {"success": True, "url": cached.url, "expires_at": cached.expires_at, "cached": True}
+
+    log.info("portal: pay-by-link cache MISS for res=%s -- generating", reservation_id)
+    result = await generate_pay_by_link(
+        reservation_id, client_ip=_client_ip(request),
+    )
+    # Persist outcome -- on failure too, so audit is complete.
+    db.add(PayByLink(
+        reservation_id=reservation_id,
+        url=result.get("url") if result.get("success") else None,
+        expires_at=result.get("expires_at"),
+        generation_method="ui_automation",
+        error_message=None if result.get("success") else (result.get("error") or "Unknown failure"),
+        client_ip=_client_ip(request),
+    ))
+    await db.commit()
+    return result
+
+
+def _render_card_link_page(prefix_or_token: str, result: dict, return_path: str) -> HTMLResponse:
+    """Render the page that surrounds the Pay-by-Link iframe (or shows the
+    failure message). Same shell as the rest of the portal but stripped
+    down -- the focus is the iframe + a way back."""
+    if not result.get("success"):
+        err = result.get("error") or "We couldn't generate a card-entry link right now."
+        body = f"""
+<h1>Add a card</h1>
+<div class="gated-prompt">
+    <strong>Something went wrong on our end.</strong> {_esc(err)}
+    <p style="margin-top:10px;">Please call the front desk at
+    <a href="tel:{settings.hotel_phone_tel}">{settings.hotel_phone_display}</a>
+    and we'll add the card for you.</p>
+</div>
+<p><a href="{return_path}">&larr; Back to your stay</a></p>
+"""
+        return _portal_page("Add a card", body)
+
+    url = result["url"]
+    cached = result.get("cached")
+    body = f"""
+<h1>Add a card</h1>
+<p>Enter your card on the secure page below. The page is hosted by our
+   reservation system &mdash; your card details go directly to them; we
+   never see your card number.</p>
+{('<p class="card-info" style="margin-top:0;">Reusing a link generated earlier today.</p>' if cached else '')}
+<iframe class="card-link-frame" src="{_esc(url)}" allow="payment"></iframe>
+<div class="card-link-fallback">
+    If the form above doesn't load, your browser may be blocking embedded
+    pages from our reservation system.
+    <a href="{_esc(url)}" target="_blank" rel="noopener">Open the card-entry page in a new tab</a>.
+</div>
+<p style="margin-top:16px;"><a href="{return_path}">&larr; Back to your stay</a></p>
+"""
+    return _portal_page("Add a card", body)
+
+
+def _render_loading_page(target_action_url: str, return_path: str) -> HTMLResponse:
+    """Brief 'Generating your link...' splash that auto-POSTs to the action
+    URL. We use a separate POST endpoint that actually does the Playwright
+    work, so the GET request to this page returns instantly and the
+    browser has a chance to render the spinner before the slow op fires."""
+    body = f"""
+<h1>Add a card</h1>
+<div class="card-link-loading">
+    <div class="spinner"></div>
+    <p>Generating your secure card-entry link...</p>
+    <p style="font-size:13px;">This can take up to 30 seconds.</p>
+</div>
+<form id="auto-form" method="post" action="{target_action_url}"></form>
+<script>document.getElementById('auto-form').submit();</script>
+<noscript>
+    <p>Your browser has JavaScript disabled.
+    <a href="{return_path}">Go back</a> and please call the front desk to add a card.</p>
+</noscript>
+"""
+    return _portal_page("Add a card", body)
+
+
+@router.get("/g/{token}/card-link")
+async def get_card_link_by_token(
+    token: str, request: Request, db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(PortalToken, token)
+    if row is None or row.purpose != "guest_portal":
+        return _portal_page("Not found", _NOT_FOUND_PAGE)
+    if row.expires_at < datetime.utcnow():
+        return _portal_page("Expired", _EXPIRED_PAGE)
+    return _render_loading_page(
+        target_action_url=f"/g/{token}/card-link",
+        return_path=f"/g/{token}",
+    )
+
+
+@router.post("/g/{token}/card-link")
+async def post_card_link_by_token(
+    token: str, request: Request, db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(PortalToken, token)
+    if row is None or row.purpose != "guest_portal":
+        return _portal_page("Not found", _NOT_FOUND_PAGE)
+    if row.expires_at < datetime.utcnow():
+        return _portal_page("Expired", _EXPIRED_PAGE)
+    result = await _get_or_generate_pay_by_link(row.reservation_id, request, db)
+    return _render_card_link_page(token, result, return_path=f"/g/{token}")
+
+
+@router.get("/h{stem}/card-link")
+async def get_card_link_by_prefix(
+    stem: str, request: Request, db: AsyncSession = Depends(get_db),
+):
+    prefix = _trim_to_first4_digits(stem)
+    if prefix is None:
+        return _portal_page("Not found", _NOT_FOUND_PAGE)
+    verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
+    if not verified_res_id or not verified_res_id.startswith(prefix):
+        return RedirectResponse(url=f"/h{prefix}", status_code=303)
+    return _render_loading_page(
+        target_action_url=f"/h{prefix}/card-link",
+        return_path=f"/h{prefix}",
+    )
+
+
+@router.post("/h{stem}/card-link")
+async def post_card_link_by_prefix(
+    stem: str, request: Request, db: AsyncSession = Depends(get_db),
+):
+    prefix = _trim_to_first4_digits(stem)
+    if prefix is None:
+        return _portal_page("Not found", _NOT_FOUND_PAGE)
+    verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
+    if not verified_res_id or not verified_res_id.startswith(prefix):
+        return RedirectResponse(url=f"/h{prefix}", status_code=303)
+    result = await _get_or_generate_pay_by_link(verified_res_id, request, db)
+    return _render_card_link_page(prefix, result, return_path=f"/h{prefix}")

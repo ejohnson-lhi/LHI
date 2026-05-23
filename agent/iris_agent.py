@@ -329,7 +329,13 @@ def _greeting_chunks_for(persona: str) -> list[str]:
 # that no LLM output will ever match, then played via session.say()
 # which finds the cache hit and bypasses Kokoro entirely.
 RINGBACK_CACHE_KEY = "__ringback_tone__"
-RINGBACK_DURATION_S = 1.5
+# Was 1.5s; shortened to 0.8s on 5/17 so the residual ringback playback
+# after a transfer connects is bounded to ~0.8s in the worst case where
+# SpeechHandle.interrupt() doesn't stop in-flight audio with
+# allow_interruptions=False. Combined with the 3.2s pause below, the
+# total ring cycle is 4s — close enough to the standard US ringback
+# cadence (2s on / 4s off) that callers still recognize it as ringing.
+RINGBACK_DURATION_S = 0.8
 
 
 def _generate_ringback_pcm(duration_s: float = RINGBACK_DURATION_S) -> bytes:
@@ -483,26 +489,17 @@ class IrisAgent(Agent):
             # takes 11-16 seconds end-to-end (mostly waiting for the human
             # to walk over and pick up port 2). With Iris muted during that
             # window, callers heard total silence and concluded the line
-            # was dead — most hung up within 13 seconds, leaving the front
-            # desk picking up to dead air. Sarah Hibbs (real guest) called
-            # 3 times trying to get her room key; +17074794717 tried 6+
-            # times in 5 hours; data showed the pattern unambiguously
-            # (caller-disconnect at t=13.7s, transfer-completion at t=15.95s).
+            # was dead — most hung up within 13 seconds. Fix is the
+            # verbal handoff below + the ringback loop inside transfer_to
+            # which plays during the SIP ring wait.
             #
-            # Fix: replace dead air with audible cues BEFORE muting:
-            #   (1) Synthetic ringback tone — sounds like a normal phone
-            #       ringing, signals "your call is being routed."
-            #   (2) Verbal handoff — explicit "Connecting you to the front
-            #       desk now." so caller knows what's happening.
-            # Both are cached at prewarm so they play instantly without
-            # synthesis delay. After speaking, we mute as before; future
-            # STT-triggered LLM responses still get suppressed by the
-            # on_user_turn_completed StopResponse override.
-            try:
-                await self.session.say(RINGBACK_CACHE_KEY, allow_interruptions=False)
-                log.info("Silent mode: played synthetic ringback")
-            except Exception:
-                log.exception("Could not play ringback (continuing anyway)")
+            # Pre-ringback removed 5/17: the synthetic tone before the
+            # verbal handoff was burbling on real PSTN calls because it
+            # hit the still-stabilizing SIP audio bridge ~0.3s after
+            # answer. The handoff phrase alone is the meaningful cue;
+            # the looping ringback inside transfer_to then takes over
+            # once the bridge has settled. (RINGBACK_CACHE_KEY is still
+            # generated/cached for the loop's use.)
             HANDOFF_PHRASE = "Connecting you to the front desk now."
             try:
                 await self.session.say(HANDOFF_PHRASE, allow_interruptions=False)
@@ -937,30 +934,55 @@ class IrisAgent(Agent):
             # add_to_chat_ctx=False keeps the "__ringback_tone__" sentinel
             # out of the LLM's chat history. Without it, every ring would
             # show up as an assistant message and could confuse subsequent
-            # LLM turns (e.g., the no_answer fallback turn). Falls back to
-            # the basic call signature if the installed livekit-agents
-            # version predates that kwarg.
+            # LLM turns. TypeError fallback handles livekit-agents versions
+            # that predate the kwarg.
+            #
+            # SpeechHandle tracking + interrupt() is the fix for the
+            # "dial tone continued for a moment after I answered" issue:
+            # without it, the in-flight session.say() audio plays through
+            # to completion (up to RINGBACK_DURATION_S seconds) even after
+            # the destination picks up, because allow_interruptions=False
+            # blocks user-driven interruption AND awaiting an async-cancel
+            # doesn't stop already-queued audio. handle.interrupt() does.
+            handle = None
             try:
                 while True:
                     try:
                         try:
-                            await self.session.say(
+                            handle = self.session.say(
                                 RINGBACK_CACHE_KEY,
                                 allow_interruptions=False,
                                 add_to_chat_ctx=False,
                             )
                         except TypeError:
-                            await self.session.say(
+                            handle = self.session.say(
                                 RINGBACK_CACHE_KEY,
                                 allow_interruptions=False,
                             )
                     except Exception:
-                        log.exception(
-                            "Ringback say() failed; stopping loop"
-                        )
+                        log.exception("Ringback say() failed; stopping loop")
                         return
-                    await asyncio.sleep(3.5)
+                    try:
+                        if hasattr(handle, "wait_for_playout"):
+                            await handle.wait_for_playout()
+                        else:
+                            await handle
+                    except asyncio.CancelledError:
+                        if hasattr(handle, "interrupt"):
+                            try:
+                                handle.interrupt()
+                            except Exception:
+                                log.exception("Could not interrupt in-flight ringback")
+                        raise
+                    handle = None
+                    # 3.2s gap + 0.8s tone above = 4s ring cycle, close to
+                    # the standard US 2s-on/4s-off cadence.
+                    await asyncio.sleep(3.2)
             except asyncio.CancelledError:
+                # If we were cancelled while sleeping (between rings),
+                # there's no in-flight audio to interrupt. If cancelled
+                # during the await above, the inner handler already issued
+                # the interrupt.
                 raise
 
         ringback_task: asyncio.Task | None = None

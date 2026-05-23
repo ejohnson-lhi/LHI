@@ -34,6 +34,35 @@ class Settings(BaseSettings):
     # since 2024 -- $20/stay per dog, multiplied by itemQuantity.
     cloudbeds_dog_fee_item_id: str = "401630"
 
+    # --- Cloudbeds dashboard automation (Playwright) ---
+    # Used to generate Pay-by-Link URLs for guests by driving the Cloudbeds
+    # admin UI (the API path is gated behind Marketplace App approval that we
+    # don't have). All sensitive; never commit to source. Set in .env only.
+    cloudbeds_login_url: str = "https://signin.cloudbeds.com"
+    cloudbeds_admin_email: str = ""
+    cloudbeds_admin_password: str = ""
+    # Base32-encoded TOTP secret for the bot's 2FA. Get this by adding
+    # "Google Authenticator" as a factor in your Okta account: when the QR
+    # code shows, click "Can't scan?" / "Manual entry" to reveal the
+    # text-form secret. Stash it here. NEVER commit. Treat like a password.
+    cloudbeds_totp_secret: str = ""
+    # Anti-bot pacing. Real humans don't fill 6-digit codes in 0ms. Okta
+    # (and Cloudbeds' Stripe layer below) will quietly reject too-fast
+    # input as scripted. Defaults match an average human's keystroke
+    # cadence; bump higher if you still see rejections.
+    cloudbeds_typing_delay_ms: int = 110   # delay between each typed char
+    cloudbeds_action_pause_ms: int = 800   # pause between major actions
+    cloudbeds_browser_slow_mo_ms: int = 60  # Playwright per-action slowdown
+    # Set False during selector-discovery / debugging so we can SEE the browser.
+    # Should be True in production.
+    cloudbeds_browser_headless: bool = True
+    # Amount (USD cents) to charge on the Pay-by-Link. v1 default: $1 auth-only
+    # (the smallest "feels real" hold). Cloudbeds may force a specific minimum.
+    cloudbeds_paylink_amount_cents: int = 100
+    cloudbeds_paylink_description: str = "Card on file for incidentals (Lighthouse Inn)"
+    # Where to SMS-alert when the automation fails (Eric by default).
+    cloudbeds_automation_alert_phone: str = ""  # falls back to eric_cell_number
+
     # --- Anthropic ---
     anthropic_api_key: str = ""
 
@@ -69,6 +98,15 @@ class Settings(BaseSettings):
     # never texted. Belt-and-suspenders test safety: even if DCS sends real
     # reservations, no guest is bothered. Set PORTAL_TEST_MODE=true in .env.
     portal_test_mode: bool = False
+
+    # --- DCS relay (hotel-side admin UI reachable through this droplet) ---
+    # When set, /dcs/{path} HTTP-proxies requests to this URL over the
+    # WireGuard tunnel — preferred mode going forward. When BLANK, the
+    # relay falls back to 302-redirecting users to the ngrok URL most
+    # recently published via /portal/dcs-tunnel (legacy mode, kept as a
+    # months-long rollback path while we shake out WireGuard).
+    # Typical value once WG is up: "http://10.42.0.2:8090"
+    dcs_wg_target_url: str = ""
 
     # --- Hotel identity (pinned to the top of every guest portal page) ---
     hotel_name: str = "Lighthouse Inn"
