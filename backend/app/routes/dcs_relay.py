@@ -261,6 +261,12 @@ async def _proxy_via_wireguard(request: Request, path: str) -> Response:
     if original_host:
         forwarded["X-Forwarded-Host"] = original_host
     forwarded["X-Forwarded-Proto"] = request.url.scheme
+    # Tell DCS it's mounted under /dcs/ from the user's perspective. DCS's
+    # custom middleware in Program.cs reads this and sets Request.PathBase so
+    # asp-page TagHelpers, ~/ in hrefs, and LinkGenerator all prepend /dcs/
+    # to generated URLs. Without this, Razor emits root-anchored URLs that
+    # bypass the relay (e.g. /Reservations -> droplet root -> 404).
+    forwarded["X-Forwarded-Prefix"] = "/dcs"
 
     client = _get_proxy_client()
     upstream_req = client.build_request(
