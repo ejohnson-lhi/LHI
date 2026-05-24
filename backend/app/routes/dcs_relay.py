@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from starlette.datastructures import MutableHeaders
 
 from app.config import settings
 from app.routes.portal import require_portal_auth  # reuse the same guard
@@ -290,14 +291,19 @@ async def _proxy_via_wireguard(request: Request, path: str) -> Response:
         log.exception("DCS proxy: upstream error to %s", target)
         return Response(content=f"upstream error: {e}", status_code=502, media_type="text/plain")
 
-    # Strip hop-by-hop from upstream response. We do NOT strip
-    # Content-Length: httpx's aiter_raw() yields the raw transport
-    # bytes so any compression / chunking from upstream passes through
-    # unchanged, and the client/uvicorn pair sorts out framing.
-    response_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP_HEADERS
-    }
+    # Build response headers as MutableHeaders so multi-value headers are
+    # preserved. A dict comprehension here collapses duplicate keys, which is
+    # catastrophic for Set-Cookie: Razor Pages routinely emits 2-3 Set-Cookie
+    # headers in one response (antiforgery + tempdata + session). If we lose
+    # any of them the browser ends up without the antiforgery cookie, and the
+    # next POST fails antiforgery validation with 400. Iterate raw byte pairs
+    # so case + duplicates are both preserved end-to-end.
+    response_headers = MutableHeaders()
+    for name_bytes, value_bytes in upstream.headers.raw:
+        name = name_bytes.decode("latin-1")
+        if name.lower() in _HOP_BY_HOP_HEADERS:
+            continue
+        response_headers.append(name, value_bytes.decode("latin-1"))
 
     return StreamingResponse(
         upstream.aiter_raw(),
