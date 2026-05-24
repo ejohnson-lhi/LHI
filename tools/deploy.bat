@@ -91,11 +91,17 @@ if errorlevel 1 (
 )
 echo.
 
-echo === Pulling on droplet and restarting agent service ===
-REM On the droplet: pull, sync the systemd unit file (idempotent — only
-REM reloads if cp actually changed anything since cp -u checks mtime),
-REM then restart the agent service.
-"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo systemctl daemon-reload && sudo systemctl restart iris-agent.service && echo --- service status --- && sudo systemctl status iris-agent.service --no-pager -l | head -20"
+echo === Pulling on droplet, syncing deps, restarting both services ===
+REM On the droplet: pull, run pip install (idempotent; picks up any new
+REM dependency from backend/pyproject.toml so we don't crash-loop the
+REM service on a missing module — we've hit this with phonenumbers and
+REM python-multipart), sync the systemd unit file (cp -u skips if no
+REM change), then restart BOTH services. iris-agent is the LiveKit
+REM worker; iris-backend is the uvicorn FastAPI that serves the guest
+REM portal + the /dcs/* relay. They have separate codepaths but both
+REM live in this repo, so a deploy that doesn't restart both leaves
+REM one of them running stale code.
+"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo systemctl daemon-reload && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12"
 
 REM Clear the message file so a stale message doesn't get reused on the next run.
 if exist "%MSG_FILE%" del "%MSG_FILE%"
