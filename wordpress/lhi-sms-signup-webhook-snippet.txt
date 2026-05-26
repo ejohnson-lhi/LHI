@@ -1,0 +1,107 @@
+// ─────────────────────────────────────────────────────────────────────
+// LIGHTHOUSE SMS SIGNUP WEBHOOK BRIDGE (FluentSnippets / Code Snippets)
+//
+// Forwards Fluent Forms /sms-signup/ submissions (form ID 3) to the
+// iris-backend droplet so they land in the sms_consent audit log and
+// trigger a one-time confirmation SMS.
+//
+// Paste this entire block into the snippet body. No <?php tag, no plugin
+// header -- the snippet plugin supplies the PHP context. Then replace
+// 'paste-the-secret-here' with the same secret you put on the droplet's
+// .env as SMS_SIGNUP_SHARED_SECRET, and Save + Activate.
+// ─────────────────────────────────────────────────────────────────────
+
+// Shared secret -- MUST match the droplet's SMS_SIGNUP_SHARED_SECRET.
+if (!defined('LHI_SMS_SIGNUP_SECRET')) {
+    define('LHI_SMS_SIGNUP_SECRET', 'paste-the-secret-here');
+}
+
+// Fluent Forms form ID -- matches [fluentform id="3"].
+if (!defined('LHI_SMS_FORM_ID')) {
+    define('LHI_SMS_FORM_ID', 3);
+}
+
+// Droplet endpoint (FastAPI) that accepts the forwarded payload.
+if (!defined('LHI_SMS_WEBHOOK_URL')) {
+    define('LHI_SMS_WEBHOOK_URL', 'https://iris.lighthouseinn-florence.com/sms-signup/webhook');
+}
+
+// Verbatim consent disclosure the guest agreed to. Bump the version
+// below whenever you change this string.
+if (!defined('LHI_SMS_CONSENT_TEXT')) {
+    define('LHI_SMS_CONSENT_TEXT', 'I agree to receive transactional SMS from The Lighthouse Inn related to my reservation - door code on arrival, checkout reminder, optional payment link, optional cancellation confirmation. Message frequency: 1-5 per stay. Msg & data rates may apply. Reply STOP to opt out, HELP for help. See our Privacy Policy and Terms.');
+}
+
+if (!defined('LHI_SMS_CONSENT_VERSION')) {
+    define('LHI_SMS_CONSENT_VERSION', 'v1_2026-05-25');
+}
+
+// Guard the function definition so a re-evaluating snippet plugin
+// doesn't fatal-error on "Cannot redeclare function" on every page load.
+if (!function_exists('lhi_sms_forward_submission')) {
+    function lhi_sms_forward_submission($entry_id, $form_data, $form) {
+        $form_id = is_object($form) ? (int) $form->id : (int) $form;
+        if ($form_id !== LHI_SMS_FORM_ID) {
+            return;
+        }
+        if (!LHI_SMS_SIGNUP_SECRET || LHI_SMS_SIGNUP_SECRET === 'paste-the-secret-here') {
+            error_log('[lhi-sms] Skip entry #' . $entry_id . ': LHI_SMS_SIGNUP_SECRET is not set');
+            return;
+        }
+
+        $name = isset($form_data['name']) ? trim((string) $form_data['name']) : '';
+        $reservation_number = isset($form_data['reservation_number']) ? trim((string) $form_data['reservation_number']) : '';
+        $mobile = isset($form_data['mobile']) ? trim((string) $form_data['mobile']) : '';
+        $consent = $form_data['consent'] ?? '';
+        if (is_array($consent)) {
+            $consent = implode(', ', $consent);
+        }
+
+        // Real client IP behind GoDaddy's edge sits in X-Forwarded-For.
+        $ip = '';
+        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+            $parts = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+            $ip = trim($parts[0]);
+        } elseif (!empty($_SERVER['REMOTE_ADDR'])) {
+            $ip = $_SERVER['REMOTE_ADDR'];
+        }
+        $ua = isset($_SERVER['HTTP_USER_AGENT']) ? substr((string) $_SERVER['HTTP_USER_AGENT'], 0, 500) : '';
+
+        $payload = array(
+            'name' => $name,
+            'reservation_number' => $reservation_number,
+            'mobile' => $mobile,
+            'consent' => $consent,
+            'consent_text' => LHI_SMS_CONSENT_TEXT,
+            'consent_text_version' => LHI_SMS_CONSENT_VERSION,
+            'submitter_ip' => $ip,
+            'user_agent' => $ua,
+        );
+
+        $response = wp_remote_post(LHI_SMS_WEBHOOK_URL, array(
+            'timeout' => 15,
+            'headers' => array(
+                'Content-Type'    => 'application/json',
+                'X-Signup-Secret' => LHI_SMS_SIGNUP_SECRET,
+            ),
+            'body' => wp_json_encode($payload),
+        ));
+
+        if (is_wp_error($response)) {
+            error_log('[lhi-sms] Forward failed for entry #' . $entry_id . ': ' . $response->get_error_message());
+            return;
+        }
+        $code = (int) wp_remote_retrieve_response_code($response);
+        $body = (string) wp_remote_retrieve_body($response);
+        if ($code >= 400) {
+            error_log('[lhi-sms] Droplet returned HTTP ' . $code . ' for entry #' . $entry_id . ': ' . substr($body, 0, 500));
+        } else {
+            error_log('[lhi-sms] Forwarded entry #' . $entry_id . ' OK: ' . substr($body, 0, 200));
+        }
+    }
+}
+
+// Named-function callbacks are auto-deduped by WordPress, so registering
+// on both hook spellings each request is safe.
+add_action('fluentform/submission_inserted', 'lhi_sms_forward_submission', 10, 3);
+add_action('fluentform_submission_inserted', 'lhi_sms_forward_submission', 10, 3);

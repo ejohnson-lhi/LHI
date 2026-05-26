@@ -81,7 +81,11 @@ class SignupWebhook(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=200)
-    reservation_number: str = Field(min_length=1, max_length=64)
+    # Reservation number is OPTIONAL -- some guests sign up before they have
+    # their confirmation # handy, or via the front-desk flow where no number
+    # exists yet. Empty string is recorded as-is; staff can match the
+    # consent row to a booking later by phone or name.
+    reservation_number: str = Field(default="", max_length=64)
     mobile: str = Field(min_length=7, max_length=32)
 
     # Fluent Forms can send a checkbox value in several shapes (bool,
