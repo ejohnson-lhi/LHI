@@ -22,26 +22,29 @@ inspect the consent text, and (in some reviews) re-load it to confirm
 the checkbox is required and unchecked by default. Keep the form +
 this endpoint in sync.
 
-TODO (follow-up tickets, not blocking Twilio submission):
-  - Wire the inbound STOP/HELP handler into twilio/inbound so reply
-    STOP flips the action to opt_out without manual intervention.
-  - Optionally validate `reservation_number` against Cloudbeds at
-    submit time (warn-but-still-accept on miss so we never lose a
-    consent because of a typo).
+This module also hosts /sms-signup/twilio-inbound -- the webhook Twilio
+calls when a guest replies STOP / START / HELP / etc. to one of our
+outbound texts. We mirror the keyword state into sms_consent so the
+audit log stays consistent with Twilio's internal opt-out list, then
+return empty TwiML (Twilio's campaign-level keyword config handles the
+actual auto-reply text; replying again here would double-send).
 """
+import base64
+import hashlib
 import hmac
 import logging
 from datetime import datetime, timedelta
 from typing import Any
 
 import phonenumbers
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.database import get_db
+from app.db.database import AsyncSessionLocal, get_db
 from app.models.sms_consent import SmsConsent
 from app.tools.twilio_sms import send_sms
 
@@ -65,6 +68,20 @@ _PER_PHONE_MAX_PER_DAY = 3   # opt_in rows / 24h per phone_e164
 _PER_IP_MAX_PER_HOUR = 5     # opt_in rows / 1h per submitter IP
 
 _SOURCE = "web_form_signup"
+
+# CTIA-standard keyword sets matched (case-insensitive) against the first
+# word of an inbound SMS body. The campaign UI lists the same sets in
+# Twilio so their carrier-level handlers fire too -- ours just mirror the
+# state into our audit log.
+_STOP_KEYWORDS = {"STOP", "UNSUBSCRIBE", "QUIT", "CANCEL", "END", "OPTOUT", "REVOKE", "STOPALL"}
+_START_KEYWORDS = {"START", "UNSTOP", "YES", "SUBSCRIBE"}
+_HELP_KEYWORDS = {"HELP", "INFO"}
+
+# Empty TwiML response. We send this on every inbound webhook because the
+# Twilio Messaging Service's own keyword config already issues the
+# carrier-required reply (STOP confirmation, HELP text, START
+# acknowledgement). Adding our own <Message> on top would double-send.
+_EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -245,6 +262,7 @@ async def signup_health():
 async def signup_webhook(
     payload: SignupWebhook,
     request: Request,
+    background_tasks: BackgroundTasks,
     x_signup_secret: str | None = Header(default=None, alias="X-Signup-Secret"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -357,6 +375,18 @@ async def signup_webhook(
             sms_result.get("error"),
         )
 
+    # ── 9. Background-validate the reservation number against Cloudbeds.
+    # Warn-but-accept policy: we never reject a consent because the rez #
+    # didn't match. The result lands on the same row's reservation_match
+    # column so staff can spot typos / pre-booking signups in a periodic
+    # report. Skip entirely when no number was provided.
+    if payload.reservation_number:
+        background_tasks.add_task(
+            _validate_reservation_in_background,
+            row.id,
+            payload.reservation_number,
+        )
+
     return {
         "success": True,
         "status": "opted_in",
@@ -364,3 +394,215 @@ async def signup_webhook(
         "confirmation_sms_sid": row.confirmation_sms_sid,
         "confirmation_error": None if sms_result.get("success") else sms_result.get("error"),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Background tasks
+# ──────────────────────────────────────────────────────────────────────────
+
+
+async def _validate_reservation_in_background(
+    consent_id: int, reservation_number: str
+) -> None:
+    """Look up the reservation in Cloudbeds and stamp the result on the
+    sms_consent row. Runs after signup_webhook has already returned 200
+    to the WP snippet, so it adds zero latency to the user-visible flow.
+
+    Never raises -- Cloudbeds outages must not strand consent records.
+    """
+    # Imported lazily so a missing/broken cloudbeds module can't take down
+    # the signup webhook's import chain at startup.
+    from app.tools.cloudbeds import get_reservation_by_id
+
+    try:
+        result = await get_reservation_by_id(reservation_number)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "SMS signup bg-validate: Cloudbeds lookup crashed id=%s res=%s err=%s",
+            consent_id, reservation_number, e,
+        )
+        return
+
+    matched = result is not None
+
+    async with AsyncSessionLocal() as db:
+        row = await db.get(SmsConsent, consent_id)
+        if row is None:
+            log.warning(
+                "SMS signup bg-validate: consent row %s vanished before stamping",
+                consent_id,
+            )
+            return
+        row.reservation_match = 1 if matched else 0
+        await db.commit()
+
+    if matched:
+        log.info(
+            "SMS signup bg-validate: reservation MATCHED id=%s res=%s guest=%r",
+            consent_id, reservation_number, result.get("guest_name"),
+        )
+    else:
+        log.warning(
+            "SMS signup bg-validate: reservation NOT FOUND in Cloudbeds id=%s res=%s "
+            "(consent still valid; staff should follow up)",
+            consent_id, reservation_number,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Twilio inbound SMS webhook (STOP / START / HELP keyword mirroring)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _verify_twilio_signature(
+    request_url: str, form_params: dict[str, Any], signature_header: str
+) -> bool:
+    """Verify Twilio's X-Twilio-Signature header.
+
+    Twilio signs: HMAC-SHA1(URL + concat(sorted_param_pairs), AuthToken),
+    base64-encoded. Failing the check means someone other than Twilio
+    POSTed to our endpoint -- treat as forgery and refuse.
+    """
+    if not signature_header or not settings.twilio_auth_token:
+        return False
+    sorted_pairs = sorted(form_params.items())
+    payload = request_url + "".join(f"{k}{v}" for k, v in sorted_pairs)
+    computed = base64.b64encode(
+        hmac.new(
+            settings.twilio_auth_token.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha1,
+        ).digest()
+    ).decode()
+    return hmac.compare_digest(computed, signature_header)
+
+
+async def _record_consent_change(
+    db: AsyncSession,
+    *,
+    phone_e164: str,
+    action: str,
+    source: str,
+    message_sid: str,
+) -> int:
+    """Insert a new sms_consent row capturing an opt-in/opt-out event
+    triggered by an inbound SMS keyword. Returns the new row's id.
+
+    We deliberately store one row per event (never UPDATE) so the audit
+    log retains the full history -- TCPA disputes turn on "did you have
+    proof of consent on date X", which requires immutable rows.
+    """
+    row = SmsConsent(
+        reservation_id="",  # SMS-keyword events have no reservation context
+        guest_id=None,
+        phone_e164=phone_e164,
+        action=action,
+        source=source,
+        consent_text=None,
+        consent_version=None,
+        client_ip=None,
+        user_agent=None,
+        recorded_at=datetime.utcnow(),
+        guest_name=None,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    log.info(
+        "SMS consent change recorded (inbound): id=%s phone=%s action=%s source=%s sid=%s",
+        row.id, phone_e164, action, source, message_sid,
+    )
+    return row.id
+
+
+@router.post("/twilio-inbound")
+async def twilio_sms_inbound(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Twilio inbound SMS webhook. Twilio POSTs here for every inbound
+    message to our Messaging Service numbers. We mirror STOP / START
+    keyword state into sms_consent so our audit log stays consistent
+    with Twilio's internal opt-out list.
+
+    Twilio's campaign-level keyword config handles the actual reply
+    text (the STOP confirmation, the HELP text, etc.) -- we return
+    empty TwiML so we don't double-send. Adding a <Message> on top of
+    Twilio's auto-reply would deliver two messages to the guest.
+
+    Auth: Twilio signs every webhook with HMAC-SHA1 in X-Twilio-Signature.
+    We verify before touching the database -- otherwise anyone could
+    spoof STOPs to opt out other people's numbers.
+    """
+    form_data = await request.form()
+    # Convert to a plain dict for signature verification (Twilio expects
+    # all values as strings).
+    form_params: dict[str, Any] = {k: str(v) for k, v in form_data.items()}
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    request_url = settings.twilio_inbound_base_url.rstrip("/") + str(request.url.path)
+    if not _verify_twilio_signature(request_url, form_params, signature):
+        peer = request.client.host if request.client else "?"
+        log.warning(
+            "Twilio inbound: bad/missing signature from %s url=%s (refusing)",
+            peer, request_url,
+        )
+        return Response(status_code=403, content="Forbidden")
+
+    body_text = form_params.get("Body", "").strip()
+    from_number = form_params.get("From", "").strip()
+    to_number = form_params.get("To", "").strip()
+    message_sid = form_params.get("MessageSid", "")
+
+    log.info(
+        "Twilio inbound SMS: from=%s to=%s sid=%s body=%r",
+        from_number, to_number, message_sid, body_text[:200],
+    )
+
+    if not from_number:
+        # No From -- nothing to mirror. Acknowledge and bail.
+        return Response(content=_EMPTY_TWIML, media_type="application/xml")
+
+    # Normalize From to E.164. Twilio guarantees E.164 already but be
+    # defensive in case future channels (WhatsApp, etc.) reuse this hook.
+    try:
+        parsed = phonenumbers.parse(from_number, "US")
+        phone_e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+    except phonenumbers.NumberParseException:
+        phone_e164 = from_number  # fall back to whatever Twilio sent
+
+    first_word = body_text.split(maxsplit=1)[0].upper() if body_text else ""
+
+    if first_word in _STOP_KEYWORDS:
+        await _record_consent_change(
+            db,
+            phone_e164=phone_e164,
+            action="opt_out",
+            source="sms_reply_stop",
+            message_sid=message_sid,
+        )
+    elif first_word in _START_KEYWORDS:
+        await _record_consent_change(
+            db,
+            phone_e164=phone_e164,
+            action="opt_in",
+            source="sms_reply_start",
+            message_sid=message_sid,
+        )
+    elif first_word in _HELP_KEYWORDS:
+        # No DB change for HELP -- it's a passive query, not a state change.
+        # Twilio's campaign-level HELP keyword handles the reply text.
+        log.info(
+            "Twilio inbound: HELP from %s (Twilio campaign auto-replies)",
+            phone_e164,
+        )
+    else:
+        # Non-keyword reply (a guest texting back conversationally to a
+        # transactional message). Log so staff can spot real questions in
+        # the journal, but don't pretend it's a consent change.
+        log.info(
+            "Twilio inbound: non-keyword reply from %s body=%r (logged, no action)",
+            phone_e164, body_text[:100],
+        )
+
+    return Response(content=_EMPTY_TWIML, media_type="application/xml")

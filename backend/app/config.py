@@ -118,6 +118,13 @@ class Settings(BaseSettings):
     # Hostname the WP signup form lives on (informational; logged at startup
     # and exposed via /sms-signup/health for sanity-checking deploys).
     sms_signup_origin_host: str = "lighthouseinn-florence.com"
+    # Public base URL Twilio POSTs to for inbound SMS (STOP/HELP/START
+    # keywords). Used to reconstruct the canonical URL for Twilio's
+    # signature verification (HMAC-SHA1 of URL + sorted form params).
+    # Must match what's configured in the Twilio Messaging Service's
+    # "Incoming Messages" webhook URL (scheme + host only -- the path is
+    # appended by the route handler).
+    twilio_inbound_base_url: str = "https://iris.lighthouseinn-florence.com"
 
     # --- Hotel identity (pinned to the top of every guest portal page) ---
     hotel_name: str = "Lighthouse Inn"

@@ -42,6 +42,7 @@ async def init_db():
             ("sms_consent", "guest_name", "TEXT"),
             ("sms_consent", "confirmation_sms_sid", "TEXT"),
             ("sms_consent", "confirmation_sent_at", "DATETIME"),
+            ("sms_consent", "reservation_match", "INTEGER"),
         ]
         for table, column, coltype in migrations:
             try:

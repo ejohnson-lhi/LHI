@@ -68,3 +68,11 @@ class SmsConsent(Base):
     #   confirmation_sent_at     -- when send_sms returned success
     confirmation_sms_sid = Column(String, nullable=True)
     confirmation_sent_at = Column(DateTime, nullable=True)
+
+    # Async Cloudbeds reservation validation (warn-but-accept policy).
+    # Populated by a background task after the webhook returns:
+    #   NULL  -- not checked yet, or no reservation_number provided
+    #   1     -- matched a real Cloudbeds reservation
+    #   0     -- reservation_number was provided but no match found
+    #            (consent is still valid; staff should follow up)
+    reservation_match = Column(Integer, nullable=True)
