@@ -1,0 +1,66 @@
+{
+	"requestHeaders": {
+		"headers": [
+			{
+				"name": "Accept",
+				"value": "application/json"
+			},
+			{
+				"name": "Accept-Encoding",
+				"value": "gzip, deflate, br, zstd"
+			},
+			{
+				"name": "Accept-Language",
+				"value": "en-US,en;q=0.9"
+			},
+			{
+				"name": "Connection",
+				"value": "keep-alive"
+			},
+			{
+				"name": "Content-Length",
+				"value": "4125"
+			},
+			{
+				"name": "Content-Type",
+				"value": "application/x-www-form-urlencoded"
+			},
+			{
+				"name": "DNT",
+				"value": "1"
+			},
+			{
+				"name": "Host",
+				"value": "api.stripe.com"
+			},
+			{
+				"name": "Origin",
+				"value": "https://js.stripe.com"
+			},
+			{
+				"name": "Priority",
+				"value": "u=4"
+			},
+			{
+				"name": "Sec-Fetch-Dest",
+				"value": "empty"
+			},
+			{
+				"name": "Sec-Fetch-Mode",
+				"value": "cors"
+			},
+			{
+				"name": "Sec-Fetch-Site",
+				"value": "same-site"
+			},
+			{
+				"name": "Sec-GPC",
+				"value": "1"
+			},
+			{
+				"name": "User-Agent",
+				"value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+			}
+		]
+	}
+}

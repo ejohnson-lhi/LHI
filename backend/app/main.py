@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.db.database import init_db
-from app.routes import admin, dcs_relay, incoming_call, llm, portal, vapi_tools
+from app.routes import admin, dcs_relay, incoming_call, llm, portal, portal_card, sms_signup, vapi_tools
 
 # Ensure SQLAlchemy sees all models before init_db's metadata.create_all runs.
 # Importing the module is enough — the class registers itself with Base.
@@ -62,6 +62,20 @@ app.include_router(llm.router, prefix="/llm", tags=["custom-llm"])
 # /dcs/{path} is namespaced under /dcs/ so it can't collide with portal's
 # /c/, /g/, /h* routes.
 app.include_router(dcs_relay.router, tags=["dcs-relay"])
+
+# Guest portal card-capture flow (Stripe.js -> tok_xxx -> Cloudbeds
+# internal save_credit_card). Test endpoints under /portal-card/* — no
+# auth yet, so localhost / dev use only until we layer a one-shot token
+# on top. Registered with the portal-card prefix so the catch-all /h*
+# routes in portal.py can't shadow it.
+app.include_router(portal_card.router, tags=["portal-card"])
+
+# WordPress /sms-signup/ Fluent Forms webhook. Stable URL on the droplet
+# the WP form POSTs to with X-Signup-Secret. This IS the verifiable
+# opt-in path cited in our Twilio A2P 10DLC campaign submission. Mount
+# before portal so /sms-signup/{anything} can't get swallowed by
+# portal's catch-all guest-facing routes.
+app.include_router(sms_signup.router, prefix="/sms-signup", tags=["sms-signup"])
 
 
 @app.exception_handler(RequestValidationError)

@@ -1,0 +1,70 @@
+{
+	"requestHeaders": {
+		"headers": [
+			{
+				"name": "Accept",
+				"value": "application/json, application/octet-stream"
+			},
+			{
+				"name": "Accept-Encoding",
+				"value": "gzip, deflate, br, zstd"
+			},
+			{
+				"name": "Accept-Language",
+				"value": "en-US,en;q=0.9"
+			},
+			{
+				"name": "Alt-Used",
+				"value": "api.hcaptcha.com"
+			},
+			{
+				"name": "Connection",
+				"value": "keep-alive"
+			},
+			{
+				"name": "Content-Length",
+				"value": "33063"
+			},
+			{
+				"name": "content-type",
+				"value": "application/octet-stream"
+			},
+			{
+				"name": "Host",
+				"value": "api.hcaptcha.com"
+			},
+			{
+				"name": "Origin",
+				"value": "https://newassets.hcaptcha.com"
+			},
+			{
+				"name": "Referer",
+				"value": "https://newassets.hcaptcha.com/"
+			},
+			{
+				"name": "Sec-Fetch-Dest",
+				"value": "empty"
+			},
+			{
+				"name": "Sec-Fetch-Mode",
+				"value": "cors"
+			},
+			{
+				"name": "Sec-Fetch-Site",
+				"value": "same-site"
+			},
+			{
+				"name": "Sec-Fetch-Storage-Access",
+				"value": "none"
+			},
+			{
+				"name": "Sec-GPC",
+				"value": "1"
+			},
+			{
+				"name": "User-Agent",
+				"value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+			}
+		]
+	}
+}

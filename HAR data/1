@@ -1,0 +1,39 @@
+{
+  "id": "tok_1TbBGjCkb5UaC5yL6awp4CcQ",
+  "object": "token",
+  "card": {
+    "id": "card_1TbBGjCkb5UaC5yLDfoE4a4X",
+    "object": "card",
+    "address_city": null,
+    "address_country": null,
+    "address_line1": null,
+    "address_line1_check": null,
+    "address_line2": null,
+    "address_state": null,
+    "address_zip": null,
+    "address_zip_check": null,
+    "brand": "Visa",
+    "country": "US",
+    "cvc_check": "unchecked",
+    "dynamic_last4": null,
+    "email": null,
+    "exp_month": 10,
+    "exp_year": 2028,
+    "funding": "credit",
+    "last4": "4958",
+    "name": "Eric O Johnson",
+    "networks": {
+      "preferred": null
+    },
+    "phone": null,
+    "regulated_status": "unregulated",
+    "tokenization_method": null,
+    "use": "credit",
+    "wallet": null
+  },
+  "client_ip": "199.193.238.24",
+  "created": 1779764581,
+  "livemode": true,
+  "type": "card",
+  "used": false
+}

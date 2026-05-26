@@ -1,0 +1,106 @@
+{
+	"requestHeaders": {
+		"headers": [
+			{
+				"name": "Accept",
+				"value": "application/json, text/javascript, */*; q=0.01"
+			},
+			{
+				"name": "Accept-Encoding",
+				"value": "gzip, deflate, br, zstd"
+			},
+			{
+				"name": "Accept-Language",
+				"value": "en-US,en;q=0.9"
+			},
+			{
+				"name": "Connection",
+				"value": "keep-alive"
+			},
+			{
+				"name": "Content-Length",
+				"value": "1160"
+			},
+			{
+				"name": "Content-Type",
+				"value": "application/x-www-form-urlencoded; charset=UTF-8"
+			},
+			{
+				"name": "Cookie",
+				"value": "cbmktg=eyJhbGciOiJBMjU2S1ciLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIn0.MjVajEYM9tEHOLv5q0SNVRqEP6lHdi3bEU9RwJBeqrdH6oKkV_6pXzWPvl3g9KPxgww9yJ2mq0EZuR6AM7BL32uIGA5tnFB9.Jv_pbpGL5GN0zwmauGuPkQ.01kOOV8ekZU15Wt6ZD8cq98lD-SwYiCWm19q2_SdMgop3Gd3M-ZS7MgwD4TBNunT1O2pQnzzRB8mR6e4AvNUhTcpd2nZxBd84FrCGQ9HxXrp_HqotDUZ_MN_zDyXsEpEvtNcKja4bN20ICrL_kyh3g.8MsL4qjERj6giXMe-c7FRmaHza7Mtif805OiUYo9_BU; __zlcmid=1EElZYEfmJwQ5gu; _ga_GDN11DGBXF=GS2.1.s1778266317$o14$g1$t1778266395$j60$l0$h0; _ga=GA1.1.1740776419.1746119650; _ga_1234567=GS2.1.s1778266317$o13$g1$t1778266395$j60$l0$h0; _ga_EQZTZXZ75S=GS2.1.s1747083734$o2$g0$t1747083734$j0$l0$h0; _ga_YL3P26DVQL=GS2.1.s1768087473$o26$g0$t1768087473$j60$l0$h970837141; OptanonConsent=isGpcEnabled=1&datestamp=Thu+May+21+2026+15%3A48%3A49+GMT-0700+(Pacific+Daylight+Time)&version=202601.2.0&browserGpcFlag=1&isIABGlobal=false&hosts=&landingPath=NotLandingPage&groups=C0003%3A1%2CC0001%3A1%2CC0002%3A1%2CC0004%3A0&AwaitingReconsent=false&consentId=a1da5575-9406-4fd6-8064-c40523af819d&interactionCount=0&isAnonUser=1&prevHadToken=0; FPID=FPID2.2.5cTa4w2IdqXISWK7p6oEkuuFws8WvDhkFF0RfPc8eQ8%3D.1746119650; _ga_5MXQ5XJDCR=GS2.1.s1779736469$o74$g0$t1779736469$j60$l0$h0; _ga_WQTNYKKCYW=GS2.2.s1748890076$o2$g0$t1748890076$j60$l0$h0; cb_funnel_pricing_steps=1; __q_state_97ddMkPtkP2z5P29=eyJ1dWlkIjoiZjJmODBkM2EtMjcxNC00NTFjLTk3ODktYmJjMWZiYzg1ZDdmIiwiY29va2llRG9tYWluIjoiY2xvdWRiZWRzLmNvbSJ9; _ga_DE2X96DC1M=GS2.1.s1779767880$o269$g1$t1779767993$j60$l0$h0; _ga_RF1NZSSDB1=GS2.1.s1758256973$o15$g0$t1758257002$j31$l0$h0; cf_clearance=4kUNDA1G6UNYaR0621nGvJug_7vClVv.A5INOJXde.Y-1749698033-1.2.1.1-tB5JN1o0A8yS9BxzQmm01awrcDWM1gbhHNZ.ZAJ7SRjhftw55QQ8Ev_ycTfEjGOmHgs_oeU6G0.op3UjSxCdeyeaKEDHj7z7rWoIFLNjcgfx4kbnRaLi6puDoiA8Ui1hzTmdtl0dNYHFAQ5ZV3CfFj_AXsaKCDMeuUFvV6clcCTA_JPf60TV7YSS4QAX0PU39o5s0XYOXrgx.eDgN79rBMPFhnnInMOdO66wDJ5BpAkYMRpHUWM43PY6U_YLhHrNNQ5ObHV1tGvK0diuD_vNMQUhLfBNOBTyTtO_mwklDckOzIMUP65o3k84JMrNAtTDdnNG7v01h4nlQys2YPaxnbne9o1f_7nmvN6NY9c7fIMyHyOhgKSb.5FkOagyMcAC; _ttp=aNYdBhOxwWNLIRcZrzG0Ci4i6KZ; sbjs_current_add=fd%3D2026-02-13%2011%3A01%3A50%7C%7C%7Cep%3Dhttps%3A%2F%2Fwww.cloudbeds.com%2Ffeatures%2Fapi%2F%7C%7C%7Crf%3Dhttps%3A%2F%2Fwww.google.com%2F; sbjs_current=typ%3Dorganic%7C%7C%7Csrc%3Dgoogle%7C%7C%7Cmdm%3Dorganic%7C%7C%7Ccmp%3D%28none%29%7C%7C%7Ccnt%3D%28none%29%7C%7C%7Ctrm%3D%28none%29; sbjs_udata=vst%3D12%7C%7C%7Cuip%3D%28none%29%7C%7C%7Cuag%3DMozilla%2F5.0%20%28Windows%20NT%2010.0%3B%20Win64%3B%20x64%3B%20rv%3A150.0%29%20Gecko%2F20100101%20Firefox%2F150.0; sbjs_migrations=1418474375998%3D1; sbjs_first_add=fd%3D2026-02-08%2014%3A11%3A54%7C%7C%7Cep%3Dhttps%3A%2F%2Fwww.cloudbeds.com%2Ffeatures%2Fapi%2F%7C%7C%7Crf%3Dhttps%3A%2F%2Fwww.google.com%2F; sbjs_first=typ%3Dorganic%7C%7C%7Csrc%3Dgoogle%7C%7C%7Cmdm%3Dorganic%7C%7C%7Ccmp%3D%28none%29%7C%7C%7Ccnt%3D%28none%29%7C%7C%7Ctrm%3D%28none%29; loc=calendar; csrf_accessa_cookie=641cb16bb80cc2900b33792f1d76fdb2; acessa_session_enabled=1; acessa_session=d6c9894b981a1b6e957c0213fa997b93a4bcbeaa; at=eyJraWQiOiJLaE1RZmRpa2lyVFNFMU1KUHV4OXZHai1xeUUwX0x1eFNMdnNIWUJhcUprIiwiYWxnIjoiUlMyNTYifQ.eyJ2ZXIiOjEsImp0aSI6IkFULnM1SF9RN1ZPbE9rWk1QeWhRa2FuNVNpVjdWWU1uYTNoekhmRTlIZ0JnWkkub2FyNHQ0eXNpOWN5ZFFOODk1ZDciLCJpc3MiOiJodHRwczovL3NpZ25pbi5jbG91ZGJlZHMuY29tL29hdXRoMi9hdXNkNWcydTY5QmxKNFdBYzVkNiIsImF1ZCI6Imh0dHBzOi8vaG90ZWxzLmNsb3VkYmVkcy5jb20vYXBpIiwic3ViIjoibGhpQGxhc2VyYml0ZS5jb20iLCJpYXQiOjE3Nzk3NjQ0MzMsImV4cCI6MTc3OTc5MzIzMywiY2lkIjoiMG9haHBmZmVlYnR1ZXd2ZGExZDYiLCJ1aWQiOiIwMHUxbnR3cGZrY0YwaktnejVkNyIsInNjcCI6WyJvZmZsaW5lX2FjY2VzcyIsImdyb3VwcyIsIm9wZW5pZCIsImVtYWlsIiwicHJvZmlsZSJdLCJhdXRoX3RpbWUiOjE3Nzk3NjQ0MzIsImFzc29jaWF0aW9uSWRzIjpbXSwicHJvcGVydHlJZHNfc3RyIjpbIjE3NjAxMCJdLCJjbGllbnRUeXBlIjoidW5rbm93biIsImFzc29jaWF0aW9uSWRzX3N0ciI6W10sIm1mZFVzZXJJZF9zdHIiOiIyNDM4NjMiLCJyZXNvdXJjZXMiOltdLCJwcm9wZXJ0eUlkcyI6WzE3NjAxMF0sImlzU3VwZXJBZG1pbiI6ZmFsc2UsIm1mZFVzZXJJZCI6MjQzODYzLCJ0eXBlIjoibm9uZSJ9.r3JRH6lUBicJkDZx-65itNukz26HM_LgMqcWxwuGko1wcDTtH4iWhO5MU4TawbdOJ0HLizHeWADV3hSblohliiOlys-b96bGC4rE4bkgRa7NJfUruBcpeTmXUl0-_qo5MJ4TRWjcCNqTDyFO5z5kl1U29cUSYwhNFLdnCOQA5ZGNvbyqgWe8ZGPS7F5Z_EZwH1S0E2cFyd1Oihse5RbX4BfVIlItkm23D22VQuGA6X4RsaFov29d9I5RYx3rdyHd39HhgpWUFSAVk3iJYe1KqGHPj81oyJ46_cDxZgyFm05_P-hawL1iSFbn5TIUIaWZl5RtwCarAEnjmTg7UqHjtw; user_last_activity=1779764433; rt=82ac4680daffb09c7ec8c0cb73ab5730d798f39f6843fde404f1fcc02ef2afb5_AT.iHE10PhqIV3R6onxZd2Yh1ga4j0goVwETorA_KQhnMA.oar4t4ysi9cydQN895d7; identity=1; hotel_name=Lighthouse%20Inn; _dd_s=logs=1&id=8eac085e-e6c4-486e-bac8-1d851944e0c7&created=1779767972771&expire=1779769590204&rum=2"
+			},
+			{
+				"name": "DNT",
+				"value": "1"
+			},
+			{
+				"name": "Host",
+				"value": "hotels.cloudbeds.com"
+			},
+			{
+				"name": "Origin",
+				"value": "https://hotels.cloudbeds.com"
+			},
+			{
+				"name": "Referer",
+				"value": "https://hotels.cloudbeds.com/connect/176010"
+			},
+			{
+				"name": "Sec-Fetch-Dest",
+				"value": "empty"
+			},
+			{
+				"name": "Sec-Fetch-Mode",
+				"value": "cors"
+			},
+			{
+				"name": "Sec-Fetch-Site",
+				"value": "same-origin"
+			},
+			{
+				"name": "Sec-GPC",
+				"value": "1"
+			},
+			{
+				"name": "TE",
+				"value": "trailers"
+			},
+			{
+				"name": "traceparent",
+				"value": "00-00000000000000003458fb77b0a02094-7173be74c71a40ff-00"
+			},
+			{
+				"name": "User-Agent",
+				"value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+			},
+			{
+				"name": "x-datadog-origin",
+				"value": "rum"
+			},
+			{
+				"name": "x-datadog-parent-id",
+				"value": "8175087157373452543"
+			},
+			{
+				"name": "x-datadog-sampling-priority",
+				"value": "0"
+			},
+			{
+				"name": "x-datadog-trace-id",
+				"value": "3772041179405754516"
+			},
+			{
+				"name": "X-Property-Id",
+				"value": "176010"
+			},
+			{
+				"name": "X-Requested-With",
+				"value": "XMLHttpRequest"
+			},
+			{
+				"name": "x-used-method",
+				"value": "common.ajax"
+			}
+		]
+	}
+}

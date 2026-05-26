@@ -114,6 +114,37 @@ def _entry_url() -> str:
 _TYPO_RATE = 0.03
 _MIN_LEN_FOR_TYPOS = 8
 
+
+def _keystroke_delay_ms(base_ms: float, familiarity: float = 1.0) -> int:
+    """One keystroke delay (ms) drawn from a mixture distribution that
+    approximates real human typing better than a flat 0.5x-1.5x jitter.
+
+    Real typing is bursty: most keystrokes cluster tightly near the
+    median, with a few much faster (muscle-memory bigrams) and a few
+    much slower (re-reading source material, thinking). Uniform jitter
+    misses both tails, so the signal looks too regular to bot-detection.
+
+    Mixture by probability:
+       10% burst   (0.20x - 0.50x of base)  — familiar key sequences
+       75% normal  (0.70x - 1.30x of base)  — typical cadence
+       12% slow    (1.50x - 2.50x of base)  — re-reading the source
+        3% pause   (3.00x - 6.00x of base)  — genuine thinking pause
+
+    `familiarity` scales the entire distribution:
+        0.5 = very familiar (own name, your email, well-known password)
+        1.0 = average
+        1.5 = unfamiliar (numbers off a credit card)
+    """
+    eff = base_ms * max(0.1, familiarity)
+    r = random.random()
+    if r < 0.10:
+        return max(15, int(eff * random.uniform(0.20, 0.50)))
+    if r < 0.85:
+        return int(eff * random.uniform(0.70, 1.30))
+    if r < 0.97:
+        return int(eff * random.uniform(1.50, 2.50))
+    return int(eff * random.uniform(3.00, 6.00))
+
 # Failure-alert dedup. Keyed by short signature; values are timestamps.
 _last_alert_at: dict[str, float] = {}
 _ALERT_DEDUP_WINDOW_SECONDS = 300.0
@@ -123,6 +154,56 @@ _ALERT_DEDUP_WINDOW_SECONDS = 300.0
 # session). The lock prevents two requests from racing on login.
 _session_lock = asyncio.Lock()
 _session_storage_state: dict[str, Any] | None = None
+
+# Disk-backed session cache. Without this, every fresh Python process
+# starts with no Playwright cookies and has to do the full Okta dance —
+# even though Okta itself often skips 2FA via its own "remember device"
+# cookie. Storing storage_state on disk lets consecutive script runs
+# skip even the email/password retype, going straight to a quick
+# "is the session still valid?" navigation check (~5s instead of ~30s).
+# Path is in data/ which is already gitignored (lighthouse.db lives there).
+# 8-hour TTL — Cloudbeds' session cookie typically lasts much longer
+# than that but we expire conservatively so a stale cache doesn't keep
+# us limping past a real session-revocation.
+_SESSION_CACHE_PATH = Path("data") / ".cloudbeds_session.json"
+_SESSION_CACHE_MAX_AGE_SECONDS = 8 * 3600
+
+
+def _load_cached_session_from_disk() -> dict[str, Any] | None:
+    """Return cached storage_state if the on-disk file exists and is
+    younger than the TTL. None otherwise (forces a full login)."""
+    try:
+        if not _SESSION_CACHE_PATH.exists():
+            return None
+        age = time.time() - _SESSION_CACHE_PATH.stat().st_mtime
+        if age > _SESSION_CACHE_MAX_AGE_SECONDS:
+            log.info(
+                "Cloudbeds session cache is %.1f hours old; ignoring (will re-login).",
+                age / 3600,
+            )
+            return None
+        import json
+        with _SESSION_CACHE_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as ex:
+        log.warning("Couldn't load Cloudbeds session cache: %s", ex)
+        return None
+
+
+def _save_cached_session_to_disk(state: dict[str, Any]) -> None:
+    """Persist storage_state for re-use across script runs. Contains
+    cookies — treat as a secret. Lives under data/ which is gitignored."""
+    try:
+        _SESSION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        # Write to a temp file then rename, so a crash mid-write doesn't
+        # leave a corrupted JSON we'd then fail to parse next time.
+        tmp = _SESSION_CACHE_PATH.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(state, f)
+        tmp.replace(_SESSION_CACHE_PATH)
+    except Exception as ex:
+        log.warning("Couldn't save Cloudbeds session cache: %s", ex)
 
 
 def _alert_signature(msg: str) -> str:
@@ -222,8 +303,14 @@ class CloudbedsBrowser:
             # and silently reject).
             args=["--disable-blink-features=AutomationControlled"],
         )
-        # Reuse stored auth state across requests when possible.
+        # Reuse stored auth state across requests when possible. Two-tier:
+        # in-memory module-level cache for fast access within a process,
+        # disk-backed cache for re-use across fresh script runs.
         global _session_storage_state
+        if _session_storage_state is None:
+            _session_storage_state = _load_cached_session_from_disk()
+            if _session_storage_state:
+                log.info("Cloudbeds: loaded session cache from disk; will skip credential entry.")
         ctx_kwargs: dict[str, Any] = {
             "viewport": {"width": 1400, "height": 900},
             "user_agent": (
@@ -273,13 +360,21 @@ class CloudbedsBrowser:
         except Exception as ex:
             log.warning("Couldn't save Playwright trace: %s", ex)
         # Save the post-action auth state so the next call can skip login.
-        # Only when no exception fired -- a broken session might be poisoned.
+        # Unconditional: cookies are just cookies, and the TTL check on the
+        # load side rejects stale ones. Worst case after a crashed run is a
+        # cache with partial Okta cookies; next run loads it, validation
+        # fails on the dashboard nav, login() re-runs the credential flow
+        # and replaces the cache. One extra login. Not worth gating on
+        # exc_type and missing legitimate "user pressed Ctrl+C after a
+        # successful save" cases.
         try:
-            if exc_type is None and self._context is not None:
+            if self._context is not None:
                 global _session_storage_state
                 _session_storage_state = await self._context.storage_state()
-        except Exception:
-            pass
+                _save_cached_session_to_disk(_session_storage_state)
+                log.info("Cloudbeds: saved session cache to disk.")
+        except Exception as ex:
+            log.warning("Couldn't save session cache on exit: %s", ex)
         try:
             if self._context: await self._context.close()
         except Exception: pass
@@ -364,70 +459,233 @@ class CloudbedsBrowser:
         *selectors: str,
         timeout: int = 5000,
         allow_typos: bool = True,
+        familiarity: float = 1.0,
     ) -> bool:
-        """Like _fill_first_visible but types one char at a time, with
-        per-char delay jitter and an occasional typo-and-backspace cycle.
-        Auth flows (Okta in particular) treat instant 'fills' as scripted
-        input and sometimes silently reject. This mimics human cadence
-        well enough to get past the gate.
+        """Like _fill_first_visible but types one char at a time with
+        mixture-distribution per-char delays (see _keystroke_delay_ms) and
+        an occasional typo-and-backspace cycle.
 
-        Per-char delay comes from settings, scaled by a random 0.5x-1.5x
-        on every keystroke (humans aren't metronomes). When `allow_typos`
-        is True (default) AND the value is long enough to be plausible as
-        a typed phrase (>= 8 chars), each char has a small chance of
-        producing a wrong character followed by Backspace before the
-        correct one is typed. Disable for short fixed-format values
-        (TOTP codes, single-digit fields) where a typo+backspace would
-        look more bot-like than just typing it cleanly."""
-        base_ms = max(1, settings.cloudbeds_typing_delay_ms)
-        do_typos = allow_typos and len(value) >= _MIN_LEN_FOR_TYPOS
+        `familiarity` scales the cadence:
+            0.5 = own name / well-known email (fast, with bursts)
+            1.0 = default
+            1.5 = card-from-physical-card (slower, more mid-typing pauses)
 
+        Auth flows (Okta in particular) treat instant `.fill()` as
+        scripted input and silently reject. This mimics human cadence well
+        enough to get past the gate. The mixture distribution is what
+        actually gets us past Stripe-Elements-grade bot detection: a flat
+        uniform jitter is itself a tell.
+
+        When `allow_typos` is True AND `value` is long enough (>= 8 chars),
+        each alphanumeric char has a small chance of producing a wrong
+        character followed by Backspace before the correct one. Disable
+        for short fixed-format values (TOTP codes, CVV, expiry) where a
+        typo+backspace would look more bot-like than typing cleanly."""
         for sel in selectors:
             if not sel:
                 continue
             try:
                 el = self.page.locator(sel).first
-                await el.wait_for(state="visible", timeout=timeout)
-                # Focus first (humans click before typing)
-                await el.click()
-                await asyncio.sleep(random.uniform(0.12, 0.25))
-                # Clear any pre-fill so type() doesn't append to existing chars
-                await el.fill("")
-                await asyncio.sleep(random.uniform(0.04, 0.10))
-                # Type one char at a time with jittered delays + occasional
-                # typo-and-correct. Slight extra pause on spaces and after
-                # punctuation, matching how people actually type.
-                for c in value:
-                    if do_typos and c.isalnum() and random.random() < _TYPO_RATE:
-                        # Pick a wrong char that's the same "kind" as the
-                        # right one -- letters get letters, digits get
-                        # digits. Looks more like a fat-finger than a
-                        # random key.
-                        if c.isalpha():
-                            wrong = random.choice("abcdefghijklmnopqrstuvwxyz")
-                            if c.isupper():
-                                wrong = wrong.upper()
-                        else:
-                            wrong = random.choice("0123456789")
-                        # Type the wrong char, "notice" it, backspace.
-                        await el.type(wrong, delay=0)
-                        await asyncio.sleep(random.uniform(0.18, 0.42))
-                        await el.press("Backspace")
-                        await asyncio.sleep(random.uniform(0.08, 0.20))
-                    # Per-char jittered delay (0.5x - 1.5x of base, in ms).
-                    delay_ms = int(base_ms * random.uniform(0.5, 1.5))
-                    await el.type(c, delay=delay_ms)
-                    # A tiny extra micro-pause after spaces / punctuation
-                    if c in " .,@-_":
-                        await asyncio.sleep(random.uniform(0.02, 0.09))
-                # Pause before whatever's next (gives the page a moment
-                # to validate / show errors / enable the submit button).
-                base_pause = settings.cloudbeds_action_pause_ms / 1000
-                await asyncio.sleep(base_pause * random.uniform(0.75, 1.3))
-                return True
+                ok = await self._humanlike_type_into(
+                    el, value,
+                    allow_typos=allow_typos,
+                    familiarity=familiarity,
+                    clear_first=True,
+                    timeout=timeout,
+                )
+                if ok:
+                    return True
             except Exception:
                 continue
         return False
+
+    async def _humanlike_keyboard_into(
+        self,
+        container_locator,
+        value: str,
+        *,
+        allow_typos: bool = True,
+        familiarity: float = 1.0,
+        timeout: int = 10000,
+        break_after_chars: list[int] | None = None,
+    ) -> bool:
+        """Click a PAGE-LEVEL container element, then type via Page.keyboard
+        with humanlike cadence. Use this when an input lives inside a
+        cross-origin iframe (notably Stripe Elements) where `frame_locator`
+        chains fight Playwright's actionability checks and cause
+        scroll-jumping / visibility timeouts.
+
+        Mechanics: clicking the page-level container puts focus on it. For
+        Stripe Elements containers (#cardNumber / #cardCvv / .CardExpireContainer),
+        Stripe.js intercepts the click and routes focus into its iframe's
+        internal input. Subsequent keystrokes via Page.keyboard go to
+        whatever has focus — so they land in Stripe's input without us
+        ever entering the iframe via Playwright."""
+        base_ms = max(1, settings.cloudbeds_typing_delay_ms)
+        do_typos = allow_typos and len(value) >= _MIN_LEN_FOR_TYPOS
+        f_clamped = max(0.4, familiarity)
+
+        try:
+            await container_locator.wait_for(state="visible", timeout=timeout)
+            # force=True skips Playwright's repeat actionability check
+            # that was the source of the scroll-jumping when Stripe's
+            # iframe re-layouts mid-stabilization.
+            await container_locator.click(force=True)
+            await asyncio.sleep(random.uniform(0.20, 0.40) * f_clamped)
+
+            for i, c in enumerate(value):
+                if do_typos and c.isalnum() and random.random() < _TYPO_RATE:
+                    if c.isalpha():
+                        wrong = random.choice("abcdefghijklmnopqrstuvwxyz")
+                        if c.isupper():
+                            wrong = wrong.upper()
+                    else:
+                        wrong = random.choice("0123456789")
+                    await self.page.keyboard.type(wrong, delay=0)
+                    await asyncio.sleep(random.uniform(0.18, 0.42))
+                    await self.page.keyboard.press("Backspace")
+                    await asyncio.sleep(random.uniform(0.08, 0.20))
+
+                # IMPORTANT: Playwright's `type(text, delay=N)` only uses
+                # delay BETWEEN chars within one call. For single-char calls,
+                # the delay is essentially ignored. So we always pass
+                # delay=0 here and impose the inter-keystroke gap with our
+                # own asyncio.sleep. Without this, our mixture-distribution
+                # cadence wouldn't actually be applied -- the keys would
+                # fire as fast as the event loop could schedule them, which
+                # is what was breaking Stripe's expiration-field auto-format
+                # (race between "1" processing and "2" arrival).
+                delay_ms = _keystroke_delay_ms(base_ms, familiarity)
+                await self.page.keyboard.type(c, delay=0)
+                await asyncio.sleep(delay_ms / 1000.0)
+
+                if c in " .,@-_":
+                    await asyncio.sleep(random.uniform(0.02, 0.12))
+                if familiarity > 1.2 and (i + 1) % 4 == 0 and i + 1 < len(value):
+                    if random.random() < 0.35:
+                        await asyncio.sleep(random.uniform(0.25, 0.70))
+                # DETERMINISTIC mid-field pause -- specifically for fields
+                # that auto-format mid-typing (Stripe expiration inserts "/"
+                # after MM; if the next keystroke arrives during that
+                # re-focus animation it gets dropped). Callers pass
+                # break_after_chars=[2] for "MMYY" to force a deliberate
+                # pause matching how a human looks at the YY part of their
+                # card after typing the month.
+                if (
+                    break_after_chars
+                    and (i + 1) in break_after_chars
+                    and i + 1 < len(value)
+                ):
+                    await asyncio.sleep(random.uniform(0.40, 0.90))
+
+            base_pause = settings.cloudbeds_action_pause_ms / 1000
+            await asyncio.sleep(base_pause * random.uniform(0.75, 1.3))
+            return True
+        except Exception as ex:
+            log.warning("_humanlike_keyboard_into failed: %s", ex)
+            return False
+
+    async def _humanlike_type_into(
+        self,
+        locator,
+        value: str,
+        *,
+        allow_typos: bool = True,
+        familiarity: float = 1.0,
+        clear_first: bool = True,
+        timeout: int = 5000,
+        break_after_chars: list[int] | None = None,
+    ) -> bool:
+        """Type into an already-resolved Playwright Locator with humanlike
+        cadence. Use this for iframe-internal targets (e.g.
+        `page.frame_locator('#cardNumber iframe').locator('input').first`)
+        where a page-level selector can't reach. Same cadence + typo +
+        familiarity semantics as `_humanlike_type`."""
+        base_ms = max(1, settings.cloudbeds_typing_delay_ms)
+        do_typos = allow_typos and len(value) >= _MIN_LEN_FOR_TYPOS
+        # Scale the "thinking" pauses (initial + space-after) by familiarity
+        # too, but clamp the lower end so bursts of speed don't collapse
+        # these pauses to zero.
+        f_clamped = max(0.4, familiarity)
+
+        try:
+            await locator.wait_for(state="visible", timeout=timeout)
+            # Auto-detect masked / hidden fields and force typos off. A real
+            # person can't see what they typed in a `type=password` field, so
+            # they can't typo-then-backspace -- they just type carefully and
+            # accept whatever lands. Doing the typo dance on a masked field
+            # is a script tell. Same applies to fields explicitly tagged for
+            # password autofill (autocomplete=current-password / new-password).
+            try:
+                input_type = (await locator.get_attribute("type") or "").lower()
+                autocomp = (await locator.get_attribute("autocomplete") or "").lower()
+                if input_type == "password" or autocomp in ("current-password", "new-password"):
+                    do_typos = False
+            except Exception:
+                pass
+            # Initial "look at the field" pause -- longer when the value is
+            # something we need to read off a card vs something we know cold.
+            await locator.click()
+            await asyncio.sleep(random.uniform(0.12, 0.30) * f_clamped)
+            if clear_first:
+                # Stripe Elements iframes sometimes refuse programmatic
+                # fill(""). Don't let a clear failure abort the typing.
+                try:
+                    await locator.fill("")
+                except Exception:
+                    pass
+                await asyncio.sleep(random.uniform(0.04, 0.10) * f_clamped)
+
+            for i, c in enumerate(value):
+                if do_typos and c.isalnum() and random.random() < _TYPO_RATE:
+                    # Wrong char of the same kind (letters -> letters,
+                    # digits -> digits). Fat-finger pattern, not random key.
+                    if c.isalpha():
+                        wrong = random.choice("abcdefghijklmnopqrstuvwxyz")
+                        if c.isupper():
+                            wrong = wrong.upper()
+                    else:
+                        wrong = random.choice("0123456789")
+                    await locator.type(wrong, delay=0)
+                    await asyncio.sleep(random.uniform(0.18, 0.42))
+                    await locator.press("Backspace")
+                    await asyncio.sleep(random.uniform(0.08, 0.20))
+
+                # Same caveat as _humanlike_keyboard_into: `type(text, delay=N)`
+                # only applies delay BETWEEN chars in one call, not within a
+                # single-char call. Always pass delay=0 here and impose the
+                # inter-keystroke gap with asyncio.sleep so the mixture
+                # distribution actually drives timing.
+                delay_ms = _keystroke_delay_ms(base_ms, familiarity)
+                await locator.type(c, delay=0)
+                await asyncio.sleep(delay_ms / 1000.0)
+
+                # Micro-pause after a space or punctuation -- the eye
+                # tends to dwell at word boundaries.
+                if c in " .,@-_":
+                    await asyncio.sleep(random.uniform(0.02, 0.12))
+                # For unfamiliar data (card number etc.), ~35% chance of a
+                # "look back at the card" pause after every 4-char block.
+                if familiarity > 1.2 and (i + 1) % 4 == 0 and i + 1 < len(value):
+                    if random.random() < 0.35:
+                        await asyncio.sleep(random.uniform(0.25, 0.70))
+                # Deterministic mid-field pause for auto-formatting inputs
+                # (see _humanlike_keyboard_into for the rationale -- Stripe
+                # expiration "/" insertion is the canonical case).
+                if (
+                    break_after_chars
+                    and (i + 1) in break_after_chars
+                    and i + 1 < len(value)
+                ):
+                    await asyncio.sleep(random.uniform(0.40, 0.90))
+
+            # Post-typing review pause before whatever's next.
+            base_pause = settings.cloudbeds_action_pause_ms / 1000
+            await asyncio.sleep(base_pause * random.uniform(0.75, 1.3))
+            return True
+        except Exception as ex:
+            log.warning("_humanlike_type_into failed: %s", ex)
+            return False
 
     async def _pause(self, label: str = "") -> None:
         """Insert a humanlike pause between major steps. Called after

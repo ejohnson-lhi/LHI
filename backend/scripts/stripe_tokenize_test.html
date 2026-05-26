@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Stripe.js tokenization test (using Cloudbeds' publishable key)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://js.stripe.com/v3/"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+           max-width: 36rem; margin: 2rem auto; padding: 1rem; color: #222; }
+    h2 { font-size: 1.3rem; margin-bottom: 0.3rem; }
+    .blurb { color: #555; font-size: .95rem; margin-bottom: 1.5rem; }
+    .form-row { margin: 1rem 0; }
+    label { display: block; margin-bottom: 0.4rem; font-weight: 600; font-size: .92rem; }
+    input.txt, #card-element {
+        width: 100%; padding: .65rem .75rem; box-sizing: border-box;
+        border: 1px solid #c5c5c5; border-radius: .35rem; background: white;
+        font-family: inherit; font-size: 1rem;
+    }
+    #card-element { padding: .85rem .75rem; }
+    button { padding: .7rem 1.2rem; font-size: 1rem; font-weight: 600;
+             background: #2b6fb6; color: white; border: 0; border-radius: .35rem;
+             cursor: pointer; margin-top: 1rem; }
+    button:disabled { background: #888; cursor: default; }
+    pre { background: #f4f4f4; padding: 1rem; border-radius: .35rem;
+          overflow: auto; font-size: .85rem; white-space: pre-wrap; word-break: break-all; }
+    .ok { color: #0a7d2f; font-weight: 600; }
+    .err { color: #b00020; font-weight: 600; }
+    .pm-id { display: inline-block; background: #ffec99; padding: .15rem .4rem; border-radius: .2rem; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h2>Stripe.js Legacy-Token Test (matches dashboard)</h2>
+  <p class="blurb">
+    Loads Stripe.js with <strong>Cloudbeds' publishable key</strong>
+    and calls <code>stripe.createToken()</code> — the exact same call the
+    Cloudbeds dashboard's "Add Card" Save button makes (per HAR capture
+    2026-05-25). The resulting <span class="pm-id">tok_xxx</span> + its
+    card object are what the dashboard's <code>save_credit_card</code>
+    endpoint accepts. Use the "Copy env vars" button below to set up
+    <code>scripts\\test_dashboard_save_card.py</code> in one paste.
+  </p>
+
+  <div class="form-row">
+    <label for="cardholder-name">Cardholder Name</label>
+    <input type="text" id="cardholder-name" class="txt" placeholder="As it appears on the card" />
+  </div>
+
+  <div class="form-row">
+    <label for="card-element">Card details (number, expiration, CVV)</label>
+    <div id="card-element"><!-- Stripe Elements mounts here --></div>
+    <div id="card-errors" class="err" style="margin-top:.5rem; min-height:1.2em;" role="alert"></div>
+  </div>
+
+  <button id="submit-btn" type="button">Tokenize Card (createToken)</button>
+
+  <h3 style="margin-top:2rem;">Result</h3>
+  <div id="result-status"></div>
+  <pre id="result-detail">(submit to tokenize — the response from Stripe appears here)</pre>
+  <button id="copy-env-btn" type="button" style="display:none; background:#0a7d2f;">Copy env vars for test_dashboard_save_card.py</button>
+
+  <script>
+    // Cloudbeds' publishable key, extracted from the dashboard's Stripe
+    // Elements iframe src (2026-05-24). This is Cloudbeds' PLATFORM
+    // publishable key. HAR capture (2026-05-25) of the dashboard's
+    // working save_credit_card flow showed the dashboard tokenizes on
+    // the PLATFORM account (no stripeAccount override) — our earlier
+    // theory that the connected sub-account was needed was wrong. We
+    // match the dashboard's exact behavior here.
+    const CLOUDBEDS_STRIPE_PK = 'pk_live_51GxYvfCkb5UaC5yLKjotmnTBp7MYbmiTqeNvDluaevZJ7xSsbL7RC4f3ZQdglMa9IVY6iPkpfDCdSJGrgdiyvuRo00jZpsTHkv';
+
+    const stripe = Stripe(CLOUDBEDS_STRIPE_PK);
+    const elements = stripe.elements();
+    const cardElement = elements.create('card', {
+      style: {
+        base: {
+          fontFamily: '"Segoe UI", system-ui, sans-serif',
+          fontSize: '15px',
+          color: '#222',
+          '::placeholder': { color: '#888' },
+        },
+      },
+    });
+    cardElement.mount('#card-element');
+
+    const errors = document.getElementById('card-errors');
+    cardElement.on('change', (event) => {
+      errors.textContent = event.error ? event.error.message : '';
+    });
+
+    const btn = document.getElementById('submit-btn');
+    const copyBtn = document.getElementById('copy-env-btn');
+    // Stash the most recent token result so the copy-env button can find it.
+    let lastToken = null;
+
+    btn.addEventListener('click', async () => {
+      const name = document.getElementById('cardholder-name').value.trim();
+      const statusEl = document.getElementById('result-status');
+      const detailEl = document.getElementById('result-detail');
+
+      btn.disabled = true;
+      btn.textContent = 'Tokenizing...';
+      statusEl.textContent = '';
+      detailEl.textContent = '';
+      copyBtn.style.display = 'none';
+      lastToken = null;
+
+      try {
+        // The Cloudbeds dashboard uses stripe.createToken() (legacy token),
+        // NOT stripe.createPaymentMethod(). Their save_credit_card endpoint
+        // takes the tok_xxx id + the token's `card` sub-object as form
+        // fields. Match exactly.
+        const tokenArgs = name ? { name } : {};
+        const { token, error } = await stripe.createToken(cardElement, tokenArgs);
+
+        if (error) {
+          statusEl.innerHTML = '<span class="err">FAILED.</span> Stripe returned an error:';
+          detailEl.textContent = JSON.stringify(error, null, 2);
+        } else {
+          lastToken = token;
+          statusEl.innerHTML = '<span class="ok">SUCCESS.</span> Token ID: '
+            + '<span class="pm-id">' + token.id + '</span> '
+            + '(use the green button below to copy env vars for the test script)';
+          detailEl.textContent = JSON.stringify(token, null, 2);
+          copyBtn.style.display = 'inline-block';
+        }
+      } catch (ex) {
+        statusEl.innerHTML = '<span class="err">EXCEPTION.</span> Unhandled error from Stripe.js:';
+        detailEl.textContent = (ex && ex.message) ? ex.message : String(ex);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Tokenize Card (createToken)';
+      }
+    });
+
+    copyBtn.addEventListener('click', async () => {
+      if (!lastToken) return;
+      // Produce a cmd-pasteable block. The card-object JSON is stringified
+      // on one line so set quoting works in cmd. The test script parses
+      // it with json.loads().
+      const cardJson = JSON.stringify(lastToken.card);
+      // cmd's `set` doesn't like literal quotes; escape with backslash-quote
+      // for clipboard, which the user can paste directly.
+      const block = [
+        'set TEST_TOKEN_ID=' + lastToken.id,
+        'set TEST_TOKEN_CARD_JSON=' + cardJson,
+      ].join('\n');
+      try {
+        await navigator.clipboard.writeText(block);
+        copyBtn.textContent = 'Copied! Paste in your cmd shell, then run the test.';
+        setTimeout(() => {
+          copyBtn.textContent = 'Copy env vars for test_dashboard_save_card.py';
+        }, 4000);
+      } catch (ex) {
+        // Clipboard write can fail in some browsers without HTTPS/permissions.
+        // Fall back to a manual copy via prompt().
+        prompt('Copy the block below manually:', block);
+      }
+    });
+  </script>
+</body>
+</html>

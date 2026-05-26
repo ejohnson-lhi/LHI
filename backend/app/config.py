@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     # Typical value once WG is up: "http://10.42.0.2:8090"
     dcs_wg_target_url: str = ""
 
+    # --- SMS signup webhook ---
+    # Shared secret the WordPress /sms-signup/ Fluent Forms webhook sends in
+    # the X-Signup-Secret header. Generate with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    # Leave blank to disable the endpoint (returns 503 for all requests --
+    # useful while developing or if the WP form is taken down).
+    sms_signup_shared_secret: str = ""
+    # Hostname the WP signup form lives on (informational; logged at startup
+    # and exposed via /sms-signup/health for sanity-checking deploys).
+    sms_signup_origin_host: str = "lighthouseinn-florence.com"
+
     # --- Hotel identity (pinned to the top of every guest portal page) ---
     hotel_name: str = "Lighthouse Inn"
     # Single-line address: e.g. "155 Hwy 101, Florence, OR 97439". Empty -> not shown.

@@ -39,6 +39,9 @@ async def init_db():
             ("sms_consent", "twilio_lookup_at", "DATETIME"),
             ("sms_consent", "twilio_line_type", "TEXT"),
             ("sms_consent", "twilio_carrier", "TEXT"),
+            ("sms_consent", "guest_name", "TEXT"),
+            ("sms_consent", "confirmation_sms_sid", "TEXT"),
+            ("sms_consent", "confirmation_sent_at", "DATETIME"),
         ]
         for table, column, coltype in migrations:
             try:

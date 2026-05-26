@@ -53,3 +53,18 @@ class SmsConsent(Base):
     twilio_lookup_at = Column(DateTime, nullable=True)
     twilio_line_type = Column(String, nullable=True)
     twilio_carrier = Column(String, nullable=True)
+
+    # Guest name captured at the moment of consent. Nice-to-have for audit
+    # readability; the reservation_id is the canonical link to Cloudbeds.
+    # We snapshot it here so a later rename on the reservation doesn't make
+    # the historical consent record harder to recognize.
+    guest_name = Column(String, nullable=True)
+
+    # One-time confirmation SMS we send right after recording a web-form
+    # opt-in ("Lighthouse Inn: you're signed up for SMS..."). Populated on
+    # the same row that captured the consent, so the audit trail proves we
+    # actually delivered (or attempted) the confirmation handshake.
+    #   confirmation_sms_sid     -- Twilio Message SID, if send succeeded
+    #   confirmation_sent_at     -- when send_sms returned success
+    confirmation_sms_sid = Column(String, nullable=True)
+    confirmation_sent_at = Column(DateTime, nullable=True)
