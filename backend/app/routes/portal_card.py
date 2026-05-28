@@ -1,6 +1,25 @@
-"""Guest portal — Add-Card flow.
+"""Guest portal — Add-Card flow. [DEPRECATED — see /g/{token} flow]
 
-End-to-end flow:
+DEPRECATION NOTE (2026-05-27): The add-card UX is now unified inside the
+main guest portal at /g/{token}. The card accordion in that page renders
+the same Stripe Elements form this file used to expose at
+/portal-card/{token}, and the new entry point for SMS-delivered card
+links is /g/{token}?open=card (which auto-expands the card accordion on
+arrival).
+
+This file is kept around in case stale Twilio retries deliver an old
+/portal-card/{token} URL, but no new code paths point here. To finish
+the migration:
+  1. Confirm no live SMS messages still reference /portal-card URLs
+     (Twilio message log + portal_token rows with purpose='add_card').
+  2. Delete this file + drop the /portal-card/* routes from main.py.
+  3. Drop or migrate any portal_token rows where purpose='add_card'.
+
+Iris's send_card_link_via_sms tool was updated to call
+issue_guest_token_row in portal.py and SMS the /g/{token}?open=card
+URL instead of minting a one-shot add_card token here.
+
+Original end-to-end flow (still works for compat):
 
   1. DCS / Iris calls POST /portal-card/mint with X-Portal-Auth, passing
      the reservation_id + room context. We mint a one-shot token and
@@ -124,6 +143,42 @@ async def _resolve_token(token: str, db: AsyncSession) -> PortalToken:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+async def mint_card_capture_token_row(
+    db: AsyncSession,
+    *,
+    reservation_id: str,
+    first_name: str | None,
+    room_number: str,
+) -> tuple[str, str, datetime]:
+    """In-process helper for callers that already have a DB session and
+    want to mint a card-capture token without going through the HTTP
+    endpoint. Used by the Iris voice tool. Returns (token, portal_url,
+    expires_at). Mirrors the mint endpoint's logic exactly so behavior
+    stays consistent whether the mint comes from DCS, Iris voice, or
+    manual /portal-card/mint calls."""
+    token = secrets.token_urlsafe(16)
+    now = datetime.utcnow()
+    expires_at = now + _TOKEN_TTL
+    row = PortalToken(
+        token=token,
+        purpose=_PURPOSE,
+        reservation_id=reservation_id,
+        first_name=first_name,
+        room_number=room_number,
+        created_at=now,
+        expires_at=expires_at,
+    )
+    db.add(row)
+    await db.commit()
+    base = settings.portal_public_base_url.rstrip("/")
+    portal_url = f"{base}/portal-card/{token}"
+    log.info(
+        "Minted add_card token=%s reservation=%s room=%s expires=%s",
+        token, reservation_id, room_number, expires_at.isoformat(),
+    )
+    return token, portal_url, expires_at
+
+
 @router.post(
     "/portal-card/mint",
     response_model=MintResponse,
@@ -144,26 +199,11 @@ async def mint_card_capture_token(
     the internal search endpoint once the httpx client is warm).
     Avoids tying mint to a slower path; if the search endpoint is
     flaky at mint time we can still mint successfully."""
-    token = secrets.token_urlsafe(16)
-    now = datetime.utcnow()
-    expires_at = now + _TOKEN_TTL
-    row = PortalToken(
-        token=token,
-        purpose=_PURPOSE,
+    token, portal_url, expires_at = await mint_card_capture_token_row(
+        db,
         reservation_id=req.reservation_id,
         first_name=req.first_name,
         room_number=req.room_number,
-        created_at=now,
-        expires_at=expires_at,
-    )
-    db.add(row)
-    await db.commit()
-
-    base = settings.portal_public_base_url.rstrip("/")
-    portal_url = f"{base}/portal-card/{token}"
-    log.info(
-        "Minted add_card token=%s reservation=%s room=%s expires=%s",
-        token, req.reservation_id, req.room_number, expires_at.isoformat(),
     )
     return MintResponse(token=token, portal_url=portal_url, expires_at=expires_at)
 

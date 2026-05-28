@@ -207,6 +207,121 @@ async def _handle_send_payment_link(args: dict, call: VapiCallObject) -> dict:
     return {"sent": False, "message": "Stub — payment link integration not yet wired."}
 
 
+async def _handle_send_card_link_via_sms(args: dict, call: VapiCallObject) -> dict:
+    """Get-or-mint the long-lived guest-portal URL for the reservation and
+    SMS it to the guest, with `?open=card` so the credit-card accordion is
+    auto-expanded on arrival. Iris uses this mid-call when a reservation
+    needs a card on file (e.g. incidentals deposit, no-card-booked-via-OTA
+    situations).
+
+    Args:
+      reservation_id (required): public Cloudbeds reservation ID
+      phone_number (optional): override the destination phone. Defaults
+        to the reservation's guest_cell_phone, then guest_phone, then
+        the caller's caller-ID. Iris's prompt is responsible for
+        guest-identity verification BEFORE calling this — the handler
+        doesn't re-verify.
+
+    The URL is the same long-lived /g/{token} guest portal that DCS sends
+    pre-arrival; if the guest already has one, we reuse it instead of
+    minting a fresh token. Token lifetime is 60 days (or through 1 day
+    past checkout once stay dates are known).
+
+    SMS deliverability note: A2P 10DLC campaign approval may still be
+    pending. If Twilio rejects the send, we surface the portal URL in
+    the response so Iris can read it back to the guest verbally as a
+    fallback. The link itself is still valid."""
+    from app.config import settings as _settings
+    from app.db.database import AsyncSessionLocal
+    from app.routes.portal import issue_guest_token_row
+
+    reservation_id = (args.get("reservation_id") or "").strip()
+    if not reservation_id:
+        return {"sent": False, "message": "Need reservation_id."}
+
+    reservation = await cloudbeds.get_reservation_by_id(reservation_id)
+    if not reservation:
+        return {"sent": False, "message": f"Could not find reservation {reservation_id}."}
+
+    # Resolve the destination phone. Iris can override via args; otherwise
+    # the reservation's stored phone wins; last-ditch fallback is caller-ID.
+    phone = (args.get("phone_number") or "").strip()
+    if not phone:
+        phone = (reservation.get("guest_cell_phone") or reservation.get("guest_phone") or "").strip()
+    if not phone:
+        phone = (call.customer.number or "").strip() if call.customer else ""
+    if not phone:
+        return {"sent": False, "message": "No phone number found for this reservation or caller."}
+
+    first_name = (reservation.get("guest_first_name") or "").strip()
+
+    # Get-or-create the guest portal token in-process (no HTTP round-trip
+    # to ourselves). Idempotent — reuses any existing unexpired token.
+    async with AsyncSessionLocal() as session:
+        try:
+            token, portal_url, is_new = await issue_guest_token_row(
+                session, reservation_id=reservation_id,
+            )
+        except Exception:
+            log.exception("Failed to issue guest_portal token for res %s", reservation_id)
+            return {"sent": False, "message": "Could not generate the portal link."}
+
+    # Auto-open the card accordion on arrival so the guest doesn't have to
+    # hunt through the page for the right section.
+    sms_portal_url = f"{portal_url}?open=card#card-section"
+
+    # portal_test_mode redirect: during pre-A2P-approval testing, every SMS
+    # gets rerouted to ERIC_CELL_NUMBER regardless of the actual guest.
+    # Belt-and-suspenders so we can't accidentally text a real guest while
+    # the A2P campaign is still under review.
+    intended_phone = phone
+    if _settings.portal_test_mode and _settings.eric_cell_number:
+        log.warning(
+            "send_card_link_via_sms: portal_test_mode ON — redirecting SMS for "
+            "reservation %s from %s to ERIC_CELL_NUMBER %s",
+            reservation_id, intended_phone, _settings.eric_cell_number,
+        )
+        phone = _settings.eric_cell_number
+
+    sms_result = await twilio_sms.send_card_link_sms(
+        phone_number=phone,
+        portal_url=sms_portal_url,
+        first_name=first_name or None,
+    )
+
+    if sms_result.get("success"):
+        log.info(
+            "send_card_link_via_sms: res=%s phone=%s token_new=%s sid=%s",
+            reservation_id, phone, is_new, sms_result.get("sid"),
+        )
+        return {
+            "sent": True,
+            "sid": sms_result.get("sid"),
+            "message": f"Card-on-file link sent to {phone}. The link stays valid through their stay.",
+            # Include the URL so Iris can also read it back verbally if the
+            # guest doesn't get the SMS in real time (helpful while A2P
+            # campaign approval is pending and deliverability is uneven).
+            "portal_url": sms_portal_url,
+        }
+
+    # SMS send failed — could be A2P-pending, an invalid number, or
+    # Twilio outage. Surface the URL so the call can still succeed by
+    # voice readback if Iris's prompt is set up to do that.
+    log.warning(
+        "send_card_link_via_sms: SMS send failed for res=%s phone=%s: %s",
+        reservation_id, phone, sms_result.get("error"),
+    )
+    return {
+        "sent": False,
+        "message": (
+            f"Could not send SMS ({sms_result.get('error', 'unknown error')}). "
+            f"The portal link itself is valid; you can read it to "
+            f"the guest: {sms_portal_url}"
+        ),
+        "portal_url": sms_portal_url,
+    }
+
+
 async def _handle_set_call_routing(args: dict, call: VapiCallObject) -> dict:
     return {"success": False, "message": "Stub — routing state DB not yet wired."}
 
@@ -253,6 +368,11 @@ async def send_door_code(request: VapiToolCallRequest) -> VapiToolCallResponse:
 @router.post("/send_payment_link")
 async def send_payment_link(request: VapiToolCallRequest) -> VapiToolCallResponse:
     return await _dispatch(request, _handle_send_payment_link)
+
+
+@router.post("/send_card_link_via_sms")
+async def send_card_link_via_sms(request: VapiToolCallRequest) -> VapiToolCallResponse:
+    return await _dispatch(request, _handle_send_card_link_via_sms)
 
 
 @router.post("/set_call_routing")

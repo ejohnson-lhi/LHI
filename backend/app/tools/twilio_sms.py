@@ -122,3 +122,17 @@ async def send_door_code_sms(phone_number: str, room_name: str, door_code: str) 
         f"Reply STOP to opt out."
     )
     return await send_sms(phone_number, body)
+
+
+async def send_card_link_sms(phone_number: str, portal_url: str, *, first_name: str | None = None) -> dict:
+    """SMS the guest a one-shot secure link to add a card to their
+    reservation. The portal page handles tokenization via Stripe.js so
+    the PAN never touches our backend. Keep the body short — A2P
+    deliverability favors brief, identifiable messages."""
+    greeting = f"Hi {first_name}," if first_name and first_name.strip() else "Hello,"
+    body = (
+        f"{greeting} Lighthouse Inn: add a card on file securely "
+        f"via this link: {portal_url}\n"
+        f"Link expires in 24 hours. Reply STOP to opt out."
+    )
+    return await send_sms(phone_number, body)

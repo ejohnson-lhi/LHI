@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Florence Lighthouse Inn — Your stay</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+       background: #f6f7f9; color: #222; margin: 0; padding: 0;
+       line-height: 1.5; }
+.hotel-header { position: sticky; top: 0; z-index: 10; background: #fff;
+                border-bottom: 1px solid #e2e8f0;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+                padding: 12px 16px; }
+.hotel-header-inner { max-width: 540px; margin: 0 auto; }
+.hotel-name { font-size: 18px; font-weight: 700; color: #0f172a; }
+.hotel-name a { color: inherit; text-decoration: none; }
+.hotel-name a:hover { text-decoration: underline; }
+.hotel-meta { font-size: 13px; color: #475569; margin-top: 2px; }
+.hotel-meta a { color: inherit; text-decoration: none; }
+.hotel-meta a[href^="tel:"] { color: #1e40af; }
+.hotel-meta a:hover { text-decoration: underline; }
+/* Welcome box: greeting + room/door-code/wifi consolidated into one section.
+   Replaces the old separate Room & door code / WiFi / Your info accordions. */
+.welcome-box { padding-top: 14px; padding-bottom: 14px; }
+.welcome-box h1 { margin: 0 0 12px; }
+.welcome-room { margin: 4px 0 12px; }
+.welcome-room .door-code-line { font-size: 15px; color: #0f172a; margin: 8px 0 0;
+                                display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.welcome-room .door-code-line .code-pill { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 20px; font-weight: 700; letter-spacing: 3px;
+    background: #f1f5f9; border-radius: 6px; padding: 4px 12px; color: #0f172a; user-select: all; }
+.welcome-room details.room-directions { background: transparent; box-shadow: none;
+    border: 1px solid #e2e8f0; border-radius: 8px; margin: 0; }
+.welcome-room details.room-directions > summary { padding: 10px 14px; font-size: 15px;
+    color: #0f172a; font-weight: 500; cursor: pointer; }
+.welcome-room details.room-directions > summary strong { font-weight: 700; }
+.welcome-room details.room-directions > summary::after { content: "\25BE"; margin-left: auto;
+    color: #94a3b8; transition: transform 0.15s ease; }
+.welcome-room details.room-directions[open] > summary::after { transform: rotate(180deg); }
+.welcome-room details.room-directions > summary { display: flex; align-items: center; gap: 8px; }
+.welcome-room details.room-directions > summary::-webkit-details-marker { display: none; }
+.welcome-room details.room-directions > summary:hover { background: #f8fafc; }
+.welcome-room details.room-directions .directions-body { padding: 4px 14px 14px; color: #334155;
+    font-size: 14px; }
+.welcome-wifi { font-size: 14px; color: #334155; margin: 12px 0 0;
+                padding-top: 12px; border-top: 1px solid #f1f5f9; }
+.welcome-wifi .wifi-creds { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                            background: #f1f5f9; border-radius: 4px; padding: 2px 8px;
+                            user-select: all; font-weight: 600; color: #0f172a; }
+/* Tiny reservation-ID line at the bottom of the welcome box. Out of the
+   way but findable if support needs the number. */
+.welcome-resid { font-size: 11px; color: #94a3b8; margin: 10px 0 0;
+                 padding-top: 8px; border-top: 1px solid #f8fafc; letter-spacing: 0.2px; }
+.wrap { max-width: 540px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 22px; margin: 0 0 8px; }
+.section { background: #fff; border-radius: 12px; padding: 18px 20px; margin: 12px 0;
+           box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+.section h2 { font-size: 16px; margin: 0 0 10px; color: #0f172a; display: flex; align-items: center; gap: 8px; }
+.section h2 .icon { font-size: 18px; }
+.section p { margin: 6px 0; color: #334155; font-size: 14px; }
+.kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; font-size: 14px; }
+.kv dt { color: #64748b; font-weight: 500; }
+.kv dd { margin: 0; color: #0f172a; }
+.wifi-creds { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              background: #f1f5f9; border-radius: 6px; padding: 6px 10px;
+              display: inline-block; user-select: all; }
+.code-display { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 28px; font-weight: 700; letter-spacing: 4px;
+                background: #f1f5f9; border-radius: 8px; padding: 10px 16px;
+                display: inline-block; color: #0f172a; user-select: all; }
+.badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 4px 10px;
+         border-radius: 999px; letter-spacing: 0.3px; text-transform: uppercase; }
+.badge.info    { background: #dbeafe; color: #1e40af; }
+.badge.primary { background: #dcfce7; color: #166534; }
+.badge.warn    { background: #fef3c7; color: #92400e; }
+.badge.muted   { background: #e2e8f0; color: #475569; }
+.badge.ok      { background: #dcfce7; color: #166534; }
+.headline { font-size: 18px; font-weight: 600; color: #0f172a; margin: 12px 0 6px; }
+.countdown { font-size: 14px; color: #1e40af; font-weight: 600; margin-top: 4px; }
+.countdown.muted { color: #64748b; font-weight: 500; }
+/* Native <details>/<summary> accordion. No JS. */
+details.accord { background: #fff; border-radius: 12px; margin: 10px 0;
+                 box-shadow: 0 1px 3px rgba(0,0,0,0.06); overflow: hidden; }
+details.accord > summary { list-style: none; cursor: pointer; padding: 14px 20px;
+                           font-weight: 600; color: #0f172a; font-size: 15px;
+                           display: flex; align-items: center; gap: 10px; }
+details.accord > summary::-webkit-details-marker { display: none; }
+details.accord > summary .accord-title { flex: 1; }
+details.accord > summary .accord-check { color: #16a34a; font-weight: 700;
+                                          font-size: 16px; display: none; }
+details.accord.complete > summary .accord-check { display: inline-block; }
+details.accord > summary::after { content: "\25BE"; margin-left: 4px; color: #94a3b8;
+                                  transition: transform 0.15s ease; }
+details.accord[open] > summary::after { transform: rotate(180deg); }
+details.accord > summary:hover { background: #f8fafc; }
+.accord-body { padding: 4px 20px 18px; color: #334155; font-size: 14px; }
+.accord-body p { margin: 6px 0; }
+.accord-body .hint { color: #64748b; font-style: italic; }
+.coming-soon ul { margin: 4px 0 0; padding-left: 20px; color: #64748b; }
+.coming-soon li { margin: 4px 0; }
+.gated-prompt { background: #fef3c7; border-left: 3px solid #f59e0b;
+                padding: 10px 14px; border-radius: 6px; margin: 6px 0;
+                color: #78350f; font-size: 14px; }
+.saved-banner { background: #dcfce7; border-left: 3px solid #16a34a;
+                padding: 10px 14px; border-radius: 6px; margin: 0 0 12px;
+                color: #14532d; font-size: 14px; font-weight: 500; }
+form.contact label { display: block; font-size: 13px; font-weight: 500;
+                     color: #475569; margin: 10px 0 4px; }
+form.contact input[type="text"],
+form.contact input[type="tel"],
+form.contact input[type="email"] {
+    width: 100%; padding: 9px 11px; font-size: 15px;
+    border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box;
+}
+/* Browser-native validation: a non-empty tel/email that doesn't match its
+   pattern (or type=email format) renders red. Empty optional fields stay
+   :valid -- pattern only fires when there's a value. */
+form.contact input[type="tel"]:invalid,
+form.contact input[type="email"]:invalid,
+form.contact input.server-invalid {
+    border-color: #ef4444; background: #fef2f2;
+}
+form.contact .row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 8px; }
+form.contact .row label { grid-column: span 1; }
+form.contact .consent-block { background: #f8fafc; border-radius: 8px;
+                              padding: 12px 14px; margin-top: 14px;
+                              font-size: 13px; color: #334155; }
+form.contact .consent-block label { display: flex; gap: 8px; align-items: flex-start;
+                                    cursor: pointer; margin: 0; font-weight: 500;
+                                    color: #0f172a; font-size: 14px; }
+form.contact .consent-block input[type="checkbox"] { margin-top: 3px; }
+form.contact .consent-fine { color: #64748b; margin-top: 6px; font-size: 12px;
+                             line-height: 1.45; }
+form.contact button { margin-top: 14px; width: 100%; padding: 12px;
+                      background: #2563eb; color: white; border: 0;
+                      border-radius: 6px; font-size: 15px; font-weight: 600;
+                      cursor: pointer; }
+form.contact button:hover { background: #1d4ed8; }
+form.contact.pet label.pet-choice { display: flex; align-items: center;
+    gap: 10px; margin: 8px 0; padding: 10px 12px; cursor: pointer;
+    font-weight: 500; color: #0f172a; font-size: 14px;
+    border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; }
+form.contact.pet label.pet-choice:hover { background: #f8fafc; }
+form.contact.pet label.pet-choice em { color: #64748b; font-style: normal; }
+form.contact.sign .agreement-text { font-size: 13px; color: #334155;
+    background: #f8fafc; border-radius: 8px; padding: 12px 14px;
+    max-height: 240px; overflow-y: auto; white-space: pre-wrap;
+    border: 1px solid #e2e8f0; margin: 8px 0 14px; }
+form.contact.sign .sig-wrap { position: relative; border: 1px solid #cbd5e1;
+    border-radius: 8px; background: #fff; }
+form.contact.sign canvas.sig-pad { display: block; width: 100%;
+    height: 160px; touch-action: none; cursor: crosshair;
+    border-radius: 8px; }
+form.contact.sign .sig-clear { position: absolute; top: 6px; right: 6px;
+    background: #fff; border: 1px solid #cbd5e1; color: #475569;
+    font-size: 12px; padding: 4px 10px; border-radius: 6px;
+    cursor: pointer; }
+form.contact.sign .sig-clear:hover { background: #f1f5f9; }
+form.contact.sign .sig-hint { font-size: 12px; color: #94a3b8;
+    margin-top: 4px; }
+.signed-summary { background: #f0fdf4; border-left: 3px solid #16a34a;
+    border-radius: 8px; padding: 12px 14px; color: #14532d; font-size: 14px; }
+.signed-summary p { margin: 4px 0; }
+.signed-summary .label { color: #16a34a; font-weight: 700;
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+.card-list { margin: 6px 0 14px; }
+.card-row { display: flex; align-items: center; gap: 10px;
+    border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 14px;
+    margin: 6px 0; background: #fff; font-size: 14px; }
+.card-row.virtual { border-color: #fbbf24; background: #fffbeb; }
+.card-brand { font-weight: 600; color: #0f172a; min-width: 70px; }
+.card-last4 { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #475569; letter-spacing: 1px; }
+.card-tag { margin-left: auto; font-size: 12px; padding: 2px 8px;
+    border-radius: 999px; font-weight: 600; }
+.card-tag.ok { background: #dcfce7; color: #166534; }
+.card-tag.warn { background: #fef3c7; color: #92400e; }
+.card-info { font-size: 13px; color: #475569; margin: 6px 0 10px; }
+#stripe-card-element { padding: 11px 12px; border: 1px solid #cbd5e1;
+    border-radius: 6px; background: #fff; }
+#stripe-card-error { color: #b91c1c; font-size: 13px; min-height: 18px;
+    margin-top: 6px; }
+.add-card-btn { display: inline-block; padding: 12px 22px;
+    background: #2563eb; color: white; border-radius: 6px;
+    font-size: 15px; font-weight: 600; text-decoration: none;
+    margin-top: 6px; cursor: pointer; }
+.add-card-btn:hover { background: #1d4ed8; }
+.card-link-frame { width: 100%; height: 700px; border: 1px solid #cbd5e1;
+    border-radius: 8px; margin-top: 16px; background: #fff; }
+.card-link-fallback { background: #fef3c7; border-left: 3px solid #f59e0b;
+    border-radius: 6px; padding: 12px 14px; margin-top: 16px;
+    color: #78350f; font-size: 14px; }
+.card-link-loading { padding: 40px 20px; text-align: center; color: #64748b; }
+.card-link-loading .spinner {
+    display: inline-block; width: 32px; height: 32px;
+    border: 3px solid #e2e8f0; border-top-color: #2563eb;
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin-bottom: 10px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+/* Inline checkout button -- rendered in the status section on
+   departing_today, not as a standalone accordion. */
+.checkout-action { margin: 14px 0 6px; }
+.checkout-btn { display: inline-block; padding: 12px 22px; background: #16a34a;
+    color: white; border: 0; border-radius: 6px; font-size: 15px;
+    font-weight: 600; cursor: pointer; }
+.checkout-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.checkout-btn:hover:not(:disabled) { background: #15803d; }
+.checkout-action .hint { color: #64748b; font-size: 12px; margin-top: 6px; }
+/* Room preferences -- two-zone drag-and-drop. Sortable.js handles the
+   actual dragging; this just styles the zones + cards. */
+.prefs-intro { color: #475569; font-size: 13px; margin: 4px 0 12px; }
+.prefs-zones { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.prefs-zone { background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 10px; padding: 12px 12px 14px; }
+.prefs-zone h3 { margin: 0 0 8px; font-size: 13px; font-weight: 700;
+    color: #334155; text-transform: uppercase; letter-spacing: 0.5px; }
+.prefs-zone.matters h3 { color: #0f172a; }
+.prefs-zone.matters { background: #ecfeff; border-color: #a5f3fc; }
+.prefs-list { list-style: none; margin: 0; padding: 0; min-height: 36px; }
+.prefs-list:empty::after { content: attr(data-empty); display: block;
+    color: #94a3b8; font-style: italic; font-size: 13px;
+    padding: 8px 6px; }
+.pref-item { display: flex; align-items: center; gap: 10px;
+    background: #fff; border: 1px solid #cbd5e1; border-radius: 8px;
+    padding: 9px 12px; margin: 6px 0; cursor: grab;
+    user-select: none; -webkit-user-select: none; touch-action: none; }
+.pref-item:active { cursor: grabbing; }
+.pref-handle { color: #94a3b8; font-size: 16px; line-height: 1;
+    font-weight: 700; flex-shrink: 0; }
+.pref-label { color: #0f172a; font-size: 14px; font-weight: 600; }
+.pref-label small { display: block; color: #64748b; font-size: 12px;
+    font-weight: 400; margin-top: 2px; }
+.pref-priority { background: #06b6d4; color: #fff; font-size: 11px;
+    font-weight: 700; min-width: 22px; height: 22px; border-radius: 999px;
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-left: auto; flex-shrink: 0; padding: 0 6px; }
+.sortable-ghost { opacity: 0.45; }
+.sortable-drag { box-shadow: 0 6px 18px rgba(0,0,0,0.15); }
+.prefs-form button { margin-top: 14px; width: 100%; padding: 12px;
+    background: #2563eb; color: white; border: 0; border-radius: 6px;
+    font-size: 15px; font-weight: 600; cursor: pointer; }
+.prefs-form button:hover { background: #1d4ed8; }
+.prefs-locked-note { font-size: 13px; color: #64748b; font-style: italic;
+    margin: 8px 0 12px; }
+.prefs-readonly-list { margin: 0; padding-left: 22px; color: #0f172a;
+    font-size: 14px; }
+.prefs-readonly-list li { margin: 4px 0; }
+.prefs-readonly-empty { color: #94a3b8; font-style: italic; font-size: 13px; }
+/* FAQ + Ask Iris -- live-matching text input, expandable matches, LLM fallback. */
+.faq-intro { color: #475569; font-size: 13px; margin: 4px 0 10px; }
+.faq-search { width: 100%; padding: 10px 12px; font-size: 15px;
+    border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box;
+    background: #fff; }
+.faq-search:focus { outline: 2px solid #06b6d4; outline-offset: -1px; }
+.faq-status { font-size: 12px; color: #64748b; margin: 4px 2px 8px;
+    min-height: 16px; }
+.faq-results { margin: 0; padding: 0; list-style: none; }
+.faq-result { background: #fff; border: 1px solid #e2e8f0;
+    border-radius: 8px; margin: 6px 0; }
+.faq-result summary { padding: 10px 14px; cursor: pointer;
+    font-size: 14px; font-weight: 600; color: #0f172a;
+    display: flex; align-items: center; gap: 8px;
+    list-style: none; }
+.faq-result summary::-webkit-details-marker { display: none; }
+.faq-result summary::after { content: "\25BE"; margin-left: auto;
+    color: #94a3b8; transition: transform 0.15s ease; }
+.faq-result[open] summary::after { transform: rotate(180deg); }
+.faq-result summary:hover { background: #f8fafc; }
+.faq-answer { padding: 4px 14px 14px; color: #334155; font-size: 14px;
+    line-height: 1.5; white-space: pre-wrap; }
+.faq-no-match { color: #64748b; font-size: 13px; margin: 8px 2px;
+    font-style: italic; }
+.faq-ask-iris-btn { display: none; padding: 11px 18px; margin-top: 6px;
+    background: #06b6d4; color: white; border: 0; border-radius: 6px;
+    font-size: 14px; font-weight: 600; cursor: pointer; }
+.faq-ask-iris-btn:hover { background: #0891b2; }
+.faq-ask-iris-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.faq-ask-iris-pending { color: #64748b; font-size: 13px;
+    font-style: italic; margin: 8px 2px; display: none; }
+.faq-iris-response { display: none; margin-top: 12px; padding: 14px 16px;
+    background: #ecfeff; border: 1px solid #a5f3fc; border-radius: 10px; }
+.faq-iris-response .iris-label { font-size: 11px; font-weight: 700;
+    color: #0891b2; text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 6px; }
+.faq-iris-response .iris-answer { color: #0f172a; font-size: 14px;
+    line-height: 1.55; white-space: pre-wrap; }
+.faq-iris-response .iris-meta { font-size: 11px; color: #64748b;
+    margin-top: 8px; }
+.faq-blocked { color: #92400e; background: #fef3c7;
+    border: 1px solid #fcd34d; border-radius: 8px;
+    padding: 10px 14px; font-size: 13px; }
+.footer { text-align: center; color: #94a3b8; font-size: 12px; margin: 20px 0 8px; }
+.footer a { color: #64748b; }
+</style>
+</head>
+<body><div class="hotel-header"><div class="hotel-header-inner"><div class="hotel-name"><a href="https://www.google.com/maps/search/?api=1&query=Florence+Lighthouse+Inn+155+Hwy+101%2C+Florence+OR+97439" target="_blank" rel="noopener">Florence Lighthouse Inn</a></div><div class="hotel-meta"><a href="https://www.google.com/maps/search/?api=1&query=Florence+Lighthouse+Inn+155+Hwy+101%2C+Florence+OR+97439" target="_blank" rel="noopener">155 Hwy 101, Florence OR 97439</a></div><div class="hotel-meta"><a href="tel:+15419973221">541-997-3221</a></div></div></div><div class="wrap">
+<div class="section welcome-box">
+    <h1>Hi Jane Mariner!</h1>
+    <div class="welcome-room">
+        <div class="gated-prompt">Please sign the rental agreement and add a credit card below. Once both are complete, your room number and door code will appear here.</div>
+    </div>
+    <div class="welcome-wifi">
+        Wi-Fi: <span class="wifi-creds">lighthouseinn</span>
+        &nbsp;·&nbsp; <span class="wifi-creds">happyguest</span>
+    </div>
+    <div class="welcome-resid">Reservation 7952184200254</div>
+</div>
+
+<div class="section">
+    <span class="badge info">Upcoming</span>
+    <div class="headline">We look forward to seeing you on Sat, May 30.</div>
+    <p>Return any time before your stay to confirm your info, sign the rental agreement, and add an incidentals card.</p>
+    <dl class="kv">
+        <dt>Arriving</dt><dd>Sat, May 30</dd>
+        <dt>Departing</dt><dd>Tue, Jun 2</dd>
+    </dl>
+    <div class="countdown">Arriving in 3 days</div>
+</div>
+
+<details class="accord " id="contact-section" open>
+    <summary>
+        <span class="accord-title">📋 Confirm address &amp; phone</span>
+        <span class="accord-check" aria-label="completed">✓</span>
+    </summary>
+    <div class="accord-body">
+<form class="contact" method="post" action="/g/SAMPLETOKEN/contact" novalidate>
+    <label for="address1">Street address</label>
+    <input type="text" id="address1" name="address1" value="812 SW Coastal Way" autocomplete="address-line1" />
+
+    <label for="address2">Apt / suite (optional)</label>
+    <input type="text" id="address2" name="address2" value="" autocomplete="address-line2" />
+
+    <div class="row">
+        <div>
+            <label for="city">City</label>
+            <input type="text" id="city" name="city" value="Portland" autocomplete="address-level2" />
+        </div>
+        <div>
+            <label for="state">State / Region</label>
+            <input type="text" id="state" name="state" value="OR" autocomplete="address-level1" />
+        </div>
+        <div>
+            <label for="zip_code">ZIP / Postal</label>
+            <input type="text" id="zip_code" name="zip_code" value="97205" autocomplete="postal-code" />
+        </div>
+    </div>
+
+    <label for="country">Country</label>
+    <input type="text" id="country" name="country" value="US" autocomplete="country" />
+
+    <label for="cell_phone">Cell phone (for texts)</label>
+    <input type="tel" id="cell_phone" name="cell_phone" value="(503)-555-1234"
+           class=""
+           autocomplete="tel" inputmode="tel"
+           pattern="[\+\d\s\(\)\-\.]{7,}"
+           title="At least 7 digits, e.g. (541)-555-7890 or +44 7911 123 456" />
+
+    <label for="phone">Other phone (optional)</label>
+    <input type="tel" id="phone" name="phone" value="(503)-555-1234"
+           class=""
+           autocomplete="tel" inputmode="tel"
+           pattern="[\+\d\s\(\)\-\.]{7,}"
+           title="At least 7 digits, e.g. (541)-555-7890 or +44 7911 123 456" />
+
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" value="jane.mariner@example.com" autocomplete="email" />
+
+    <div class="consent-block">
+        <label for="sms_consent">
+            <input type="checkbox" id="sms_consent" name="sms_consent" value="yes"  />
+            <span>This phone can receive text messages, and I agree to receive booking-related texts from Lighthouse Inn (reservation reminders, door codes, check-out prompts). Message frequency varies. Reply STOP at any time to opt out. Reply HELP for help. Message and data rates may apply.</span>
+        </label>
+        <p class="consent-fine">Consent is not a condition of any purchase. Texts go to the cell phone above.</p>
+    </div>
+
+    <button type="submit">Save</button>
+</form>
+</div>
+</details>
+
+<details class="accord " id="sign-section" open>
+    <summary>
+        <span class="accord-title">✍️ Sign the rental agreement</span>
+        <span class="accord-check" aria-label="completed">✓</span>
+    </summary>
+    <div class="accord-body">
+<form class="contact sign" method="post" action="/g/SAMPLETOKEN/sign" novalidate>
+    <div class="agreement-text">Welcome to the Florence Lighthouse Inn. By signing below, I agree to the following:
+
+Smoking &amp; odors. Please don't smoke in your room -- not everyone wants to get high at the same time you do! A smoking area is at the south end of the building. I agree to pay for smoking, vaping, and cannabis damages, missing items, and pet-policy penalties. I understand a fee of $150 or more will be assessed if there has been smoking, odors, cats in the room, or other damage.
+
+Pets. I won't leave my pet unattended in the room and will respect quiet hours.
+
+Towels &amp; cleanliness. Please don't use the white towels or cloths to clean mud or dirt from shoes, pets, the floor, or your ride. Florence is sandy -- please don't put towels on the floor. Use the towel racks instead.
+
+Fees &amp; charges. I understand a fee will be charged for arriving late, leaving a day early, staying past check-out time (11:00 AM), and any after-hours interactions, and that the final amount is charged based on inspection. Current fee amounts are available from the front desk. If room keys are not returned to the front desk, a $250 fee will be charged. A hold may be placed on the method of payment to cover incidental costs and damages.
+
+Hours &amp; service. While we can answer the phone 24/7, we prefer that you call between 8:00 AM and 8:00 PM. Stay-over service (fresh towels, bed straightening) is available on request.
+
+Thank you for choosing the Florence Lighthouse Inn. We hope you have a pleasant stay.</div>
+
+    <label for="typed_name">Type your name</label>
+    <input type="text" id="typed_name" name="typed_name" value="Jane Mariner"
+           autocomplete="name" />
+
+    <label>Sign below (use your finger or mouse)</label>
+    <div class="sig-wrap">
+        <canvas id="sigPad" class="sig-pad" width="600" height="160"></canvas>
+        <button type="button" class="sig-clear" onclick="window.__sigPad_clear()">Clear</button>
+    </div>
+    <div class="sig-hint">Your signature stays on file as a PDF attached to your reservation.</div>
+
+    <input type="hidden" name="signature_png" id="signaturePng" value="" />
+    <button type="submit" onclick="return window.__sigPad_submit(this.form)">I agree &mdash; sign</button>
+</form>
+<script>
+(function() {
+  const cvs = document.getElementById('sigPad'); if (!cvs) return;
+  const ctx = cvs.getContext('2d');
+  // Match the canvas's internal pixel buffer to the rendered size so strokes
+  // don't ghost or stretch. Re-run on resize for responsive layouts.
+  function fitCanvas() {
+    const r = cvs.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    cvs.width  = Math.floor(r.width  * dpr);
+    cvs.height = Math.floor(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.strokeStyle = '#0f172a';
+  }
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+  let drawing = false, dirty = false;
+  function ptFromEvent(ev) {
+    const r = cvs.getBoundingClientRect();
+    const p = ev.touches ? ev.touches[0] : ev;
+    return {x: p.clientX - r.left, y: p.clientY - r.top};
+  }
+  function down(ev) { ev.preventDefault(); drawing = true; const p = ptFromEvent(ev); ctx.beginPath(); ctx.moveTo(p.x, p.y); }
+  function move(ev) { if (!drawing) return; ev.preventDefault(); const p = ptFromEvent(ev); ctx.lineTo(p.x, p.y); ctx.stroke(); dirty = true; }
+  function up(ev) { drawing = false; }
+  cvs.addEventListener('mousedown', down);
+  cvs.addEventListener('mousemove', move);
+  cvs.addEventListener('mouseup', up);
+  cvs.addEventListener('mouseleave', up);
+  cvs.addEventListener('touchstart', down, {passive: false});
+  cvs.addEventListener('touchmove', move, {passive: false});
+  cvs.addEventListener('touchend', up);
+  window.__sigPad_clear = function() {
+    ctx.clearRect(0, 0, cvs.width, cvs.height); dirty = false;
+    document.getElementById('signaturePng').value = '';
+  };
+  window.__sigPad_submit = function(form) {
+    if (!dirty) { alert('Please draw your signature in the box first.'); return false; }
+    const data = cvs.toDataURL('image/png');
+    document.getElementById('signaturePng').value = data;
+    return true;
+  };
+})();
+</script>
+</div>
+</details>
+
+<details class="accord " id="card-section" open>
+    <summary>
+        <span class="accord-title">💳 Credit card on file</span>
+        <span class="accord-check" aria-label="completed">✓</span>
+    </summary>
+    <div class="accord-body"><p class="card-info">No card on file yet. Please add one below for incidentals. Cards are charged on the morning of your scheduled arrival.</p>
+<form id="card-form" novalidate>
+    <label for="cardholder-name" style="display:block;font-size:13px;font-weight:500;color:#475569;margin:10px 0 4px;">Cardholder name</label>
+    <input type="text" id="cardholder-name" autocomplete="cc-name"
+           value="Jane Mariner" placeholder="As shown on the card"
+           style="width:100%;padding:9px 11px;font-size:15px;border:1px solid #cbd5e1;border-radius:6px;box-sizing:border-box;" />
+    <label style="display:block;font-size:13px;font-weight:500;color:#475569;margin:10px 0 4px;">Card details</label>
+    <div id="stripe-card-element"></div>
+    <div id="stripe-card-error" role="alert"></div>
+    <button id="card-submit-btn" type="submit" class="add-card-btn"
+            style="border:0;width:100%;margin-top:12px;">Add card to reservation</button>
+</form>
+<p class="card-info" style="margin-top:8px;font-size:12px;">
+    Your card details go directly to our payment processor. We never see or
+    store the card number ourselves.
+</p>
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+(function() {
+    const PK = "pk_live_51GxYvfCkb5UaC5yLKjotmnTBp7MYbmiTqeNvDluaevZJ7xSsbL7RC4f3ZQdglMa9IVY6iPkpfDCdSJGrgdiyvuRo00jZpsTHkv";
+    const ACTION_URL = "/g/SAMPLETOKEN/cards";
+    const RELOAD_URL = "/g/SAMPLETOKEN?saved=card#card-section";
+    const stripe = Stripe(PK);
+    const elements = stripe.elements();
+    const cardElement = elements.create('card', {
+        style: {
+            base: {
+                fontFamily: '"Segoe UI", system-ui, sans-serif',
+                fontSize: '15px',
+                color: '#0f172a',
+                '::placeholder': { color: '#94a3b8' },
+            },
+        },
+    });
+    cardElement.mount('#stripe-card-element');
+    const errEl = document.getElementById('stripe-card-error');
+    cardElement.on('change', function(ev) {
+        errEl.textContent = ev.error ? ev.error.message : '';
+    });
+    const form = document.getElementById('card-form');
+    const btn = document.getElementById('card-submit-btn');
+    const nameInput = document.getElementById('cardholder-name');
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const name = (nameInput.value || '').trim();
+        if (!name) {
+            errEl.textContent = 'Please enter the cardholder name.';
+            return;
+        }
+        btn.disabled = true;
+        const oldLabel = btn.textContent;
+        btn.textContent = 'Adding card...';
+        errEl.textContent = '';
+        try {
+            const tk = await stripe.createToken(cardElement, { name });
+            if (tk.error) {
+                errEl.textContent = tk.error.message || 'Could not tokenize the card.';
+                return;
+            }
+            const resp = await fetch(ACTION_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    token_id: tk.token.id,
+                    token_card: tk.token.card,
+                }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok && data.success) {
+                window.location.href = RELOAD_URL;
+                return;
+            }
+            errEl.textContent = data.error || data.detail
+                || 'We could not save the card. Please try again.';
+        } catch (ex) {
+            errEl.textContent = 'Network error: ' + (ex && ex.message ? ex.message : ex);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = oldLabel;
+        }
+    });
+})();
+</script>
+</div>
+</details>
+
+<details class="accord " id="pet-section" >
+    <summary>
+        <span class="accord-title">🐕 Bringing a pet?</span>
+        <span class="accord-check" aria-label="completed">✓</span>
+    </summary>
+    <div class="accord-body">
+<form class="contact pet" method="post" action="/g/SAMPLETOKEN/pets" novalidate>
+    <p class="hint">Cats are not allowed at the Lighthouse Inn.</p>
+    <label class="pet-choice">
+        <input type="checkbox" name="dog_count" value="1"  />
+        <span>Yes, I'm bringing a dog(s). <em>($20 dog fee for up to a week)</em></span>
+    </label>
+    <button type="submit">Save</button>
+</form>
+</div>
+</details>
+
+<details class="accord " id="prefs-section" >
+    <summary>
+        <span class="accord-title">🛏️ Room preferences</span>
+        <span class="accord-check" aria-label="completed">✓</span>
+    </summary>
+    <div class="accord-body">
+<p class="prefs-intro">Drag the things you care about into <strong>Matters to me</strong> in priority order — top of the list is most important. Anything in <strong>No preference</strong> we treat as a don't-care. Not guaranteed, but we use this when we assign rooms on the morning of arrival.</p>
+<p class="prefs-locked-note">Heads up: preferences lock once you've checked in.</p>
+<form class="prefs-form" method="post" action="/g/SAMPLETOKEN/preferences" novalidate>
+    <div class="prefs-zones">
+        <div class="prefs-zone matters">
+            <h3>Matters to me (in priority order)</h3>
+            <ul id="prefs-matters" class="prefs-list" data-empty="Drag preferences here.">
+                
+            </ul>
+        </div>
+        <div class="prefs-zone nopref">
+            <h3>No preference</h3>
+            <ul id="prefs-nopref" class="prefs-list" data-empty="(nothing here)">
+                <li class="pref-item" data-key="outside_door"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">Outside door</span></li>
+<li class="pref-item" data-key="carpeted"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">Carpeted</span></li>
+<li class="pref-item" data-key="no_carpet"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">No carpet<small>Hard floors — for allergies</small></span></li>
+<li class="pref-item" data-key="bath_tub"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">Bath tub</span></li>
+<li class="pref-item" data-key="no_stairs"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">No stairs<small>Step-free access</small></span></li>
+<li class="pref-item" data-key="front_side"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">Front side</span></li>
+<li class="pref-item" data-key="back_side"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">Back side</span></li>
+<li class="pref-item" data-key="top_floor"><span class="pref-handle" aria-hidden="true">≡</span><span class="pref-label">Top floor</span></li>
+            </ul>
+        </div>
+    </div>
+    <input type="hidden" name="prefs_json" id="prefs-json-input" value="[]" />
+    <button type="submit">Save preferences</button>
+</form>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+<script>
+(function() {
+    const matters = document.getElementById('prefs-matters');
+    const nopref = document.getElementById('prefs-nopref');
+    if (!matters || !nopref || typeof Sortable === 'undefined') return;
+    function refreshPriorities() {
+        // Recompute the 1..N priority pill on each "matters" item after
+        // any reorder. Removes the pill from anything in "no preference".
+        Array.from(matters.children).forEach(function(li, i) {
+            let pill = li.querySelector('.pref-priority');
+            if (!pill) {
+                pill = document.createElement('span');
+                pill.className = 'pref-priority';
+                li.appendChild(pill);
+            }
+            pill.textContent = (i + 1).toString();
+            pill.setAttribute('aria-label', 'priority ' + (i + 1));
+        });
+        Array.from(nopref.children).forEach(function(li) {
+            const pill = li.querySelector('.pref-priority');
+            if (pill) pill.remove();
+        });
+    }
+    const opts = { group: 'prefs', animation: 150, onSort: refreshPriorities };
+    Sortable.create(matters, opts);
+    Sortable.create(nopref, opts);
+    refreshPriorities();
+    document.querySelector('.prefs-form').addEventListener('submit', function() {
+        const keys = Array.from(matters.children)
+            .map(function(li) { return li.dataset.key || ''; })
+            .filter(Boolean);
+        document.getElementById('prefs-json-input').value = JSON.stringify(keys);
+    });
+})();
+</script>
+</div>
+</details>
+
+<details class="accord " id="faq-section" >
+    <summary>
+        <span class="accord-title">❓ FAQ &amp; Ask Iris</span>
+        <span class="accord-check" aria-label="completed">✓</span>
+    </summary>
+    <div class="accord-body">
+<p class="faq-intro">Ask anything about the hotel, the area, or your stay. Start typing and we'll try to find the answer below.</p>
+<input type="text" id="faq-search" class="faq-search"
+       placeholder="Type a question..." autocomplete="off"
+       aria-label="Ask a question" />
+<div id="faq-status" class="faq-status" aria-live="polite"></div>
+<ul id="faq-results" class="faq-results"></ul>
+<p id="faq-no-match" class="faq-no-match" style="display:none">
+    No FAQ entry matched your question.
+</p>
+<p id="faq-ask-iris-pending" class="faq-ask-iris-pending"></p>
+<button type="button" id="faq-ask-iris-btn" class="faq-ask-iris-btn">
+    Ask Iris (longer answer)
+</button>
+<div id="faq-blocked" class="faq-blocked" style="display:none"></div>
+<div id="faq-iris-response" class="faq-iris-response" role="status" aria-live="polite">
+    <div class="iris-label">Iris</div>
+    <div class="iris-answer"></div>
+    <div class="iris-meta"></div>
+</div>
+<script>
+(function() {
+    const MATCH_URL = "/g/SAMPLETOKEN/faq-match";
+    const ASK_URL = "/g/SAMPLETOKEN/ask-iris";
+    const LOG_TAP_URL = "/g/SAMPLETOKEN/log-faq-tap";
+    const input = document.getElementById('faq-search');
+    const status = document.getElementById('faq-status');
+    const results = document.getElementById('faq-results');
+    const noMatch = document.getElementById('faq-no-match');
+    const askBtn = document.getElementById('faq-ask-iris-btn');
+    const askPending = document.getElementById('faq-ask-iris-pending');
+    const blocked = document.getElementById('faq-blocked');
+    const respBox = document.getElementById('faq-iris-response');
+    const respAnswer = respBox.querySelector('.iris-answer');
+    const respMeta = respBox.querySelector('.iris-meta');
+    if (!input) return;
+
+    let debounceTimer = null;
+    let askButtonTimer = null;
+    let currentQuestion = '';
+    let currentState = null;  // last throttle state from server
+
+    function escapeHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function clearResults() {
+        results.innerHTML = '';
+        noMatch.style.display = 'none';
+        askBtn.style.display = 'none';
+        askPending.style.display = 'none';
+        blocked.style.display = 'none';
+        if (askButtonTimer) { clearTimeout(askButtonTimer); askButtonTimer = null; }
+    }
+
+    // Track which (question, slug) pairs we've already logged. Without
+    // this, every accordion open/close fires the toggle event again --
+    // we don't want to double-log a guest who closes and re-opens the
+    // same entry.
+    const tappedThisSession = new Set();
+
+    function renderMatches(matches) {
+        results.innerHTML = matches.map(function(m) {
+            return '<li><details class="faq-result" data-slug="' + escapeHtml(m.slug) + '">'
+                + '<summary>' + escapeHtml(m.question) + '</summary>'
+                + '<div class="faq-answer">' + escapeHtml(m.answer) + '</div>'
+                + '</details></li>';
+        }).join('');
+        // Bind a single `toggle` listener per <details>. Fires every
+        // open AND close, so we filter inside.
+        Array.from(results.querySelectorAll('details.faq-result')).forEach(function(d) {
+            d.addEventListener('toggle', function() {
+                if (!d.open) return;
+                const slug = d.getAttribute('data-slug') || '';
+                if (!slug || !currentQuestion) return;
+                const tapKey = currentQuestion + '|' + slug;
+                if (tappedThisSession.has(tapKey)) return;
+                tappedThisSession.add(tapKey);
+                // Fire-and-forget. Logging failures shouldn't disrupt
+                // the guest's UX; we'll lose the data point and move on.
+                fetch(LOG_TAP_URL, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question: currentQuestion, slug: slug }),
+                }).catch(function() { /* swallow */ });
+            });
+        });
+    }
+
+    function showAskIris(state) {
+        if (!currentQuestion || currentQuestion.length < 3) {
+            // Don't offer the LLM for trivially short input -- avoids
+            // accidental quota burn.
+            return;
+        }
+        if (state.blocked) {
+            blocked.textContent = state.blocked_message || 'Daily question limit reached.';
+            blocked.style.display = '';
+            return;
+        }
+        const delay = Math.max(0, state.delay_seconds || 0);
+        if (delay > 0) {
+            askPending.textContent = 'Iris is preparing... (' + delay + 's)';
+            askPending.style.display = '';
+            let remaining = delay;
+            askButtonTimer = setInterval(function() {
+                remaining--;
+                if (remaining <= 0) {
+                    clearInterval(askButtonTimer); askButtonTimer = null;
+                    askPending.style.display = 'none';
+                    askBtn.style.display = '';
+                } else {
+                    askPending.textContent = 'Iris is preparing... (' + remaining + 's)';
+                }
+            }, 1000);
+        } else {
+            askBtn.style.display = '';
+        }
+        const remaining_count = (state.daily_limit || 0) - (state.used_today || 0);
+        if (remaining_count > 0 && remaining_count <= 5) {
+            askBtn.textContent = 'Ask Iris (longer answer) - ' + remaining_count + ' left today';
+        } else {
+            askBtn.textContent = 'Ask Iris (longer answer)';
+        }
+    }
+
+    async function fetchMatches(q) {
+        currentQuestion = q;
+        clearResults();
+        if (!q || q.length < 2) {
+            status.textContent = '';
+            return;
+        }
+        status.textContent = 'Searching...';
+        try {
+            const resp = await fetch(MATCH_URL + '?q=' + encodeURIComponent(q), {
+                method: 'GET', credentials: 'same-origin',
+            });
+            const data = await resp.json().catch(function() { return {}; });
+            currentState = data.throttle || {};
+            status.textContent = '';
+            if (data.matches && data.matches.length > 0) {
+                renderMatches(data.matches);
+            } else {
+                noMatch.style.display = '';
+                showAskIris(currentState);
+            }
+        } catch (ex) {
+            status.textContent = 'Search failed: ' + (ex && ex.message || ex);
+        }
+    }
+
+    input.addEventListener('input', function() {
+        const q = input.value.trim();
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(function() { fetchMatches(q); }, 300);
+    });
+
+    askBtn.addEventListener('click', async function() {
+        if (!currentQuestion) return;
+        askBtn.disabled = true;
+        askBtn.textContent = 'Asking Iris...';
+        respBox.style.display = 'none';
+        try {
+            const resp = await fetch(ASK_URL, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: currentQuestion }),
+            });
+            const data = await resp.json().catch(function() { return {}; });
+            if (data.answer) {
+                respAnswer.textContent = data.answer;
+                respMeta.textContent = data.web_search_used
+                    ? '(answer used a web search for current info)'
+                    : '';
+                respBox.style.display = '';
+            } else if (data.error) {
+                respAnswer.textContent = 'I could not reach the LLM right now. Please call the front desk at 541-997-3221.';
+                respMeta.textContent = '';
+                respBox.style.display = '';
+            }
+            if (data.throttle) {
+                currentState = data.throttle;
+                if (currentState.blocked) {
+                    askBtn.style.display = 'none';
+                    blocked.textContent = currentState.blocked_message || '';
+                    blocked.style.display = '';
+                }
+            }
+        } catch (ex) {
+            respAnswer.textContent = 'Network error: ' + (ex && ex.message || ex);
+            respMeta.textContent = '';
+            respBox.style.display = '';
+        } finally {
+            askBtn.disabled = false;
+            askBtn.textContent = 'Ask Iris (longer answer)';
+        }
+    });
+})();
+</script>
+</div>
+</details>
+
+<details class="accord">
+    <summary>❌ Cancel reservation</summary>
+    <div class="accord-body">
+        <p class="hint">Coming soon — view the refund policy and confirm cancellation.</p>
+    </div>
+</details>
+
+<div class="footer">
+    Need help? Call <a href="tel:+15419973221">541-997-3221</a>.<br/>
+    Reply STOP to any of our texts to opt out.
+</div>
+</div></body>
+</html>

@@ -88,6 +88,8 @@ Voice/persona reference (for translating admin requests):
 - voice `aoede` ↔ persona Aoede (female, lighter)
 - voice `eric` ↔ persona Eric (male, lighter)
 
+**DTMF mute test**: When the admin says "Run the DTMF mute test for [N] seconds" or just "Run the DTMF mute test", call `admin_dtmf_mute_test` with `duration_seconds` (default 20, clamped to 5–60). The tool mutes the admin's audio track via the LiveKit admin API for the duration and logs every DTMF event that fires while muted. Before invoking, say one short line: "Okay, muting your audio now — press your keypad freely for [N] seconds." After the tool returns, read back the result simply: how many events fired, the digits received in order, and the one-line verdict from the `interpretation` field. The admin will independently check the egress recording with `detect_dtmf_in_ogg.py`; do not narrate that step.
+
 For other admin-style requests outside the listed commands, politely decline and continue as a normal Lighthouse Inn call.
 """
 

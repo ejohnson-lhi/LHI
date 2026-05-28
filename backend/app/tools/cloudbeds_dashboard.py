@@ -1,24 +1,25 @@
 """Cloudbeds internal-dashboard API client.
 
 Uses session cookies harvested from Playwright-driven Cloudbeds login to
-call the dashboard's *internal* endpoints. The PUBLIC API at
-api.cloudbeds.com (which we have an API key for) doesn't reliably expose
-card attachment: `postCreditCard` with raw PAN returns HTTP 500, with
-`paymentMethodId` returns a generic "unexpected error" we can't diagnose.
+call the dashboard's *internal* endpoints under hotels.cloudbeds.com.
+The PUBLIC API at api.cloudbeds.com doesn't reliably expose card
+attachment / payment ops under our API key scope.
 
-The dashboard's INTERNAL endpoint at
-`hotels.cloudbeds.com/hotel/save_credit_card` works fine when called with
-valid session auth — that's what the dashboard itself uses. We replicate
-its exact request shape (captured from HAR, 2026-05-25).
+**FOR REMAPPING WHEN CLOUDBEDS CHANGES THE SYSTEM**: see the project
+memory file `project_cloudbeds_internal_dashboard_endpoints.md`. That
+file documents every endpoint's URL, request shape, response shape,
+auth model, and an exact playbook for diagnosing and fixing each likely
+class of breakage (URL change, body shape change, auth change, etc.).
 
 Trade-offs vs. the Playwright Add Card path:
   + Single HTTP call. ~1-2s end-to-end vs ~30s for browser automation.
   + No selector maintenance — the form body is fixed.
-  + PCI-clean: only the Stripe legacy token (an opaque `tok_xxx` reference)
-    touches our backend, never the PAN.
-  - Internal endpoint. Cloudbeds doesn't owe us stability. If they change
-    the URL, body format, or auth, our calls break. Fallback path is the
-    validated Playwright Add Card automation.
+  + PCI-clean for card-capture: only the Stripe legacy token (an opaque
+    `tok_xxx` reference) touches our backend, never the PAN.
+  - Internal endpoints. Cloudbeds doesn't owe us stability. If they
+    change a URL, body format, or auth mechanism, our calls break.
+    Fallback path for card capture is the validated Playwright Add Card
+    automation in cloudbeds_browser.py.
   - Still requires Playwright at least once per ~8h to bootstrap a valid
     session (Okta MFA isn't scriptable via httpx).
 """
@@ -53,6 +54,7 @@ _FRONT_VERSION = "18.214.5"
 _VERSION_URL = "https://front.cloudbeds.com/mfd-root/app.js"
 
 _SAVE_CARD_URL = "https://hotels.cloudbeds.com/hotel/save_credit_card"
+_PAYMENT_ADD_URL = "https://hotels.cloudbeds.com/connect/payment/add"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
@@ -256,6 +258,306 @@ async def get_booking_id(reservation_id: str) -> str | None:
     else:
         log.warning("get_booking_id(%s): both lookup paths failed", reservation_id)
     return bid
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Payment operations: Authorize (hold) + Purchase (capture/charge)
+#
+# Same endpoint /connect/payment/add for both — switching behavior on the
+# `transaction_type` field inside the JSON-encoded `payment` form field.
+# Body shape captured from HAR 2026-05-27. The dashboard sends both
+# camelCase and snake_case variants of several fields (e.g. isAuthPayment
+# + auth_payment) — looks like Cloudbeds is migrating from one convention
+# to the other and supports both. We send both for compatibility.
+#
+# Authorize: places a hold on the card. No money moves. Holds typically
+# expire after ~7 days at the issuing bank. Response has
+# transaction_id: null, paid_value: "0.00".
+#
+# Purchase: actual charge — money moves to the merchant. Response has a
+# real transaction_id and paid_value equal to the amount.
+#
+# 3DS handling: if the issuer requires extra verification, the response
+# carries requires_authentication: true + authentication_url. The caller
+# is expected to redirect the guest to that URL (typically a bank-hosted
+# challenge page) — when they complete, the bank posts back and the
+# transaction completes. For the voice/portal flow we'd surface this
+# branch as "complete extra verification at <url>".
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _build_payment_form(
+    *,
+    booking_id: str,
+    credit_card_id: str,
+    amount: float,
+    transaction_type: str,
+    description: str,
+    folio_id: str | None,
+    property_id: str,
+    csrf_accessa: str,
+) -> dict[str, str]:
+    """Build the form body for /connect/payment/add. The body has two
+    JSON-encoded form fields (`payment`, `inventory_object`) plus the
+    usual session/version/csrf scaffolding.
+
+    The `payment` object's shape comes from HAR capture. Both auth-flag
+    pairs (camelCase + snake_case) are populated so we don't trip a
+    field-name validator if Cloudbeds is mid-migration."""
+    is_authorize = transaction_type == "Authorize"
+    payment_data: dict[str, Any] = {
+        "amount": amount,
+        "billing_details": {
+            # All empty by default — Cloudbeds-hosted card on file already
+            # has the cardholder info from the original save. Including the
+            # full shape so the field-name validator doesn't reject.
+            "address1": "", "address2": "", "city": "", "company": "",
+            "country": "", "email": "", "name": "", "phone": "",
+            "state": "", "zip": "", "first_name": "", "last_name": "",
+            "document_number": "", "tax_id": "", "birthday": "",
+            "document_type": "",
+        },
+        "card_number": "",                  # not used when paying with saved card
+        "cardholder_name": "",              # ditto
+        "credit_card_id": str(credit_card_id),
+        "credit_card_type": None,
+        "payment_method": "cards",
+        "usePaymentFees": False,
+        "use_payment_fees": False,
+        "isAllocatePayment": False,
+        "isAutoDate": True,
+        "isDeposit": False,
+        "allocate_payment": "0",
+        "transaction_type": transaction_type,   # "Authorize" or "Purchase"
+        "keep_credit_card_info": "1",
+        "auth_payment": "1" if is_authorize else "0",
+        "isAuthPayment": is_authorize,
+        "auto_date": "1",
+        "accountsReceivableLedgerId": "",
+        "description": description,
+        "folio_id": folio_id or "",
+        "currency": "",
+        "payment_date": "",
+        "payment_type": "exist_credit_card",
+        "keep_pending_payment": "0",
+        "process_payment": "0" if is_authorize else "1",
+        "isProcessPayment": not is_authorize,
+        "property_id": str(property_id),
+        "is_deposit": False,
+        "isNextGenPayload": True,
+    }
+    return {
+        "payment": json.dumps(payment_data),
+        "inventory_object": json.dumps({
+            "type": "reservation",
+            "id": str(booking_id),
+        }),
+        "suppress_client_errors": "true",
+        "property_id": str(property_id),
+        "group_id": str(property_id),
+        "version": _VERSION_URL,
+        "frontVersion": _FRONT_VERSION,
+        "csrf_accessa": csrf_accessa,
+        "billing_portal_id": _BILLING_PORTAL_ID,
+        "is_bp_setup_completed": _IS_BP_SETUP_COMPLETED,
+    }
+
+
+async def dashboard_payment_add(
+    *,
+    booking_id: str,
+    credit_card_id: str,
+    amount: float,
+    transaction_type: str,
+    description: str = "",
+    folio_id: str | None = None,
+    property_id: str | None = None,
+) -> dict:
+    """Create a payment transaction on a reservation via Cloudbeds'
+    internal /connect/payment/add endpoint.
+
+    Arguments:
+      booking_id: internal Cloudbeds reservation ID (e.g. "175931510")
+      credit_card_id: Cloudbeds-side card id (the `id` from the
+        save_credit_card response, or from /connect/CreditCard/list, or
+        from getReservation.cardsOnFile.cardID)
+      amount: dollar amount as float (e.g. 10.0 for $10.00)
+      transaction_type: "Authorize" (places a hold) or "Purchase"
+        (captures/charges the card)
+      description: free-text note attached to the transaction (shown in
+        the dashboard's transaction list)
+      folio_id: optional folio attribution. When the dashboard's
+        Add/Refund Payment popin sends a transaction, it includes the
+        reservation's folio id here. Omit to leave unattributed; the
+        response will report folio_id="0".
+      property_id: defaults to settings.cloudbeds_property_id
+
+    Returns:
+      On success: {
+        "success": True,
+        "payment_id": "228984481",          # Cloudbeds-internal payment row
+        "transaction_id": "235604278..." or None (None for Authorize),
+        "transaction_type": "Authorize" | "Purchase",
+        "status": "successful",
+        "amount": 10.0,
+        "paid": 10.0,
+        "currency": "USD",
+        "date": "2026-05-27 16:20:36",
+        "card_last4": "9675",
+        "requires_authentication": False,
+        "authentication_url": None,
+      }
+      On 3DS challenge: success=True with requires_authentication=True
+      and authentication_url populated — caller redirects the guest.
+      On failure: {"success": False, "error": "...", "detail": ...}
+    """
+    if transaction_type not in ("Authorize", "Purchase"):
+        return {"success": False, "error": f"Invalid transaction_type: {transaction_type!r}. Must be 'Authorize' or 'Purchase'."}
+    if amount <= 0:
+        return {"success": False, "error": f"Amount must be positive, got {amount}."}
+
+    prop = property_id or settings.cloudbeds_property_id
+    if not prop:
+        return {"success": False, "error": "No Cloudbeds property ID configured."}
+
+    cookies = _load_session_cookies()
+    if not cookies:
+        return {
+            "success": False,
+            "error": "No Cloudbeds session cookies on disk. "
+                     "Run scripts/test_cloudbeds_login.py to bootstrap the session.",
+        }
+    csrf = cookies.get("csrf_accessa_cookie")
+    if not csrf:
+        return {
+            "success": False,
+            "error": "Missing csrf_accessa_cookie in cached session.",
+        }
+
+    form = _build_payment_form(
+        booking_id=booking_id,
+        credit_card_id=credit_card_id,
+        amount=amount,
+        transaction_type=transaction_type,
+        description=description,
+        folio_id=folio_id,
+        property_id=str(prop),
+        csrf_accessa=csrf,
+    )
+    headers = _build_headers(str(prop))
+
+    log.info(
+        "dashboard_payment_add: %s amount=%s card_id=%s booking=%s",
+        transaction_type, amount, credit_card_id, booking_id,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            cookies=cookies,
+            timeout=_DEFAULT_TIMEOUT_SECONDS,
+            follow_redirects=False,
+        ) as client:
+            resp = await client.post(_PAYMENT_ADD_URL, data=form, headers=headers)
+    except httpx.TimeoutException:
+        log.warning("dashboard_payment_add timed out (booking=%s)", booking_id)
+        return {"success": False, "error": "Cloudbeds payment/add timed out."}
+    except httpx.HTTPError as e:
+        log.warning("dashboard_payment_add HTTP error: %s", e)
+        return {"success": False, "error": f"HTTP error: {e}"}
+
+    if resp.status_code != 200:
+        log.warning("dashboard_payment_add HTTP %s: %s",
+                    resp.status_code, resp.text[:500])
+        return {
+            "success": False,
+            "error": f"HTTP {resp.status_code}",
+            "detail": resp.text[:500],
+        }
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return {
+            "success": False,
+            "error": "Non-JSON response from Cloudbeds.",
+            "detail": resp.text[:500],
+        }
+
+    if not body.get("success"):
+        log.warning(
+            "dashboard_payment_add success=false: %s",
+            json.dumps(body)[:500],
+        )
+        return {
+            "success": False,
+            "error": body.get("message") or body.get("error") or "Cloudbeds rejected the payment.",
+            "detail": body,
+        }
+
+    data = body.get("data") or {}
+    requires_auth = bool(data.get("requires_authentication"))
+    log.info(
+        "dashboard_payment_add OK: payment_id=%s status=%s paid=%s txn=%s 3ds=%s",
+        data.get("id"), data.get("status"), data.get("paid"),
+        data.get("transaction_id"), requires_auth,
+    )
+    return {
+        "success": True,
+        "payment_id": str(data.get("id", "")),
+        "transaction_id": data.get("transaction_id"),
+        "transaction_type": data.get("transaction_type"),
+        "status": data.get("status"),
+        "amount": data.get("price"),
+        "paid": data.get("paid"),
+        "currency": data.get("currency"),
+        "date": data.get("date"),
+        "card_last4": data.get("card_number"),
+        "requires_authentication": requires_auth,
+        "authentication_url": data.get("authentication_url"),
+    }
+
+
+async def dashboard_authorize_card(
+    booking_id: str,
+    credit_card_id: str,
+    amount: float,
+    *,
+    description: str = "",
+    folio_id: str | None = None,
+) -> dict:
+    """Place an authorization hold on a saved card. No money moves.
+    See dashboard_payment_add for full return shape."""
+    return await dashboard_payment_add(
+        booking_id=booking_id,
+        credit_card_id=credit_card_id,
+        amount=amount,
+        transaction_type="Authorize",
+        description=description,
+        folio_id=folio_id,
+    )
+
+
+async def dashboard_capture_card(
+    booking_id: str,
+    credit_card_id: str,
+    amount: float,
+    *,
+    description: str = "",
+    folio_id: str | None = None,
+) -> dict:
+    """Charge a saved card (capture). Real money moves immediately.
+    See dashboard_payment_add for full return shape.
+
+    Note that Cloudbeds calls this "Purchase" in their API; the
+    dashboard's button labels say "Charge" / "Capture". Same operation."""
+    return await dashboard_payment_add(
+        booking_id=booking_id,
+        credit_card_id=credit_card_id,
+        amount=amount,
+        transaction_type="Purchase",
+        description=description,
+        folio_id=folio_id,
+    )
 
 # Exact list of token.card sub-fields that the dashboard sends, in the
 # order the HAR showed. Cloudbeds sends every field including empties —

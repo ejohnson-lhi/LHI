@@ -194,11 +194,12 @@ async def dcs_landing():
 </head><body>
 <h1>{settings.hotel_name} — Admin</h1>
 {stale_banner}
+<a class="btn" href="/dcs/rooms">Rooms</a>
 <a class="btn" href="/dcs/HK">Housekeeping</a>
 <a class="btn" href="/dcs/Reservations">Reservations</a>
 <a class="btn" href="/dcs/Activity">Activity</a>
 <a class="btn" href="/dcs/Schedules">Schedules</a>
-<a class="btn" href="/dcs/">DCS Home</a>
+<a class="btn" href="/dcs/QaLog">Q&amp;A log</a>
 <p><small>Mode: {mode_label}<br>{heartbeat_line}</small></p>
 </body></html>"""
     return HTMLResponse(html, headers={"Cache-Control": "no-cache, no-store"})

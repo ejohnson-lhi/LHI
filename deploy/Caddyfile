@@ -1,22 +1,107 @@
-# Iris backend reverse proxy.
-# Caddy auto-provisions a Let's Encrypt cert on first HTTPS request and renews
-# automatically. No further TLS config needed.
+# Caddy config for the Lighthouse Inn droplet.
+# Auto-provisions Let's Encrypt certs on first HTTPS request and renews
+# automatically -- no TLS config needed beyond the site hostnames.
+#
+# Deployed at /etc/caddy/Caddyfile on iris-backend (64.23.167.164).
+# After editing, sync with:
+#   scp deploy/Caddyfile iris@64.23.167.164:/tmp/Caddyfile
+#   ssh iris@64.23.167.164 "sudo mv /tmp/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy"
+# Then verify:
+#   ssh iris@64.23.167.164 "sudo journalctl -u caddy -n 20 --no-pager"
 
+# ─────────────────────────────────────────────────────────────────────────
+# Iris backend (FastAPI on :8000) -- voice-agent webhooks, /sms-signup/
+# audit endpoint, guest portal. The hostname is dev-facing; production
+# traffic goes through lighthouseinn-florence.com below.
+# ─────────────────────────────────────────────────────────────────────────
 iris.lighthouseinn-florence.com {
 	reverse_proxy 127.0.0.1:8000
 
-	# Reasonable security headers.
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin
 	}
 
-	# Iris produces verbose logs; keep them off Caddy's hot path. The
-	# uvicorn process logs go to journald via systemd; this is just access
-	# logging on the proxy edge.
+	# uvicorn process logs go to journald via systemd; this is just edge
+	# access logging.
 	log {
 		output file /var/log/caddy/iris-access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Public website: static files + small form backend on :8801.
+# Replaces the GoDaddy-hosted WordPress site (migrated 2026-05).
+# ─────────────────────────────────────────────────────────────────────────
+lighthouseinn-florence.com, www.lighthouseinn-florence.com {
+	# Force apex (www -> bare hostname)
+	@www host www.lighthouseinn-florence.com
+	redir @www https://lighthouseinn-florence.com{uri} permanent
+
+	# WordPress legacy URL redirects (kept so external links / SEO / bookmarks
+	# pointing at the old WP slugs land on the new pages).
+	redir /lighthouse-inn-blog* / permanent
+	redir /general-information-and-policies* /information-and-policies/ permanent
+	redir /directions-to-the-lighthouse-inn* /directions/ permanent
+	redir /top-5-trails-to-hike-around-florence* /top-5-trails/ permanent
+	redir /top-5-fun-facts-lighthouse-inn* /top-5-fun-facts/ permanent
+	redir /top-4-place-to-pick-black-berries-in-florence* /top-4-blackberries/ permanent
+	redir /thank-subscribing* / permanent
+
+	# Common URL variants people might type
+	redir /terms-and-conditions* /terms/ permanent
+	redir /terms-of-service* /terms/ permanent
+	redir /tos* /terms/ permanent
+	# Short paths matched exactly. A glob like /sms* would also match
+	# /sms-signup/, causing an infinite redirect loop to itself.
+	redir /privacy /privacy-policy/ permanent
+	redir /privacy/ /privacy-policy/ permanent
+	redir /sms /sms-signup/ permanent
+	redir /sms/ /sms-signup/ permanent
+	redir /contact* /directions/ permanent
+	redir /reservations* https://hotels.cloudbeds.com/reservation/F6K93j permanent
+	redir /reserve* https://hotels.cloudbeds.com/reservation/F6K93j permanent
+	redir /rooms* /our-rooms/ permanent
+	redir /news* / permanent
+
+	# Old WP blog posts that became dedicated pages
+	redir /now-offering-breakfast* /breakfast/ permanent
+	redir /now-offering-breakfast-2* /breakfast/ permanent
+	redir /the-beacon-2019-november* /local-events/ permanent
+
+	# Form backend (separate FastAPI on 127.0.0.1:8801). Handles the
+	# /sms-signup/ POST (and anything else under /api/).
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8801
+	}
+
+	# Everything else: static files. file_server handles directory index
+	# (foo/ -> foo/index.html) automatically, no try_files needed.
+	handle {
+		root * /var/www/lighthouseinn-florence.com
+		file_server
+	}
+
+	# Branded 404 (rewrites the URL to /404.html and serves it)
+	handle_errors {
+		root * /var/www/lighthouseinn-florence.com
+		rewrite * /{err.status_code}.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options SAMEORIGIN
+	}
+
+	log {
+		output file /var/log/caddy/lighthouseinn-access.log {
 			roll_size 10mb
 			roll_keep 5
 		}

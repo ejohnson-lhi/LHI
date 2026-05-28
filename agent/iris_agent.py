@@ -1102,6 +1102,175 @@ class IrisAgent(Agent):
             "applies_to": "next call",
         })
 
+    @function_tool
+    async def admin_dtmf_mute_test(self, duration_seconds: int = 20) -> str:
+        """[Admin only] Gating test for the in-call DTMF card-capture build (task #12).
+
+        Mutes the caller's audio track via the LiveKit server admin API for
+        `duration_seconds` (clamped to 5-60) and logs every sip_dtmf_received
+        event that fires during the muted window. Purpose: determine whether
+        DTMF events keep arriving when the caller's audio track is muted. If
+        yes, server-side mute is a viable mitigation for the egress-tone-leak
+        problem we observed in OGG recordings. If no, the build needs to use
+        stop/restart-egress as the mitigation instead.
+
+        Returns JSON: {status, verdict, dtmf_events_received, digits_received,
+        muted_for_seconds, interpretation}. After this returns, the admin
+        will separately run detect_dtmf_in_ogg.py against the call's OGG to
+        confirm the recording is clean.
+        """
+        if not self._is_admin:
+            return json.dumps({"error": "Not authorized."})
+        if self._room is None:
+            return json.dumps({"error": "Internal: no room available."})
+
+        duration = max(5, min(60, int(duration_seconds)))
+
+        # Find the caller's remote participant (the SIP one with an audio track).
+        caller_participant = None
+        for ident, p in self._room.remote_participants.items():
+            try:
+                for pub in p.track_publications.values():
+                    kind = getattr(pub, "kind", None)
+                    if kind == rtc.TrackKind.KIND_AUDIO or "AUDIO" in str(kind).upper():
+                        caller_participant = p
+                        break
+            except Exception:
+                pass
+            if caller_participant is not None:
+                break
+        if caller_participant is None:
+            return json.dumps({
+                "error": "No remote participant with an audio track found.",
+                "remote_participant_count": len(self._room.remote_participants),
+            })
+
+        # Find the audio track SID
+        audio_track_sid: str | None = None
+        for pub in caller_participant.track_publications.values():
+            kind = getattr(pub, "kind", None)
+            if kind == rtc.TrackKind.KIND_AUDIO or "AUDIO" in str(kind).upper():
+                audio_track_sid = getattr(pub, "sid", None)
+                if audio_track_sid:
+                    break
+        if not audio_track_sid:
+            return json.dumps({"error": "Audio track SID not found on caller participant."})
+
+        log.info(
+            "DTMF mute test: identity=%s track_sid=%s duration=%ds",
+            caller_participant.identity, audio_track_sid, duration,
+        )
+
+        # Set up DTMF event collector — flag-gated so events received outside
+        # the muted window don't pollute the result.
+        import time as _time
+        listening = [True]
+        events: list[dict] = []
+
+        def _on_dtmf(dtmf) -> None:
+            if not listening[0]:
+                return
+            digit = getattr(dtmf, "digit", "?")
+            code = getattr(dtmf, "code", -1)
+            events.append({
+                "t": round(_time.monotonic(), 3),
+                "digit": str(digit),
+                "code": int(code) if isinstance(code, (int, float)) else -1,
+            })
+            log.info("DTMF mute test: received digit=%s code=%s", digit, code)
+
+        try:
+            self._room.on("sip_dtmf_received", _on_dtmf)
+        except Exception:
+            log.exception("DTMF mute test: could not register handler")
+            return json.dumps({"error": "Could not register DTMF handler."})
+
+        # Mute via admin API
+        mute_t0 = _time.monotonic()
+        try:
+            lk = api.LiveKitAPI()
+            try:
+                await lk.room.mute_published_track(
+                    api.MuteRoomTrackRequest(
+                        room=self._room.name,
+                        identity=caller_participant.identity,
+                        track_sid=audio_track_sid,
+                        muted=True,
+                    )
+                )
+            finally:
+                await lk.aclose()
+        except Exception as e:
+            log.exception("DTMF mute test: failed to mute track")
+            listening[0] = False
+            try:
+                self._room.off("sip_dtmf_received", _on_dtmf)
+            except Exception:
+                pass
+            return json.dumps({"error": f"Could not mute caller track: {e}"})
+
+        log.info("DTMF mute test: muted, sleeping %ds", duration)
+        await asyncio.sleep(duration)
+
+        # Unmute
+        unmute_ok = False
+        try:
+            lk = api.LiveKitAPI()
+            try:
+                await lk.room.mute_published_track(
+                    api.MuteRoomTrackRequest(
+                        room=self._room.name,
+                        identity=caller_participant.identity,
+                        track_sid=audio_track_sid,
+                        muted=False,
+                    )
+                )
+                unmute_ok = True
+            finally:
+                await lk.aclose()
+        except Exception:
+            log.exception("DTMF mute test: failed to UN-mute track (caller may stay muted!)")
+
+        # Stop collecting; clean up the handler
+        listening[0] = False
+        try:
+            self._room.off("sip_dtmf_received", _on_dtmf)
+        except Exception:
+            log.exception("DTMF mute test: could not remove handler (harmless)")
+
+        elapsed = _time.monotonic() - mute_t0
+        digits = [e["digit"] for e in events]
+        log.info(
+            "DTMF mute test complete: muted=%.1fs events=%d digits=%s unmute_ok=%s",
+            elapsed, len(events), digits, unmute_ok,
+        )
+
+        if events:
+            verdict = "M1_VIABLE"
+            interpretation = (
+                f"{len(events)} DTMF event(s) fired while the audio track was muted. "
+                "Server-side track mute does NOT block sip_dtmf_received delivery, "
+                "so M1 (mute during capture) is a viable mitigation."
+            )
+        else:
+            verdict = "M1_INCONCLUSIVE_OR_BLOCKED"
+            interpretation = (
+                "Zero DTMF events received while muted. Either (a) admin pressed no "
+                "keys during the window, or (b) DTMF delivery is suppressed alongside "
+                "the audio track, making M1 unusable. Re-run with deliberate key presses; "
+                "if still zero, fall back to M2 (stop/restart egress)."
+            )
+
+        return json.dumps({
+            "status": "complete",
+            "verdict": verdict,
+            "muted_for_seconds": round(elapsed, 1),
+            "unmute_ok": unmute_ok,
+            "dtmf_events_received": len(events),
+            "digits_received": digits,
+            "interpretation": interpretation,
+        })
+
 
 # =============================================================================
 # Worker subprocess prewarm — runs once when each worker child starts, BEFORE

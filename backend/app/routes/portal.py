@@ -17,6 +17,7 @@ v1 supports the checkout button. Two audiences share this router:
 """
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import time
@@ -32,14 +33,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.database import get_db
+from app.data.room_preferences import AVAILABLE_PREFS, valid_keys
 from app.models.portal_token import PortalToken
 from app.tools.cloudbeds import _extract_phones_from_reservation, _get, _summarize_reservation, add_reservation_note, detect_card_type_from_pan, format_phone_display, get_reservation_by_id, normalize_phone_e164, post_credit_card, post_item, post_reservation_document, post_void_item, put_guest_contact
+from app.tools.cloudbeds_dashboard import dashboard_save_credit_card, get_booking_id
 from app.tools.twilio_sms import get_message_status, send_sms
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 TOKEN_LIFETIME = timedelta(hours=24)
+
+# Cloudbeds' platform Stripe publishable key. Lifted from the dashboard's
+# Stripe.js iframe src. Cards tokenized with THIS key produce `tok_xxx` that
+# the dashboard's /hotel/save_credit_card endpoint will accept and convert
+# to a chargeable card. Our own `settings.stripe_publishable_key` would
+# tokenize against a DIFFERENT Stripe account and fail to attach. Public by
+# design — fine to embed in HTML we serve. If Cloudbeds rotates this key
+# the dashboard's iframe src is the source of truth — re-capture from a
+# fresh HAR.
+_CLOUDBEDS_STRIPE_PK = (
+    "pk_live_51GxYvfCkb5UaC5yLKjotmnTBp7MYbmiTqeNvDluaevZJ7xSsbL7RC4f3ZQdglMa9IVY6iPkpfDCdSJGrgdiyvuRo00jZpsTHkv"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -418,36 +433,37 @@ class IssueGuestTokenResponse(BaseModel):
     is_new: bool
 
 
-@router.post("/portal/issue-guest-token", response_model=IssueGuestTokenResponse,
-             dependencies=[Depends(require_portal_auth)])
-async def issue_guest_token(req: IssueGuestTokenRequest, db: AsyncSession = Depends(get_db)):
-    """Get-or-create the long-lived guest-portal token for a reservation.
+async def issue_guest_token_row(
+    db: AsyncSession,
+    *,
+    reservation_id: str,
+) -> tuple[str, str, bool]:
+    """In-process variant of issue_guest_token: get-or-create the long-lived
+    guest-portal token for a reservation. Returns (token, portal_url, is_new).
+    Callers that already hold an AsyncSession (e.g. the Iris voice tool) use
+    this instead of HTTP-round-tripping to the /portal/issue-guest-token
+    endpoint.
 
     Idempotent: returns the existing token if one is still valid; otherwise
-    creates a new one. The token URL goes into the pre-arrival SMS that DCS
-    sends; the same URL stays usable through 24h after checkout.
-    """
+    creates a new one. Same behavior whether called via this helper or via
+    the public POST endpoint."""
     now = datetime.utcnow()
     existing = (await db.execute(
         select(PortalToken)
         .where(PortalToken.purpose == "guest_portal")
-        .where(PortalToken.reservation_id == req.reservation_id)
+        .where(PortalToken.reservation_id == reservation_id)
         .where(PortalToken.expires_at > now)
         .order_by(PortalToken.created_at.desc())
     )).scalar_one_or_none()
     if existing:
-        return IssueGuestTokenResponse(
-            token=existing.token,
-            portal_url=f"{settings.portal_public_base_url.rstrip('/')}/g/{existing.token}",
-            reservation_id=req.reservation_id,
-            is_new=False,
-        )
+        portal_url = f"{settings.portal_public_base_url.rstrip('/')}/g/{existing.token}"
+        return existing.token, portal_url, False
 
     # Look up the reservation just to capture first_name + room_name for SMS
     # templating. The page re-fetches Cloudbeds live on each visit so anything
     # else is read fresh; we don't snapshot stay dates here. 60-day token
     # lifetime is wide enough to cover any reasonable advance booking.
-    res = await get_reservation_by_id(req.reservation_id)
+    res = await get_reservation_by_id(reservation_id)
     first_name = ""
     room_name = ""
     expires_at = now + GUEST_PORTAL_FALLBACK_LIFETIME
@@ -460,7 +476,7 @@ async def issue_guest_token(req: IssueGuestTokenRequest, db: AsyncSession = Depe
     row = PortalToken(
         token=token,
         purpose="guest_portal",
-        reservation_id=req.reservation_id,
+        reservation_id=reservation_id,
         first_name=first_name,
         room_number=room_name,  # storing Cloudbeds name; page does the friendly map
         created_at=now,
@@ -470,13 +486,49 @@ async def issue_guest_token(req: IssueGuestTokenRequest, db: AsyncSession = Depe
     await db.commit()
 
     log.info("portal: issued guest_portal token for res=%s (expires %s)",
-             req.reservation_id, expires_at.isoformat())
+             reservation_id, expires_at.isoformat())
+    portal_url = f"{settings.portal_public_base_url.rstrip('/')}/g/{token}"
+    return token, portal_url, True
+
+
+@router.post("/portal/issue-guest-token", response_model=IssueGuestTokenResponse,
+             dependencies=[Depends(require_portal_auth)])
+async def issue_guest_token(req: IssueGuestTokenRequest, db: AsyncSession = Depends(get_db)):
+    """Get-or-create the long-lived guest-portal token for a reservation.
+    See issue_guest_token_row for the in-process variant."""
+    token, portal_url, is_new = await issue_guest_token_row(
+        db, reservation_id=req.reservation_id,
+    )
     return IssueGuestTokenResponse(
         token=token,
-        portal_url=f"{settings.portal_public_base_url.rstrip('/')}/g/{token}",
+        portal_url=portal_url,
         reservation_id=req.reservation_id,
-        is_new=True,
+        is_new=is_new,
     )
+
+
+# ---- Date formatting -------------------------------------------------------
+
+def _format_date_friendly(iso_or_date: str | None) -> str:
+    """Render a date as "Fri, May 30" for portal prose / kv lists.
+
+    Three-letter month abbreviation avoids the ambiguity of all-numeric
+    formats (5/6/26 reads differently in US vs EU). Weekday adds at-a-glance
+    context for short-horizon stays. Year is OMITTED on purpose — portal
+    pages only show dates for the current reservation, so "Fri, May 30"
+    can only mean one date. If the input doesn't parse, returns the raw
+    string (or empty) so the page never blows up on bad input."""
+    if not iso_or_date:
+        return ""
+    from datetime import date as _date
+    try:
+        d = _date.fromisoformat(str(iso_or_date)[:10])
+    except (ValueError, TypeError):
+        return str(iso_or_date)
+    # `%-d` strips leading zero on POSIX but Windows strftime doesn't accept
+    # it. Build with `%d` then strip the leading zero ourselves -- portable
+    # across both platforms.
+    return d.strftime("%a, %b %d").replace(" 0", " ")
 
 
 # ---- Stay-phase → human-friendly status copy --------------------------------
@@ -486,39 +538,40 @@ def _status_for_phase(phase: str, status: str, check_in: str | None, check_out: 
     headline, body). Drives the colored status pill + paragraph at the top
     of the portal page. Returned dict keys are used directly by the template."""
     s = (status or "").lower()
+    ci_friendly = _format_date_friendly(check_in) or "your arrival date"
+    co_friendly = _format_date_friendly(check_out) or ""
     if s in {"canceled", "cancelled", "no_show"}:
         return {
             "badge": "canceled", "badge_class": "muted",
             "headline": "Your reservation was canceled.",
-            "body": "If this was unexpected, please call the front desk at (541) 997-3221.",
+            "body": "If this was unexpected, please call the front desk at 541-997-3221.",
         }
     if phase == "future":
         return {
             "badge": "Upcoming", "badge_class": "info",
-            "headline": f"We look forward to seeing you on {check_in or 'your arrival date'}.",
-            "body": "You can return to this page any time before your stay to update preferences, "
-                    "confirm contact info, or add an incidentals card. Sections below will unlock as "
-                    "we add them.",
+            "headline": f"We look forward to seeing you on {ci_friendly}.",
+            "body": "Return any time before your stay to confirm your info, sign the rental "
+                    "agreement, and add an incidentals card.",
         }
     if phase == "arriving_today":
         return {
             "badge": "Arriving today", "badge_class": "primary",
             "headline": "We're expecting you today!",
-            "body": "Standard check-in is 4:00 PM. If your room is ready earlier, we'll let you know "
-                    "on this page. Once you've completed the items below, we can text you the door "
-                    "code so you can go straight to your room.",
+            "body": "Front desk check-in is from about 3pm till 8pm. Once you've "
+                    "completed the items below, we'll text your door code so you "
+                    "can go straight to your room.",
         }
     if phase == "in_house":
         return {
             "badge": "Currently staying", "badge_class": "primary",
-            "headline": "You're staying with us.",
-            "body": "WiFi info and stay-related actions are below.",
+            "headline": "You have checked in. Thank you.",
+            "body": "",
         }
     if phase == "in_house_departing_tomorrow":
         return {
             "badge": "Departing tomorrow", "badge_class": "primary",
             "headline": "We hope you've enjoyed your stay so far.",
-            "body": f"Check-out tomorrow ({check_out or ''}) is at 11:00 AM. "
+            "body": f"Check-out tomorrow ({co_friendly}) is at 11:00 AM. "
                     "If you need a later check-out, please let us know.",
         }
     if phase == "departing_today":
@@ -557,8 +610,44 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sa
                 padding: 12px 16px; }
 .hotel-header-inner { max-width: 540px; margin: 0 auto; }
 .hotel-name { font-size: 18px; font-weight: 700; color: #0f172a; }
+.hotel-name a { color: inherit; text-decoration: none; }
+.hotel-name a:hover { text-decoration: underline; }
 .hotel-meta { font-size: 13px; color: #475569; margin-top: 2px; }
-.hotel-meta a { color: #1e40af; text-decoration: none; }
+.hotel-meta a { color: inherit; text-decoration: none; }
+.hotel-meta a[href^="tel:"] { color: #1e40af; }
+.hotel-meta a:hover { text-decoration: underline; }
+/* Welcome box: greeting + room/door-code/wifi consolidated into one section.
+   Replaces the old separate Room & door code / WiFi / Your info accordions. */
+.welcome-box { padding-top: 14px; padding-bottom: 14px; }
+.welcome-box h1 { margin: 0 0 12px; }
+.welcome-room { margin: 4px 0 12px; }
+.welcome-room .door-code-line { font-size: 15px; color: #0f172a; margin: 8px 0 0;
+                                display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.welcome-room .door-code-line .code-pill { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 20px; font-weight: 700; letter-spacing: 3px;
+    background: #f1f5f9; border-radius: 6px; padding: 4px 12px; color: #0f172a; user-select: all; }
+.welcome-room details.room-directions { background: transparent; box-shadow: none;
+    border: 1px solid #e2e8f0; border-radius: 8px; margin: 0; }
+.welcome-room details.room-directions > summary { padding: 10px 14px; font-size: 15px;
+    color: #0f172a; font-weight: 500; cursor: pointer; }
+.welcome-room details.room-directions > summary strong { font-weight: 700; }
+.welcome-room details.room-directions > summary::after { content: "\\25BE"; margin-left: auto;
+    color: #94a3b8; transition: transform 0.15s ease; }
+.welcome-room details.room-directions[open] > summary::after { transform: rotate(180deg); }
+.welcome-room details.room-directions > summary { display: flex; align-items: center; gap: 8px; }
+.welcome-room details.room-directions > summary::-webkit-details-marker { display: none; }
+.welcome-room details.room-directions > summary:hover { background: #f8fafc; }
+.welcome-room details.room-directions .directions-body { padding: 4px 14px 14px; color: #334155;
+    font-size: 14px; }
+.welcome-wifi { font-size: 14px; color: #334155; margin: 12px 0 0;
+                padding-top: 12px; border-top: 1px solid #f1f5f9; }
+.welcome-wifi .wifi-creds { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                            background: #f1f5f9; border-radius: 4px; padding: 2px 8px;
+                            user-select: all; font-weight: 600; color: #0f172a; }
+/* Tiny reservation-ID line at the bottom of the welcome box. Out of the
+   way but findable if support needs the number. */
+.welcome-resid { font-size: 11px; color: #94a3b8; margin: 10px 0 0;
+                 padding-top: 8px; border-top: 1px solid #f8fafc; letter-spacing: 0.2px; }
 .wrap { max-width: 540px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 22px; margin: 0 0 8px; }
 .section { background: #fff; border-radius: 12px; padding: 18px 20px; margin: 12px 0;
@@ -706,16 +795,134 @@ form.contact.sign .sig-hint { font-size: 12px; color: #94a3b8;
     margin-bottom: 10px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* Inline checkout button -- rendered in the status section on
+   departing_today, not as a standalone accordion. */
+.checkout-action { margin: 14px 0 6px; }
+.checkout-btn { display: inline-block; padding: 12px 22px; background: #16a34a;
+    color: white; border: 0; border-radius: 6px; font-size: 15px;
+    font-weight: 600; cursor: pointer; }
+.checkout-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.checkout-btn:hover:not(:disabled) { background: #15803d; }
+.checkout-action .hint { color: #64748b; font-size: 12px; margin-top: 6px; }
+/* Room preferences -- two-zone drag-and-drop. Sortable.js handles the
+   actual dragging; this just styles the zones + cards. */
+.prefs-intro { color: #475569; font-size: 13px; margin: 4px 0 12px; }
+.prefs-zones { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.prefs-zone { background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 10px; padding: 12px 12px 14px; }
+.prefs-zone h3 { margin: 0 0 8px; font-size: 13px; font-weight: 700;
+    color: #334155; text-transform: uppercase; letter-spacing: 0.5px; }
+.prefs-zone.matters h3 { color: #0f172a; }
+.prefs-zone.matters { background: #ecfeff; border-color: #a5f3fc; }
+.prefs-list { list-style: none; margin: 0; padding: 0; min-height: 36px; }
+.prefs-list:empty::after { content: attr(data-empty); display: block;
+    color: #94a3b8; font-style: italic; font-size: 13px;
+    padding: 8px 6px; }
+.pref-item { display: flex; align-items: center; gap: 10px;
+    background: #fff; border: 1px solid #cbd5e1; border-radius: 8px;
+    padding: 9px 12px; margin: 6px 0; cursor: grab;
+    user-select: none; -webkit-user-select: none; touch-action: none; }
+.pref-item:active { cursor: grabbing; }
+.pref-handle { color: #94a3b8; font-size: 16px; line-height: 1;
+    font-weight: 700; flex-shrink: 0; }
+.pref-label { color: #0f172a; font-size: 14px; font-weight: 600; }
+.pref-label small { display: block; color: #64748b; font-size: 12px;
+    font-weight: 400; margin-top: 2px; }
+.pref-priority { background: #06b6d4; color: #fff; font-size: 11px;
+    font-weight: 700; min-width: 22px; height: 22px; border-radius: 999px;
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-left: auto; flex-shrink: 0; padding: 0 6px; }
+.sortable-ghost { opacity: 0.45; }
+.sortable-drag { box-shadow: 0 6px 18px rgba(0,0,0,0.15); }
+.prefs-form button { margin-top: 14px; width: 100%; padding: 12px;
+    background: #2563eb; color: white; border: 0; border-radius: 6px;
+    font-size: 15px; font-weight: 600; cursor: pointer; }
+.prefs-form button:hover { background: #1d4ed8; }
+.prefs-locked-note { font-size: 13px; color: #64748b; font-style: italic;
+    margin: 8px 0 12px; }
+.prefs-readonly-list { margin: 0; padding-left: 22px; color: #0f172a;
+    font-size: 14px; }
+.prefs-readonly-list li { margin: 4px 0; }
+.prefs-readonly-empty { color: #94a3b8; font-style: italic; font-size: 13px; }
+/* FAQ + Ask Iris -- live-matching text input, expandable matches, LLM fallback. */
+.faq-intro { color: #475569; font-size: 13px; margin: 4px 0 10px; }
+.faq-search { width: 100%; padding: 10px 12px; font-size: 15px;
+    border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box;
+    background: #fff; }
+.faq-search:focus { outline: 2px solid #06b6d4; outline-offset: -1px; }
+.faq-status { font-size: 12px; color: #64748b; margin: 4px 2px 8px;
+    min-height: 16px; }
+.faq-results { margin: 0; padding: 0; list-style: none; }
+.faq-result { background: #fff; border: 1px solid #e2e8f0;
+    border-radius: 8px; margin: 6px 0; }
+.faq-result summary { padding: 10px 14px; cursor: pointer;
+    font-size: 14px; font-weight: 600; color: #0f172a;
+    display: flex; align-items: center; gap: 8px;
+    list-style: none; }
+.faq-result summary::-webkit-details-marker { display: none; }
+.faq-result summary::after { content: "\\25BE"; margin-left: auto;
+    color: #94a3b8; transition: transform 0.15s ease; }
+.faq-result[open] summary::after { transform: rotate(180deg); }
+.faq-result summary:hover { background: #f8fafc; }
+.faq-answer { padding: 4px 14px 14px; color: #334155; font-size: 14px;
+    line-height: 1.5; white-space: pre-wrap; }
+.faq-no-match { color: #64748b; font-size: 13px; margin: 8px 2px;
+    font-style: italic; }
+.faq-ask-iris-btn { display: none; padding: 11px 18px; margin-top: 6px;
+    background: #06b6d4; color: white; border: 0; border-radius: 6px;
+    font-size: 14px; font-weight: 600; cursor: pointer; }
+.faq-ask-iris-btn:hover { background: #0891b2; }
+.faq-ask-iris-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.faq-ask-iris-pending { color: #64748b; font-size: 13px;
+    font-style: italic; margin: 8px 2px; display: none; }
+.faq-iris-response { display: none; margin-top: 12px; padding: 14px 16px;
+    background: #ecfeff; border: 1px solid #a5f3fc; border-radius: 10px; }
+.faq-iris-response .iris-label { font-size: 11px; font-weight: 700;
+    color: #0891b2; text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 6px; }
+.faq-iris-response .iris-answer { color: #0f172a; font-size: 14px;
+    line-height: 1.55; white-space: pre-wrap; }
+.faq-iris-response .iris-meta { font-size: 11px; color: #64748b;
+    margin-top: 8px; }
+.faq-blocked { color: #92400e; background: #fef3c7;
+    border: 1px solid #fcd34d; border-radius: 8px;
+    padding: 10px 14px; font-size: 13px; }
 .footer { text-align: center; color: #94a3b8; font-size: 12px; margin: 20px 0 8px; }
 .footer a { color: #64748b; }
 """
 
 
 def _hotel_header_html() -> str:
-    """Pinned header with hotel name, address, phone -- shown on every portal-style page."""
-    parts = [f'<div class="hotel-name">{settings.hotel_name}</div>']
+    """Pinned header with hotel name, address, phone -- shown on every portal-style page.
+
+    Hotel name + address are clickable links that open Google Maps with a
+    search for the hotel address. Phone opens the dialer. Mobile-friendly:
+    the only target devices the portal sees are guests' phones.
+
+    Google Maps search URL is generic (no API key, no hotel-specific
+    place_id) so it works even if Cloudbeds renames us in their system.
+    The `q=` query is URL-encoded but kept human-readable in the source."""
+    from urllib.parse import quote_plus
+    parts: list[str] = []
+    maps_query = quote_plus(
+        f"{settings.hotel_name} {settings.hotel_address}".strip()
+    ) if (settings.hotel_name or settings.hotel_address) else ""
+    maps_url = f"https://www.google.com/maps/search/?api=1&query={maps_query}" if maps_query else ""
+
+    if settings.hotel_name:
+        if maps_url:
+            parts.append(
+                f'<div class="hotel-name"><a href="{maps_url}" target="_blank" rel="noopener">{settings.hotel_name}</a></div>'
+            )
+        else:
+            parts.append(f'<div class="hotel-name">{settings.hotel_name}</div>')
     if settings.hotel_address:
-        parts.append(f'<div class="hotel-meta">{settings.hotel_address}</div>')
+        if maps_url:
+            parts.append(
+                f'<div class="hotel-meta"><a href="{maps_url}" target="_blank" rel="noopener">{settings.hotel_address}</a></div>'
+            )
+        else:
+            parts.append(f'<div class="hotel-meta">{settings.hotel_address}</div>')
     if settings.hotel_phone_display:
         tel = settings.hotel_phone_tel or settings.hotel_phone_display
         parts.append(
@@ -967,12 +1174,23 @@ async def _lookup_reservations_by_id_prefix(prefix: str) -> list[dict]:
 # ---- The /g/{identifier} dispatcher ----------------------------------------
 
 _PORTAL_PAGE_BODY_TPL = """\
-<h1>Hi {first_name}!</h1>
 {saved_banner_html}
+<div class="section welcome-box">
+    <h1>Hi {guest_name_display}!</h1>
+    <div class="welcome-room">
+        {welcome_room_block}
+    </div>
+    <div class="welcome-wifi">
+        Wi-Fi: <span class="wifi-creds">lighthouseinn</span>
+        &nbsp;·&nbsp; <span class="wifi-creds">happyguest</span>
+    </div>
+    <div class="welcome-resid">Reservation {reservation_id}</div>
+</div>
+
 <div class="section">
     <span class="badge {badge_class}">{badge}</span>
     <div class="headline">{headline}</div>
-    <p>{body}</p>
+    {body_html}
     <dl class="kv">
         <dt>Arriving</dt><dd>{check_in}</dd>
         <dt>Departing</dt><dd>{check_out}</dd>
@@ -980,104 +1198,119 @@ _PORTAL_PAGE_BODY_TPL = """\
     {countdown_html}
 </div>
 
-<details class="accord" open>
-    <summary>🚪 Room &amp; door code</summary>
-    <div class="accord-body">
-        {room_block}
-    </div>
-</details>
-
-<details class="accord">
-    <summary>📶 WiFi</summary>
-    <div class="accord-body">
-        <p>Network: <span class="wifi-creds">LighthouseInn</span></p>
-        <p>Password: <span class="wifi-creds">happyguest</span></p>
-    </div>
-</details>
-
-<details class="accord">
-    <summary>👤 Your info</summary>
-    <div class="accord-body">
-        <dl class="kv">
-            <dt>Guest</dt><dd>{guest_name}</dd>
-            <dt>Reservation</dt><dd>{reservation_id}</dd>
-        </dl>
-    </div>
-</details>
-
-<details class="accord {contact_complete_class}" id="contact-section" {contact_open_attr}>
-    <summary>
-        <span class="accord-title">📋 Confirm address &amp; phone</span>
-        <span class="accord-check" aria-label="completed">✓</span>
-    </summary>
-    <div class="accord-body">
-        {contact_block}
-    </div>
-</details>
-
-<details class="accord {sign_complete_class}" id="sign-section" {sign_open_attr}>
-    <summary>
-        <span class="accord-title">✍️ Sign the rental agreement</span>
-        <span class="accord-check" aria-label="completed">✓</span>
-    </summary>
-    <div class="accord-body">
-        {sign_block}
-    </div>
-</details>
-
-<details class="accord {card_complete_class}" id="card-section" {card_open_attr}>
-    <summary>
-        <span class="accord-title">💳 Credit card on file</span>
-        <span class="accord-check" aria-label="completed">✓</span>
-    </summary>
-    <div class="accord-body">
-        {card_block}
-    </div>
-</details>
-
-<details class="accord {pet_complete_class}" id="pet-section" {pet_open_attr}>
-    <summary>
-        <span class="accord-title">🐕 Bringing a pet?</span>
-        <span class="accord-check" aria-label="completed">✓</span>
-    </summary>
-    <div class="accord-body">
-        {pet_block}
-    </div>
-</details>
-
-<details class="accord">
-    <summary>🛏️ Room preferences</summary>
-    <div class="accord-body">
-        <p class="hint">Coming soon — drag your preferences (upstairs, bathtub, no carpet, balcony, etc.) into priority order. Above the line matters to you, below the line is "no preference." Not guaranteed, but we use it to match you when we assign rooms on the morning of arrival.</p>
-    </div>
-</details>
-
-<details class="accord">
-    <summary>❌ Cancel reservation</summary>
-    <div class="accord-body">
-        <p class="hint">Coming soon — view the refund policy and confirm cancellation.</p>
-    </div>
-</details>
-
-<details class="accord">
-    <summary>🚪 Check out</summary>
-    <div class="accord-body">
-        <p class="hint">Coming soon — tap when you've left so housekeeping can start.</p>
-    </div>
-</details>
-
-<details class="accord">
-    <summary>❓ FAQ &amp; Ask Iris</summary>
-    <div class="accord-body">
-        <p class="hint">Coming soon — questions about the hotel, sunsets at South Jetty, dunes at North Jetty, the Heceta lighthouse, and anywhere else worth visiting nearby.</p>
-    </div>
-</details>
+{ordered_sections_html}
 
 <div class="footer">
     Need help? Call <a href="tel:{phone_tel}">{phone_display}</a>.<br/>
     Reply STOP to any of our texts to opt out.
 </div>
 """
+
+
+# ---- Section ordering rules -------------------------------------------------
+#
+# Sections move based on completion state + stay phase. The user's stated
+# pattern: incomplete items + the FAQ live in "Group A" (above the FAQ
+# anchor), completed items drop into "Group B" (below the FAQ). Cancel is
+# always last. Check out floats to the top of Group A on the departing day.
+#
+# Implementation: every section gets a numeric priority; lower numbers
+# render first. Group-A priorities are 1-99, Group-B are 110-199, Cancel
+# is 999. Sort, join, drop into the template.
+
+_SECTION_PRIORITY_GROUP_B_OFFSET = 100  # done items: original + 100 -> below FAQ (60)
+_SECTION_PRIORITY_CHECKOUT_TODAY = 1     # bumps to top of Group A on departing_today
+_SECTION_PRIORITY_CANCEL = 999            # always last
+_SECTION_PRIORITY_DEFAULTS = {
+    # name -> Group-A priority
+    "contact":  10,
+    "sign":     20,
+    "card":     30,
+    "pet":      40,
+    "prefs":    50,
+    "faq":      60,
+    "checkout": 70,
+}
+
+
+_CHECKED_IN_PHASES = (
+    "in_house", "in_house_departing_tomorrow", "departing_today", "past",
+)
+
+
+def _section_priority(name: str, *, complete: bool, phase: str) -> int:
+    """Return the sort priority for `name` given completion state + phase.
+
+    Group A (1-99): not-yet-done items + always-on coming-soons (faq,
+    prefs-pre-stay). Group B (110-199): items the guest has finished --
+    they fall below the FAQ. Cancel always 999.
+
+    Phase-driven overrides:
+      - checkout floats to the top of Group A (priority 1) on
+        departing_today; otherwise stays in Group A at 70.
+      - prefs drops to Group B once the guest has checked in (room is
+        assigned, preferences locked). The user can still see them as
+        a "this is what I asked for" view but they're out of the to-do
+        zone.
+
+    `complete` is ignored for sections that can't complete (faq, prefs,
+    checkout, cancel).
+    """
+    if name == "cancel":
+        return _SECTION_PRIORITY_CANCEL
+    if name == "checkout":
+        return _SECTION_PRIORITY_CHECKOUT_TODAY if phase == "departing_today" else _SECTION_PRIORITY_DEFAULTS["checkout"]
+    if name == "prefs":
+        base = _SECTION_PRIORITY_DEFAULTS["prefs"]
+        # Drop into Group B (below FAQ) when the guest has already saved
+        # prefs OR when they're checked in (preferences locked). Pre-stay
+        # + not saved keeps it in the to-do zone above FAQ.
+        in_group_b = complete or (phase in _CHECKED_IN_PHASES)
+        return base + _SECTION_PRIORITY_GROUP_B_OFFSET if in_group_b else base
+    base = _SECTION_PRIORITY_DEFAULTS.get(name, 80)
+    if name == "faq":
+        return base  # can't complete; always Group A
+    return base + _SECTION_PRIORITY_GROUP_B_OFFSET if complete else base
+
+
+# Static HTML for sections without a form -- coming-soons + cancel. These
+# are full <details> blocks ready to drop into the ordered list.
+
+# Room preferences is no longer a coming-soon stub -- its accordion is
+# built dynamically in _render_portal_for_reservation via
+# _render_prefs_section_html (drag-and-drop two-zone selector).
+
+# FAQ section is no longer static -- _render_faq_section_html builds the
+# live search-box / matches / Ask-Iris UI dynamically based on action URLs
+# bound to the active token or prefix flow.
+
+_COMING_SOON_CHECKOUT_HTML = """\
+<details class="accord">
+    <summary>🚪 Check out</summary>
+    <div class="accord-body">
+        <p class="hint">Coming soon — tap when you've left so housekeeping can start.</p>
+    </div>
+</details>"""
+
+# Inline checkout button rendered in the status section on departing_today.
+# Replaces the standalone "Check out" accordion entirely -- the button
+# lives where the action makes sense ("Today is your checkout day."),
+# and the accordion is hidden on every other phase. Disabled placeholder
+# until we wire a real /g/{token}/checkout endpoint; the existing
+# /c/{token}/confirm SMS-link flow is the obvious model for that.
+_CHECKOUT_INLINE_BUTTON_HTML = """\
+<div class="checkout-action">
+    <button type="button" class="checkout-btn" disabled>I'm checking out</button>
+    <p class="hint">Coming soon — tapping this will let housekeeping know they can start.</p>
+</div>"""
+
+_COMING_SOON_CANCEL_HTML = """\
+<details class="accord">
+    <summary>❌ Cancel reservation</summary>
+    <div class="accord-body">
+        <p class="hint">Coming soon — view the refund policy and confirm cancellation.</p>
+    </div>
+</details>"""
 
 
 def _format_stay_countdown(phase: str, start_iso: str | None, end_iso: str | None) -> str:
@@ -1122,6 +1355,55 @@ CONSENT_TEXT = (
     "prompts). Message frequency varies. Reply STOP at any time to opt out. "
     "Reply HELP for help. Message and data rates may apply."
 )
+
+
+async def _contact_is_acknowledged(db: AsyncSession, reservation_id: str | None) -> bool:
+    """True iff the guest has tapped Save on the contact form at least once
+    via this portal for this reservation.
+
+    Used to keep the address section in "to-do" position even when
+    Cloudbeds already has the fields populated -- OTA-sourced data is
+    often stale and we want the guest to actively confirm it once. See
+    app/models/contact_acknowledgement.py for full rationale."""
+    if not reservation_id:
+        return False
+    from app.models.contact_acknowledgement import ContactAcknowledgement
+    row = await db.get(ContactAcknowledgement, reservation_id)
+    return row is not None
+
+
+async def _mark_contact_acknowledged(
+    db: AsyncSession,
+    reservation_id: str,
+    request: Request,
+) -> None:
+    """UPSERT a ContactAcknowledgement row for this reservation. Called
+    from the contact-save handler after a successful Cloudbeds write.
+    Idempotent -- a re-save just refreshes the timestamp.
+
+    Best-effort: a failure here doesn't roll back the contact save. The
+    next save will retry. Logged so we can see if it ever silently breaks."""
+    if not reservation_id:
+        return
+    try:
+        from app.models.contact_acknowledgement import ContactAcknowledgement
+        existing = await db.get(ContactAcknowledgement, reservation_id)
+        now = datetime.utcnow()
+        if existing is not None:
+            existing.acknowledged_at = now
+            existing.client_ip = _client_ip(request)
+            existing.user_agent = request.headers.get("user-agent", "")[:500]
+        else:
+            db.add(ContactAcknowledgement(
+                reservation_id=reservation_id,
+                acknowledged_at=now,
+                client_ip=_client_ip(request),
+                user_agent=request.headers.get("user-agent", "")[:500],
+            ))
+        await db.commit()
+    except Exception as ex:
+        log.warning("portal: contact-ack upsert failed for res=%s: %s",
+                    reservation_id, ex)
 
 
 async def _current_sms_opt_in(db: AsyncSession, reservation_id: str | None) -> bool:
@@ -1262,6 +1544,8 @@ _SAVED_BANNERS = {
     "sign_error": ("gated-prompt", "We couldn't save your signature. Please try again, or call the front desk."),
     "card": ("saved-banner", "Card on file -- thank you. Charges run on the morning of your scheduled arrival."),
     "card_error": ("gated-prompt", "We couldn't save the card. Please try again, or call the front desk."),
+    "prefs": ("saved-banner", "Saved -- room preferences updated."),
+    "prefs_error": ("gated-prompt", "We couldn't save your preferences. Please try again."),
 }
 
 
@@ -1324,22 +1608,25 @@ def _has_real_card_on_file(res: dict) -> bool:
 def _render_card_block(
     res: dict,
     action_url: str,
-    publishable_key: str,
     *,
-    overrides: dict[str, str] | None = None,
-    error_message: str | None = None,
+    cardholder_default_name: str = "",
 ) -> str:
-    """Render the card-on-file list + raw-card 'add card' inline form.
+    """Render the card-on-file list + inline Stripe Elements 'add card' form.
 
-    `overrides` carries safe fields (cardholder name, billing zip) back
-    from a failed POST so the guest doesn't have to retype them.
+    The form tokenizes the PAN with Stripe.js (Cloudbeds' platform key) and
+    POSTs the resulting `tok_xxx` + card metadata as JSON to `action_url`.
+    The server side resolves booking_id and calls
+    /hotel/save_credit_card on the Cloudbeds dashboard. PAN/CVV never
+    touch our backend.
 
-    `error_message` is the Cloudbeds/validation message from the prior
-    attempt -- rendered inline above the form so the guest sees WHY it
-    failed without scrolling back up to the banner."""
-    o = overrides or {}
-    name_value = (o.get("card_holder_name") or "")[:200]
-    zip_value = (o.get("card_address_zip") or "")[:20]
+    On success the JS reloads the portal with `?saved=card` so the freshly
+    attached card appears in the list and the green saved banner shows. On
+    failure the JS keeps the form mounted and surfaces the error inline so
+    the guest can retry without retyping every digit.
+
+    `cardholder_default_name` is the pre-fill for the Cardholder name field
+    (usually the guest's full name from the reservation). The guest can edit
+    it before submitting."""
     cards = res.get("cards_on_file") or []
     is_virtual = _is_virtual_card(res)
     card_rows_html = []
@@ -1371,10 +1658,8 @@ def _render_card_block(
 
     if is_virtual and cards:
         intro = (
-            '<p class="card-info">Your booking was made through a travel '
-            'site. That card covers the room rate only -- to allow '
-            'incidentals (parking, late checkout, damages), please add '
-            'a personal card below.</p>'
+            '<p class="card-info">An incidentals credit card is required '
+            'for checking in. Please add it here.</p>'
         )
     elif cards:
         intro = (
@@ -1389,33 +1674,105 @@ def _render_card_block(
             'your scheduled arrival.</p>'
         )
 
-    # Inline error message (passed when something went wrong on the last attempt).
-    error_html = ""
-    if error_message:
-        error_html = (
-            f'<div class="gated-prompt" style="margin:6px 0 14px;">'
-            f'<strong>That didn\'t go through.</strong> {_esc(error_message)}. '
-            f'If it keeps failing, call the front desk at '
-            f'<a href="tel:{settings.hotel_phone_tel}">{settings.hotel_phone_display}</a>.'
-            f'</div>'
-        )
+    # All JS-injected values are JSON-encoded so an unexpected character in
+    # the guest's name / URL can't break out of the string literal.
+    pk_js = json.dumps(_CLOUDBEDS_STRIPE_PK)
+    action_url_js = json.dumps(action_url)
+    # ?saved=card refreshes the page so the new card shows in the list and
+    # _saved_banner_html renders the green success banner.
+    reload_url = action_url.replace("/cards", "?saved=card") + "#card-section"
+    reload_url_js = json.dumps(reload_url)
+    cardholder_value = _esc(cardholder_default_name or "")
 
-    # Add-card UX: we open a Cloudbeds-hosted Pay-by-Link page (generated via
-    # backend automation against the Cloudbeds dashboard). The guest enters
-    # their card on Cloudbeds' page; we don't touch raw PAN/CVV here. The
-    # button below kicks off the generation and either embeds the resulting
-    # link as an iframe (if Cloudbeds allows framing) OR opens it in a new
-    # tab (fallback). Generation takes 10-30s; the receiving page shows a
-    # spinner while it runs.
-    card_link_url = action_url.replace("/cards", "/card-link")
-    add_card_block = f"""
-<a href="{card_link_url}" class="add-card-btn">Add a card</a>
-<p class="card-info" style="margin-top:10px; font-size:12px;">
-    You'll be taken to our reservation system's secure payment page to enter
-    your card. We never handle the card number ourselves.
+    # The form's #stripe-card-element div is mounted by Stripe.js once the
+    # accordion is in the DOM. We don't bother lazy-mounting on accordion
+    # toggle: Stripe Elements is cheap and the iframe just sits idle until
+    # the user types. Mounting eagerly keeps the markup simple and means a
+    # ?open=card deep link is interactive immediately.
+    return f"""{card_list_html}{intro}
+<form id="card-form" novalidate>
+    <label for="cardholder-name" style="display:block;font-size:13px;font-weight:500;color:#475569;margin:10px 0 4px;">Cardholder name</label>
+    <input type="text" id="cardholder-name" autocomplete="cc-name"
+           value="{cardholder_value}" placeholder="As shown on the card"
+           style="width:100%;padding:9px 11px;font-size:15px;border:1px solid #cbd5e1;border-radius:6px;box-sizing:border-box;" />
+    <label style="display:block;font-size:13px;font-weight:500;color:#475569;margin:10px 0 4px;">Card details</label>
+    <div id="stripe-card-element"></div>
+    <div id="stripe-card-error" role="alert"></div>
+    <button id="card-submit-btn" type="submit" class="add-card-btn"
+            style="border:0;width:100%;margin-top:12px;">Add card to reservation</button>
+</form>
+<p class="card-info" style="margin-top:8px;font-size:12px;">
+    Your card details go directly to our payment processor. We never see or
+    store the card number ourselves.
 </p>
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+(function() {{
+    const PK = {pk_js};
+    const ACTION_URL = {action_url_js};
+    const RELOAD_URL = {reload_url_js};
+    const stripe = Stripe(PK);
+    const elements = stripe.elements();
+    const cardElement = elements.create('card', {{
+        style: {{
+            base: {{
+                fontFamily: '"Segoe UI", system-ui, sans-serif',
+                fontSize: '15px',
+                color: '#0f172a',
+                '::placeholder': {{ color: '#94a3b8' }},
+            }},
+        }},
+    }});
+    cardElement.mount('#stripe-card-element');
+    const errEl = document.getElementById('stripe-card-error');
+    cardElement.on('change', function(ev) {{
+        errEl.textContent = ev.error ? ev.error.message : '';
+    }});
+    const form = document.getElementById('card-form');
+    const btn = document.getElementById('card-submit-btn');
+    const nameInput = document.getElementById('cardholder-name');
+    form.addEventListener('submit', async function(e) {{
+        e.preventDefault();
+        const name = (nameInput.value || '').trim();
+        if (!name) {{
+            errEl.textContent = 'Please enter the cardholder name.';
+            return;
+        }}
+        btn.disabled = true;
+        const oldLabel = btn.textContent;
+        btn.textContent = 'Adding card...';
+        errEl.textContent = '';
+        try {{
+            const tk = await stripe.createToken(cardElement, {{ name }});
+            if (tk.error) {{
+                errEl.textContent = tk.error.message || 'Could not tokenize the card.';
+                return;
+            }}
+            const resp = await fetch(ACTION_URL, {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{
+                    token_id: tk.token.id,
+                    token_card: tk.token.card,
+                }}),
+            }});
+            const data = await resp.json().catch(() => ({{}}));
+            if (resp.ok && data.success) {{
+                window.location.href = RELOAD_URL;
+                return;
+            }}
+            errEl.textContent = data.error || data.detail
+                || 'We could not save the card. Please try again.';
+        }} catch (ex) {{
+            errEl.textContent = 'Network error: ' + (ex && ex.message ? ex.message : ex);
+        }} finally {{
+            btn.disabled = false;
+            btn.textContent = oldLabel;
+        }}
+    }});
+}})();
+</script>
 """
-    return card_list_html + intro + error_html + add_card_block
 
 
 async def _latest_signature_agreement(db: AsyncSession, reservation_id: str):
@@ -1535,36 +1892,24 @@ async def _latest_pet_declaration(db: AsyncSession, reservation_id: str):
 
 
 def _render_pet_block(latest_decl, action_url: str) -> str:
-    """Form for declaring 0 / "1 or 2" / 3 dogs. Cats get a static no-go note.
+    """Minimal pet form: one checkbox for "bringing a dog" + the fee note.
 
-    Pricing is tier-based, NOT per-dog: 1-2 dogs cost the same ($20 for up
-    to a week), 3 dogs is $40. The form collapses 1 and 2 into one option
-    since the financial outcome is identical. Submitted values are 0, 2,
-    or 3 -- a latest row with dog_count==1 (from earlier form versions or
-    a future single-count picker) is still recognized and pre-checks the
-    combined option."""
+    Cats aren't allowed at the Lighthouse Inn (noted once at top). For
+    multi-dog stays the front desk reconciles at check-in -- guests don't
+    need a count field. Submitted values map to PetDeclaration.dog_count:
+      - checkbox checked: dog_count = 1
+      - checkbox unchecked: form submits no value, handler defaults to 0
+    The handler still understands dog_count up to 3 so historical rows
+    (or a future re-introduction of a count field) keep working."""
     current = latest_decl.dog_count if latest_decl else 0
-    # The combined radio covers 1 and 2; submit-value is 2 (upper end of
-    # the bucket). 0 and 3 map straight through.
-    in_small_bucket = current in (1, 2)
-    def _chk(condition: bool) -> str: return "checked" if condition else ""
+    bringing = current >= 1
+    checked = "checked" if bringing else ""
     return f"""
 <form class="contact pet" method="post" action="{action_url}" novalidate>
-    <p class="hint">Cats are not allowed at the Lighthouse Inn. If you're
-        bringing a dog, please let us know so we can prepare your room.
-        Pricing is for stays up to one week &mdash; if you're staying
-        longer, the front desk will follow up.</p>
+    <p class="hint">Cats are not allowed at the Lighthouse Inn.</p>
     <label class="pet-choice">
-        <input type="radio" name="dog_count" value="0" {_chk(current == 0)} />
-        <span>Just me &mdash; no pets</span>
-    </label>
-    <label class="pet-choice">
-        <input type="radio" name="dog_count" value="2" {_chk(in_small_bucket)} />
-        <span>1 or 2 dogs &nbsp;<em>($20)</em></span>
-    </label>
-    <label class="pet-choice">
-        <input type="radio" name="dog_count" value="3" {_chk(current == 3)} />
-        <span>3 dogs &nbsp;<em>($40)</em></span>
+        <input type="checkbox" name="dog_count" value="1" {checked} />
+        <span>Yes, I'm bringing a dog(s). <em>($20 dog fee for up to a week)</em></span>
     </label>
     <button type="submit">Save</button>
 </form>
@@ -1579,6 +1924,444 @@ def _render_pet_block(latest_decl, action_url: str) -> str:
 # actual count without checking the local DB.
 _PET_FEE_QUANTITY = {0: 0, 1: 1, 2: 1, 3: 2}
 _PET_FEE_PRICE = {0: 0, 1: 20, 2: 20, 3: 40}
+
+
+# ---- Room preferences -----------------------------------------------------
+
+# Pre-stay only: phases where the guest can still edit prefs. Anything past
+# this list shows a locked / read-only view. Mirrors _CHECKED_IN_PHASES
+# (defined earlier near the section-priority logic) by inversion.
+_PREFS_EDITABLE_PHASES = ("future", "arriving_today")
+
+
+async def _load_guest_prefs(
+    db: AsyncSession, reservation_id: str | None
+) -> tuple[list[str], bool]:
+    """Return (prioritized_keys, saved_before) for a reservation's
+    preferences. `saved_before` is True iff a row exists -- used as the
+    section's "complete" indicator. Unknown keys (canonical list changed
+    since save) are filtered out silently."""
+    if not reservation_id:
+        return [], False
+    from app.models.guest_preference import GuestPreference
+    row = await db.get(GuestPreference, reservation_id)
+    if row is None:
+        return [], False
+    try:
+        keys = json.loads(row.prioritized_json or "[]")
+    except (ValueError, TypeError):
+        keys = []
+    if not isinstance(keys, list):
+        keys = []
+    valid = valid_keys()
+    keys = [k for k in keys if isinstance(k, str) and k in valid]
+    return keys, True
+
+
+async def _save_guest_prefs(
+    db: AsyncSession,
+    reservation_id: str,
+    keys: list[str],
+    request: Request,
+) -> None:
+    """UPSERT the guest's prioritized preference list. Unknown keys are
+    dropped server-side; only canonical-list members survive."""
+    from app.models.guest_preference import GuestPreference
+    valid = valid_keys()
+    # Deduplicate while preserving order (a guest might have a stale dup
+    # via two saves racing; the first occurrence wins).
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for k in keys:
+        if isinstance(k, str) and k in valid and k not in seen:
+            seen.add(k)
+            ordered.append(k)
+    payload = json.dumps(ordered)
+    existing = await db.get(GuestPreference, reservation_id)
+    now = datetime.utcnow()
+    if existing is not None:
+        existing.prioritized_json = payload
+        existing.updated_at = now
+        existing.client_ip = _client_ip(request)
+        existing.user_agent = request.headers.get("user-agent", "")[:500]
+    else:
+        db.add(GuestPreference(
+            reservation_id=reservation_id,
+            prioritized_json=payload,
+            updated_at=now,
+            client_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent", "")[:500],
+        ))
+    await db.commit()
+
+
+def _render_prefs_section_html(
+    *,
+    action_url: str,
+    prioritized: list[str],
+    saved_before: bool,
+    phase: str,
+) -> str:
+    """Render the room-preferences accordion body.
+
+    Editable view (future / arriving_today): two drop zones managed by
+    Sortable.js. "Matters to me" on top (ordered, with priority numbers);
+    "No preference" below (any order). JS serializes the matters-list
+    order into a hidden `prefs_json` field on submit.
+
+    Read-only view (in_house / departing_today / past): shows the saved
+    list with a note that prefs are locked once the guest checks in. If
+    no prefs were ever saved, shows a softer empty-state message.
+
+    Loads Sortable.js from CDN once per page render. Lightweight (~30KB)
+    and the de facto choice for touch-friendly DnD."""
+    editable = phase in _PREFS_EDITABLE_PHASES
+
+    # --- Read-only branch ----------------------------------------------
+    if not editable:
+        if not prioritized:
+            return (
+                '<p class="prefs-readonly-empty">No preferences were '
+                'recorded for this stay.</p>'
+            )
+        items_html = "\n".join(
+            f'<li>{_esc(p.label)}</li>'
+            for k in prioritized
+            for p in [next((p for p in AVAILABLE_PREFS if p.key == k), None)]
+            if p is not None
+        )
+        return (
+            '<p class="prefs-locked-note">Preferences are locked once '
+            "you've checked in. Here's what was on file:</p>"
+            f'<ol class="prefs-readonly-list">{items_html}</ol>'
+        )
+
+    # --- Editable branch -----------------------------------------------
+    # Split canonical list into matters (in saved order) + nopref (rest).
+    in_matters = set(prioritized)
+    matters_prefs = [
+        next(p for p in AVAILABLE_PREFS if p.key == k)
+        for k in prioritized
+        if any(p.key == k for p in AVAILABLE_PREFS)
+    ]
+    nopref_prefs = [p for p in AVAILABLE_PREFS if p.key not in in_matters]
+
+    def _item(p, with_priority_idx: int | None) -> str:
+        tip = f'<small>{_esc(p.tip)}</small>' if p.tip else ''
+        priority = (
+            f'<span class="pref-priority" aria-label="priority {with_priority_idx}">'
+            f'{with_priority_idx}</span>'
+            if with_priority_idx is not None else ''
+        )
+        return (
+            f'<li class="pref-item" data-key="{_esc(p.key)}">'
+            f'<span class="pref-handle" aria-hidden="true">≡</span>'
+            f'<span class="pref-label">{_esc(p.label)}{tip}</span>'
+            f'{priority}'
+            f'</li>'
+        )
+
+    matters_html = "\n".join(_item(p, i + 1) for i, p in enumerate(matters_prefs))
+    nopref_html = "\n".join(_item(p, None) for p in nopref_prefs)
+    intro = (
+        "Drag the things you care about into "
+        "<strong>Matters to me</strong> in priority order — top of the "
+        "list is most important. Anything in <strong>No preference</strong> "
+        "we treat as a don't-care. Not guaranteed, but we use this when "
+        "we assign rooms on the morning of arrival."
+    )
+    note = (
+        '<p class="prefs-locked-note">Heads up: preferences lock once '
+        "you've checked in.</p>"
+    )
+
+    return f"""
+<p class="prefs-intro">{intro}</p>
+{note}
+<form class="prefs-form" method="post" action="{action_url}" novalidate>
+    <div class="prefs-zones">
+        <div class="prefs-zone matters">
+            <h3>Matters to me (in priority order)</h3>
+            <ul id="prefs-matters" class="prefs-list" data-empty="Drag preferences here.">
+                {matters_html}
+            </ul>
+        </div>
+        <div class="prefs-zone nopref">
+            <h3>No preference</h3>
+            <ul id="prefs-nopref" class="prefs-list" data-empty="(nothing here)">
+                {nopref_html}
+            </ul>
+        </div>
+    </div>
+    <input type="hidden" name="prefs_json" id="prefs-json-input" value="[]" />
+    <button type="submit">Save preferences</button>
+</form>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+<script>
+(function() {{
+    const matters = document.getElementById('prefs-matters');
+    const nopref = document.getElementById('prefs-nopref');
+    if (!matters || !nopref || typeof Sortable === 'undefined') return;
+    function refreshPriorities() {{
+        // Recompute the 1..N priority pill on each "matters" item after
+        // any reorder. Removes the pill from anything in "no preference".
+        Array.from(matters.children).forEach(function(li, i) {{
+            let pill = li.querySelector('.pref-priority');
+            if (!pill) {{
+                pill = document.createElement('span');
+                pill.className = 'pref-priority';
+                li.appendChild(pill);
+            }}
+            pill.textContent = (i + 1).toString();
+            pill.setAttribute('aria-label', 'priority ' + (i + 1));
+        }});
+        Array.from(nopref.children).forEach(function(li) {{
+            const pill = li.querySelector('.pref-priority');
+            if (pill) pill.remove();
+        }});
+    }}
+    const opts = {{ group: 'prefs', animation: 150, onSort: refreshPriorities }};
+    Sortable.create(matters, opts);
+    Sortable.create(nopref, opts);
+    refreshPriorities();
+    document.querySelector('.prefs-form').addEventListener('submit', function() {{
+        const keys = Array.from(matters.children)
+            .map(function(li) {{ return li.dataset.key || ''; }})
+            .filter(Boolean);
+        document.getElementById('prefs-json-input').value = JSON.stringify(keys);
+    }});
+}})();
+</script>
+"""
+
+
+def _render_faq_section_html(*, match_url: str, ask_url: str, log_tap_url: str) -> str:
+    """Live-matching FAQ search + Ask-Iris fallback button.
+
+    UX:
+      1. Guest types in a text box. 300ms debounce -> XHR to `match_url`.
+      2. Server returns top FAQ matches + the current throttle state.
+      3. Matches render as expandable <details>; clicking shows the
+         answer inline.
+      4. If no matches AND throttle isn't blocked: show "Ask Iris"
+         button (possibly after a delay if the guest has used >10 LLM
+         calls today).
+      5. Button click -> POST to `ask_url` with the question. Response
+         renders below in a highlighted card.
+      6. If throttle is blocked: show the blocked message, no button.
+
+    All state is server-driven -- the client just renders what comes
+    back. Keeps the rate-limit / throttle logic in one place."""
+    match_url_js = json.dumps(match_url)
+    ask_url_js = json.dumps(ask_url)
+    log_tap_url_js = json.dumps(log_tap_url)
+    return f"""
+<p class="faq-intro">Ask anything about the hotel, the area, or your stay. Start typing and we'll try to find the answer below.</p>
+<input type="text" id="faq-search" class="faq-search"
+       placeholder="Type a question..." autocomplete="off"
+       aria-label="Ask a question" />
+<div id="faq-status" class="faq-status" aria-live="polite"></div>
+<ul id="faq-results" class="faq-results"></ul>
+<p id="faq-no-match" class="faq-no-match" style="display:none">
+    No FAQ entry matched your question.
+</p>
+<p id="faq-ask-iris-pending" class="faq-ask-iris-pending"></p>
+<button type="button" id="faq-ask-iris-btn" class="faq-ask-iris-btn">
+    Ask Iris (longer answer)
+</button>
+<div id="faq-blocked" class="faq-blocked" style="display:none"></div>
+<div id="faq-iris-response" class="faq-iris-response" role="status" aria-live="polite">
+    <div class="iris-label">Iris</div>
+    <div class="iris-answer"></div>
+    <div class="iris-meta"></div>
+</div>
+<script>
+(function() {{
+    const MATCH_URL = {match_url_js};
+    const ASK_URL = {ask_url_js};
+    const LOG_TAP_URL = {log_tap_url_js};
+    const input = document.getElementById('faq-search');
+    const status = document.getElementById('faq-status');
+    const results = document.getElementById('faq-results');
+    const noMatch = document.getElementById('faq-no-match');
+    const askBtn = document.getElementById('faq-ask-iris-btn');
+    const askPending = document.getElementById('faq-ask-iris-pending');
+    const blocked = document.getElementById('faq-blocked');
+    const respBox = document.getElementById('faq-iris-response');
+    const respAnswer = respBox.querySelector('.iris-answer');
+    const respMeta = respBox.querySelector('.iris-meta');
+    if (!input) return;
+
+    let debounceTimer = null;
+    let askButtonTimer = null;
+    let currentQuestion = '';
+    let currentState = null;  // last throttle state from server
+
+    function escapeHtml(s) {{
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }}
+
+    function clearResults() {{
+        results.innerHTML = '';
+        noMatch.style.display = 'none';
+        askBtn.style.display = 'none';
+        askPending.style.display = 'none';
+        blocked.style.display = 'none';
+        if (askButtonTimer) {{ clearTimeout(askButtonTimer); askButtonTimer = null; }}
+    }}
+
+    // Track which (question, slug) pairs we've already logged. Without
+    // this, every accordion open/close fires the toggle event again --
+    // we don't want to double-log a guest who closes and re-opens the
+    // same entry.
+    const tappedThisSession = new Set();
+
+    function renderMatches(matches) {{
+        results.innerHTML = matches.map(function(m) {{
+            return '<li><details class="faq-result" data-slug="' + escapeHtml(m.slug) + '">'
+                + '<summary>' + escapeHtml(m.question) + '</summary>'
+                + '<div class="faq-answer">' + escapeHtml(m.answer) + '</div>'
+                + '</details></li>';
+        }}).join('');
+        // Bind a single `toggle` listener per <details>. Fires every
+        // open AND close, so we filter inside.
+        Array.from(results.querySelectorAll('details.faq-result')).forEach(function(d) {{
+            d.addEventListener('toggle', function() {{
+                if (!d.open) return;
+                const slug = d.getAttribute('data-slug') || '';
+                if (!slug || !currentQuestion) return;
+                const tapKey = currentQuestion + '|' + slug;
+                if (tappedThisSession.has(tapKey)) return;
+                tappedThisSession.add(tapKey);
+                // Fire-and-forget. Logging failures shouldn't disrupt
+                // the guest's UX; we'll lose the data point and move on.
+                fetch(LOG_TAP_URL, {{
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ question: currentQuestion, slug: slug }}),
+                }}).catch(function() {{ /* swallow */ }});
+            }});
+        }});
+    }}
+
+    function showAskIris(state) {{
+        if (!currentQuestion || currentQuestion.length < 3) {{
+            // Don't offer the LLM for trivially short input -- avoids
+            // accidental quota burn.
+            return;
+        }}
+        if (state.blocked) {{
+            blocked.textContent = state.blocked_message || 'Daily question limit reached.';
+            blocked.style.display = '';
+            return;
+        }}
+        const delay = Math.max(0, state.delay_seconds || 0);
+        if (delay > 0) {{
+            askPending.textContent = 'Iris is preparing... (' + delay + 's)';
+            askPending.style.display = '';
+            let remaining = delay;
+            askButtonTimer = setInterval(function() {{
+                remaining--;
+                if (remaining <= 0) {{
+                    clearInterval(askButtonTimer); askButtonTimer = null;
+                    askPending.style.display = 'none';
+                    askBtn.style.display = '';
+                }} else {{
+                    askPending.textContent = 'Iris is preparing... (' + remaining + 's)';
+                }}
+            }}, 1000);
+        }} else {{
+            askBtn.style.display = '';
+        }}
+        const remaining_count = (state.daily_limit || 0) - (state.used_today || 0);
+        if (remaining_count > 0 && remaining_count <= 5) {{
+            askBtn.textContent = 'Ask Iris (longer answer) - ' + remaining_count + ' left today';
+        }} else {{
+            askBtn.textContent = 'Ask Iris (longer answer)';
+        }}
+    }}
+
+    async function fetchMatches(q) {{
+        currentQuestion = q;
+        clearResults();
+        if (!q || q.length < 2) {{
+            status.textContent = '';
+            return;
+        }}
+        status.textContent = 'Searching...';
+        try {{
+            const resp = await fetch(MATCH_URL + '?q=' + encodeURIComponent(q), {{
+                method: 'GET', credentials: 'same-origin',
+            }});
+            const data = await resp.json().catch(function() {{ return {{}}; }});
+            currentState = data.throttle || {{}};
+            status.textContent = '';
+            if (data.matches && data.matches.length > 0) {{
+                renderMatches(data.matches);
+            }} else {{
+                noMatch.style.display = '';
+                showAskIris(currentState);
+            }}
+        }} catch (ex) {{
+            status.textContent = 'Search failed: ' + (ex && ex.message || ex);
+        }}
+    }}
+
+    input.addEventListener('input', function() {{
+        const q = input.value.trim();
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(function() {{ fetchMatches(q); }}, 300);
+    }});
+
+    askBtn.addEventListener('click', async function() {{
+        if (!currentQuestion) return;
+        askBtn.disabled = true;
+        askBtn.textContent = 'Asking Iris...';
+        respBox.style.display = 'none';
+        try {{
+            const resp = await fetch(ASK_URL, {{
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ question: currentQuestion }}),
+            }});
+            const data = await resp.json().catch(function() {{ return {{}}; }});
+            if (data.answer) {{
+                respAnswer.textContent = data.answer;
+                respMeta.textContent = data.web_search_used
+                    ? '(answer used a web search for current info)'
+                    : '';
+                respBox.style.display = '';
+            }} else if (data.error) {{
+                respAnswer.textContent = 'I could not reach the LLM right now. Please call the front desk at 541-997-3221.';
+                respMeta.textContent = '';
+                respBox.style.display = '';
+            }}
+            if (data.throttle) {{
+                currentState = data.throttle;
+                if (currentState.blocked) {{
+                    askBtn.style.display = 'none';
+                    blocked.textContent = currentState.blocked_message || '';
+                    blocked.style.display = '';
+                }}
+            }}
+        }} catch (ex) {{
+            respAnswer.textContent = 'Network error: ' + (ex && ex.message || ex);
+            respMeta.textContent = '';
+            respBox.style.display = '';
+        }} finally {{
+            askBtn.disabled = false;
+            askBtn.textContent = 'Ask Iris (longer answer)';
+        }}
+    }});
+}})();
+</script>
+"""
 
 
 def _is_contact_section_complete(res: dict) -> bool:
@@ -1610,16 +2393,23 @@ def _saved_banner_html(saved: str | None) -> str:
 
 
 def _render_room_block(res: dict, signature_complete: bool, card_on_file: bool) -> str:
-    """Operational gate: until both signature and incidentals card are
-    confirmed, the door code stays out of the lock AND off the portal page.
-    Show the guest what they need to do to unlock the code.
+    """Content for the welcome box's room/door-code area.
 
-    For phase == future we always show the 'will be assigned morning of'
-    framing -- room assignment runs that morning even after sig+CC done.
+    Three states the welcome box can render:
+      (a) Gated -- guest still has paperwork. Show what's missing instead
+          of room/code. The required accordions auto-open below.
+      (b) Unlocked + no room yet -- room assignment runs the morning of
+          arrival. Reassure the guest the code will appear here.
+      (c) Unlocked + room assigned -- show the room as a collapsible
+          "Room: <name>" header (tapping reveals directions) plus a
+          compact door-code pill on the next line.
 
-    signature_complete / card_on_file are stubs for now -- those features
-    will write real state once built. Both default to False so the gated
-    prompt shows up until the underlying features land."""
+    Stay phase carve-outs:
+      - past / unknown: brief thank-you, no room block
+      - future + gate open + no room yet: same "assigned that morning"
+        copy used for arriving_today guests, since either is the right
+        framing
+    """
     phase = res.get("stay_phase") or "unknown"
     door_code = (res.get("door_code") or "").strip()
     room_name = (res.get("room_name") or "").strip()
@@ -1637,7 +2427,7 @@ def _render_room_block(res: dict, signature_complete: bool, card_on_file: bool) 
         missing_text = " and ".join(missing)
         return (
             f'<div class="gated-prompt">Please {missing_text} below. '
-            f'Once both are complete, we\'ll send your room number and door code here.</div>'
+            f'Once both are complete, your room number and door code will appear here.</div>'
         )
 
     # Gate is open. Show whatever we currently have.
@@ -1647,16 +2437,29 @@ def _render_room_block(res: dict, signature_complete: bool, card_on_file: bool) 
             'Your door code will appear here as soon as it\'s set up.</p>'
         )
 
-    parts = []
+    parts: list[str] = []
     if room_name:
-        parts.append(f'<dl class="kv"><dt>Room</dt><dd><strong>{room_name}</strong></dd></dl>')
+        # Directions content is a placeholder until we have per-room
+        # directions captured in config. The structure is in place; fill
+        # in the body when ready.
+        parts.append(
+            f'<details class="room-directions">'
+            f'<summary>Room: <strong>{_esc(room_name)}</strong></summary>'
+            f'<div class="directions-body">'
+            f'<p>Directions to your room will appear here. If you can\'t find it, '
+            f'please call the front desk at '
+            f'<a href="tel:{settings.hotel_phone_tel}">{settings.hotel_phone_display}</a>.</p>'
+            f'</div></details>'
+        )
     else:
         parts.append('<p>Your room is being assigned now.</p>')
     if door_code:
-        parts.append(f'<p>Door code:</p><div class="code-display">{door_code}</div>')
-        parts.append('<p class="hint">Tap to copy. The code unlocks both your room and the building entry.</p>')
+        parts.append(
+            f'<div class="door-code-line">Door code: '
+            f'<span class="code-pill">{_esc(door_code)}</span></div>'
+        )
     else:
-        parts.append('<p class="hint">Your door code will appear here once your room is ready.</p>')
+        parts.append('<p class="hint" style="margin-top:8px;">Your door code will appear here once your room is ready.</p>')
     return "".join(parts)
 
 
@@ -1670,16 +2473,20 @@ async def _render_portal_for_reservation(
     contact_overrides: dict[str, str] | None = None,
     card_msg: str | None = None,
     card_overrides: dict[str, str] | None = None,
+    open_section: str | None = None,
 ) -> HTMLResponse:
     guest_name = (res.get("guest_name") or "").strip()
     first_name = guest_name.split(" ")[0] if guest_name else first_name_fallback
+    # Greeting uses the full name if we have one ("Hi Jane Mariner!"), else
+    # falls back to the first-name placeholder ("Hi Jane!" or "Hi there!").
+    guest_name_display = guest_name or (first_name_fallback or "there")
     phase = res.get("stay_phase") or "unknown"
     cb_status = res.get("status") or ""
-    check_in = res.get("check_in") or ""
-    check_out = res.get("check_out") or ""
+    check_in_iso = res.get("check_in") or ""
+    check_out_iso = res.get("check_out") or ""
     res_id_raw = res.get("reservation_id") or ""
     reservation_id_display = res_id_raw or "—"
-    s = _status_for_phase(phase, cb_status, check_in, check_out)
+    s = _status_for_phase(phase, cb_status, check_in_iso, check_out_iso)
 
     countdown = _format_stay_countdown(phase, res.get("start_iso"), res.get("end_iso"))
     if countdown:
@@ -1695,7 +2502,7 @@ async def _render_portal_for_reservation(
     latest_sig = await _latest_signature_agreement(db, res_id_raw)
     signature_complete = latest_sig is not None
     card_on_file = _has_real_card_on_file(res)
-    room_block = _render_room_block(
+    welcome_room_block = _render_room_block(
         res, signature_complete=signature_complete, card_on_file=card_on_file,
     )
 
@@ -1703,65 +2510,164 @@ async def _render_portal_for_reservation(
     contact_block = _render_contact_block(
         res, contact_action_url, sms_opted_in, overrides=contact_overrides,
     )
-    contact_complete = _is_contact_section_complete(res)
-    # Open the accordion when the user is being asked to re-check a field
-    # (post-warn redirect) so they don't have to hunt for it. The URL fragment
-    # in the redirect (#contact-section) handles the actual scroll.
+    # Contact "complete" requires BOTH Cloudbeds-fields-OK AND
+    # guest-acknowledged-via-portal. OTAs pre-populate addresses that are
+    # often stale; we want the guest to actively confirm at least once.
+    contact_fields_complete = _is_contact_section_complete(res)
+    contact_acknowledged = await _contact_is_acknowledged(db, res_id_raw)
+    contact_complete = contact_fields_complete and contact_acknowledged
+    contact_title = (
+        "📋 Address and phone" if contact_complete
+        else "📋 Confirm address &amp; phone"
+    )
+    actionable_phase = phase not in ("past", "unknown")
+    # Auto-open the contact section when (a) we redirected here on error
+    # OR (b) the guest hasn't acknowledged yet and the stay hasn't ended.
+    # The latter implements the user's "first visit, please check it"
+    # rule -- closes once they save.
     contact_open_attr = (
         "open"
-        if (saved in ("contact_phone_warn", "contact_error") or contact_overrides)
+        if (
+            saved in ("contact_phone_warn", "contact_error")
+            or contact_overrides
+            or (actionable_phase and not contact_complete)
+        )
         else ""
     )
 
     # Pet declaration: latest row drives the form pre-fill and the checkmark.
-    # Section is "complete" once the guest has saved it at least once -- even
-    # answering "no pets" counts as an acknowledgement.
+    # Section is "complete" once the guest has saved it at least once --
+    # even answering "no" counts as an acknowledgement.
     pet_action_url = contact_action_url.replace("/contact", "/pets")
     pet_latest = await _latest_pet_declaration(db, res_id_raw)
     pet_block = _render_pet_block(pet_latest, pet_action_url)
-    pet_complete_class = "complete" if pet_latest is not None else ""
+    pet_complete = pet_latest is not None
     pet_open_attr = "open" if saved in ("pets_error",) else ""
 
+    # Room preferences: drag-and-drop priority list. Editable pre-stay,
+    # read-only once checked in. "Complete" means the guest has saved at
+    # least once (even an empty list counts -- it's explicit "I don't
+    # care about any of these"). See _render_prefs_section_html.
+    prefs_action_url = contact_action_url.replace("/contact", "/preferences")
+    prefs_keys, prefs_saved = await _load_guest_prefs(db, res_id_raw)
+    prefs_block = _render_prefs_section_html(
+        action_url=prefs_action_url,
+        prioritized=prefs_keys,
+        saved_before=prefs_saved,
+        phase=phase,
+    )
+    prefs_open_attr = "open" if saved in ("prefs_error",) else ""
+
+    # FAQ + Ask Iris: live-matching search box backed by knowledge_base.md
+    # with an LLM fallback when no FAQ entry matches. URLs route to the
+    # match endpoint (per-keystroke XHR) and the ask-iris endpoint
+    # (LLM call). Both auth via the same path scope as the page itself.
+    faq_match_url = contact_action_url.replace("/contact", "/faq-match")
+    faq_ask_url = contact_action_url.replace("/contact", "/ask-iris")
+    faq_log_tap_url = contact_action_url.replace("/contact", "/log-faq-tap")
+    faq_block = _render_faq_section_html(
+        match_url=faq_match_url,
+        ask_url=faq_ask_url,
+        log_tap_url=faq_log_tap_url,
+    )
+
     # Signature agreement: complete = a SignatureAgreement row exists. Form
-    # vs read-only summary is decided inside _render_sign_block.
+    # vs read-only summary is decided inside _render_sign_block. Title drops
+    # the imperative once signed.
     sign_action_url = contact_action_url.replace("/contact", "/sign")
     sign_block = _render_sign_block(latest_sig, sign_action_url, guest_name)
-    sign_complete_class = "complete" if signature_complete else ""
-    sign_open_attr = "open" if saved in ("sign_error",) else ""
+    sign_title = "✍️ Rental agreement" if signature_complete else "✍️ Sign the rental agreement"
+    sign_open_attr = (
+        "open"
+        if (saved in ("sign_error",) or (actionable_phase and not signature_complete))
+        else ""
+    )
 
     # Credit card on file: form lists existing cards + lets the guest add
-    # a new one via Stripe Elements. Section is "complete" when there's a
+    # a new one via Stripe Elements. The form's Stripe.js call tokenizes
+    # against Cloudbeds' platform Stripe account; the resulting tok_xxx is
+    # POSTed to action_url as JSON and the server forwards it to
+    # /hotel/save_credit_card. Section is "complete" when there's a
     # non-virtual card on the reservation.
     card_action_url = contact_action_url.replace("/contact", "/cards")
     card_block = _render_card_block(
-        res, card_action_url, settings.stripe_publishable_key,
-        overrides=card_overrides, error_message=card_msg,
+        res, card_action_url,
+        cardholder_default_name=guest_name,
     )
-    card_complete_class = "complete" if card_on_file else ""
-    card_open_attr = "open" if (saved == "card_error" or card_msg) else ""
+    card_open_attr = (
+        "open"
+        if (
+            open_section == "card"
+            or saved == "card_error"
+            or card_msg
+            or (actionable_phase and not card_on_file)
+        )
+        else ""
+    )
+
+    # Build each completable section's HTML (the four with forms). The
+    # static coming-soon sections come from module constants.
+    def _accord(section_id: str, complete: bool, open_attr: str, title: str, body_html: str) -> str:
+        complete_class = "complete" if complete else ""
+        return (
+            f'<details class="accord {complete_class}" id="{section_id}" {open_attr}>\n'
+            f'    <summary>\n'
+            f'        <span class="accord-title">{title}</span>\n'
+            f'        <span class="accord-check" aria-label="completed">✓</span>\n'
+            f'    </summary>\n'
+            f'    <div class="accord-body">{body_html}</div>\n'
+            f'</details>'
+        )
+
+    contact_html = _accord("contact-section", contact_complete, contact_open_attr, contact_title, contact_block)
+    sign_html = _accord("sign-section", signature_complete, sign_open_attr, sign_title, sign_block)
+    card_html = _accord("card-section", card_on_file, card_open_attr, "💳 Credit card on file", card_block)
+    pet_html = _accord("pet-section", pet_complete, pet_open_attr, "🐕 Bringing a pet?", pet_block)
+    prefs_html = _accord("prefs-section", prefs_saved, prefs_open_attr, "🛏️ Room preferences", prefs_block)
+    faq_html = _accord("faq-section", False, "", "❓ FAQ &amp; Ask Iris", faq_block)
+
+    # Build the ordered list. Tuples of (priority, html). Sort by priority,
+    # join. Each section's priority is computed from completion + phase
+    # via _section_priority above.
+    # Check Out has no standalone accordion -- it's hidden until the
+    # actual checkout day, at which point the action button is rendered
+    # inline in the status section (see body_html_block below). This is
+    # the user's stated preference: don't clutter the section list with
+    # a coming-soon stub for an action that's only valid one day.
+    sections: list[tuple[int, str]] = [
+        (_section_priority("contact", complete=contact_complete, phase=phase), contact_html),
+        (_section_priority("sign", complete=signature_complete, phase=phase), sign_html),
+        (_section_priority("card", complete=card_on_file, phase=phase), card_html),
+        (_section_priority("pet", complete=pet_complete, phase=phase), pet_html),
+        (_section_priority("prefs", complete=prefs_saved, phase=phase), prefs_html),
+        (_section_priority("faq", complete=False, phase=phase), faq_html),
+        (_section_priority("cancel", complete=False, phase=phase), _COMING_SOON_CANCEL_HTML),
+    ]
+    sections.sort(key=lambda t: t[0])
+    ordered_sections_html = "\n\n".join(html for _, html in sections)
+
+    # Status section body. Hide the <p> entirely when there's no body
+    # copy (in_house phase has just a headline now). On departing_today
+    # the checkout button gets appended under the body text so the
+    # action lives where the prompt does.
+    body_text = s["body"] or ""
+    body_parts: list[str] = []
+    if body_text:
+        body_parts.append(f"<p>{body_text}</p>")
+    if phase == "departing_today":
+        body_parts.append(_CHECKOUT_INLINE_BUTTON_HTML)
+    body_html_block = "".join(body_parts)
 
     body = _PORTAL_PAGE_BODY_TPL.format(
-        first_name=first_name or "there",
+        guest_name_display=guest_name_display,
         saved_banner_html=_saved_banner_html(saved),
         badge=s["badge"], badge_class=s["badge_class"],
-        headline=s["headline"], body=s["body"],
-        check_in=check_in or "—",
-        check_out=check_out or "—",
+        headline=s["headline"], body_html=body_html_block,
+        check_in=_format_date_friendly(check_in_iso) or "—",
+        check_out=_format_date_friendly(check_out_iso) or "—",
         countdown_html=countdown_html,
-        room_block=room_block,
-        contact_block=contact_block,
-        contact_complete_class="complete" if contact_complete else "",
-        contact_open_attr=contact_open_attr,
-        pet_block=pet_block,
-        pet_complete_class=pet_complete_class,
-        pet_open_attr=pet_open_attr,
-        sign_block=sign_block,
-        sign_complete_class=sign_complete_class,
-        sign_open_attr=sign_open_attr,
-        card_block=card_block,
-        card_complete_class=card_complete_class,
-        card_open_attr=card_open_attr,
-        guest_name=guest_name or "—",
+        welcome_room_block=welcome_room_block,
+        ordered_sections_html=ordered_sections_html,
         reservation_id=reservation_id_display,
         phone_tel=settings.hotel_phone_tel or settings.hotel_phone_display,
         phone_display=settings.hotel_phone_display,
@@ -1790,6 +2696,7 @@ async def guest_portal_by_token(
     card_msg: str | None = None,
     card_name: str | None = None,
     card_zip: str | None = None,
+    open: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Long-token flow: the URL that's embedded in SMS. The token IS the
@@ -1821,6 +2728,7 @@ async def guest_portal_by_token(
         contact_overrides=_overrides_from_qs(cell, phone),
         card_msg=card_msg,
         card_overrides={"card_holder_name": card_name or "", "card_address_zip": card_zip or ""},
+        open_section=open,
     )
 
 
@@ -1932,6 +2840,7 @@ async def guest_portal_short(
     card_msg: str | None = None,
     card_name: str | None = None,
     card_zip: str | None = None,
+    open: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Short-URL flow with optional bot-challenge gate.
@@ -1985,6 +2894,7 @@ async def guest_portal_short(
                         contact_overrides=_overrides_from_qs(cell, phone),
                         card_msg=card_msg,
                         card_overrides={"card_holder_name": card_name or "", "card_address_zip": card_zip or ""},
+                        open_section=open,
                     ),
                     verified_res_id,
                 )
@@ -2006,6 +2916,7 @@ async def guest_portal_short(
                     contact_overrides=_overrides_from_qs(cell, phone),
                     card_msg=card_msg,
                     card_overrides={"card_holder_name": card_name or "", "card_address_zip": card_zip or ""},
+                    open_section=open,
                 ),
                 verified_res_id,
             )
@@ -2054,6 +2965,7 @@ async def guest_portal_short(
             contact_overrides=_overrides_from_qs(cell, phone),
             card_msg=card_msg,
             card_overrides={"card_holder_name": card_name or "", "card_address_zip": card_zip or ""},
+            open_section=open,
         ),
         str(summary.get("reservation_id") or ""),
     )
@@ -2185,11 +3097,19 @@ def _build_card_redirect(
     base_path: str, ok: bool, err: str,
     *, card_holder_name: str = "", card_address_zip: str = "",
 ) -> str:
-    """Build the redirect URL after a card-add POST. On failure we carry
-    back the SAFE fields the guest typed (name + ZIP) so they don't have
-    to re-enter them along with the rest -- and the Cloudbeds error
-    message so the next page can tell the guest WHY it failed instead of
-    a generic 'couldn't save'.
+    """[DEPRECATED 2026-05-27] Build the redirect URL after a card-add POST.
+
+    Was the success/error redirect-target builder for the old raw-PAN form
+    (`_apply_card_attach` -> `postCreditCard`). The current Stripe Elements
+    flow returns JSON; the JS handler does its own window.location reload
+    on success and inline error rendering on failure, so no server-side
+    redirect URL is built. Kept temporarily in case the old form path is
+    revived for an admin-only backend tool.
+
+    On failure we carry back the SAFE fields the guest typed (name + ZIP)
+    so they don't have to re-enter them along with the rest -- and the
+    Cloudbeds error message so the next page can tell the guest WHY it
+    failed instead of a generic 'couldn't save'.
 
     PCI: PAN/CVV/expiration are NEVER included in the redirect URL.
     They're typed fresh on each retry.
@@ -2343,6 +3263,12 @@ async def _apply_contact_update(
             new_action, reservation_id, len(written_phones),
             ", ".join("..." + p[-4:] if p else "(none)" for p in written_phones),
         )
+
+    # Mark the contact section as acknowledged for this reservation. This
+    # is what "completes" the address section in the portal -- not the
+    # Cloudbeds data being non-empty (OTA-pre-populated addresses are
+    # often stale; we want the guest's active confirmation).
+    await _mark_contact_acknowledged(db, reservation_id, request)
 
     _invalidate_reservations_cache()
     if any_phone_invalid:
@@ -2583,6 +3509,804 @@ async def post_pets_by_prefix(
     return RedirectResponse(url=f"/h{prefix}?saved={code}#pet-section", status_code=303)
 
 
+# ---- Room preferences -------------------------------------------------------
+#
+# Guest-facing POST: parse the JSON list submitted by the Sortable.js form,
+# filter against the canonical preference list, save. Refuses to save once
+# the guest is checked in -- preferences lock at that point (room is
+# already assigned).
+#
+# Two near-identical handlers (/g/{token}/preferences + /h{stem}/preferences)
+# share _apply_prefs_save which does the parse + lock-check + save.
+
+
+def _parse_prefs_json(raw: str) -> list[str]:
+    """Best-effort parse of the form's prefs_json field. Returns a list
+    of strings; any other shape (dict, int, malformed JSON, non-string
+    items) collapses to []. Filtering against the canonical key list
+    happens later in _save_guest_prefs -- we don't have to do it here."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [s for s in parsed if isinstance(s, str)]
+
+
+async def _apply_prefs_save(
+    reservation_id: str,
+    request: Request,
+    db: AsyncSession,
+    *,
+    prefs_json_raw: str,
+) -> tuple[bool, str]:
+    """Save the guest's prefs after running the editable-phase gate.
+    Returns (ok, error_message)."""
+    res = await get_reservation_by_id(reservation_id)
+    phase = (res or {}).get("stay_phase") or "unknown"
+    if phase not in _PREFS_EDITABLE_PHASES:
+        log.info(
+            "portal: prefs save refused for res=%s -- phase=%s is non-editable",
+            reservation_id, phase,
+        )
+        return False, "Preferences are locked once you've checked in."
+    keys = _parse_prefs_json(prefs_json_raw)
+    await _save_guest_prefs(db, reservation_id, keys, request)
+    log.info("portal: prefs saved for res=%s (%d in matters)", reservation_id, len(keys))
+    return True, ""
+
+
+@router.post("/g/{token}/preferences")
+async def post_prefs_by_token(
+    token: str,
+    request: Request,
+    prefs_json: str = Form(default="[]"),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(PortalToken, token)
+    if row is None or row.purpose != "guest_portal":
+        return _portal_page("Not found", _NOT_FOUND_PAGE)
+    if row.expires_at < datetime.utcnow():
+        return _portal_page("Expired", _EXPIRED_PAGE)
+    ok, _err = await _apply_prefs_save(
+        row.reservation_id, request, db, prefs_json_raw=prefs_json,
+    )
+    code = "prefs" if ok else "prefs_error"
+    return RedirectResponse(url=f"/g/{token}?saved={code}#prefs-section", status_code=303)
+
+
+@router.post("/h{stem}/preferences")
+async def post_prefs_by_prefix(
+    stem: str,
+    request: Request,
+    prefs_json: str = Form(default="[]"),
+    db: AsyncSession = Depends(get_db),
+):
+    prefix = _trim_to_first4_digits(stem)
+    if prefix is None:
+        return _portal_page("Not found", _NOT_FOUND_PAGE)
+    verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
+    if not verified_res_id or not verified_res_id.startswith(prefix):
+        log.warning("portal: prefs POST rejected ip=%s prefix=%s cookie=%s",
+                    _client_ip(request), prefix, "yes" if verified_res_id else "no")
+        return RedirectResponse(url=f"/h{prefix}", status_code=303)
+    ok, _err = await _apply_prefs_save(
+        verified_res_id, request, db, prefs_json_raw=prefs_json,
+    )
+    code = "prefs" if ok else "prefs_error"
+    return RedirectResponse(url=f"/h{prefix}?saved={code}#prefs-section", status_code=303)
+
+
+# ---- FAQ + Ask Iris -------------------------------------------------------
+#
+# Two endpoint pairs per portal-flow (token + prefix):
+#
+#   GET .../faq-match?q=<text>   -- per-keystroke matcher. Returns the top
+#                                   FAQ hits + current throttle state.
+#                                   No side effects, no logging.
+#   POST .../ask-iris            -- LLM fallback. Body: {"question": str}.
+#                                   Calls Anthropic, logs the Q&A row,
+#                                   enforces the daily LLM-call cap.
+#
+# Both endpoints share helpers in app.services.faq_* -- the heavy lifting
+# (KB load, matching, throttle, LLM call) lives there; these routes just
+# auth + wire up.
+
+
+class _FaqMatchItem(BaseModel):
+    slug: str
+    question: str
+    answer: str
+    score: float
+
+
+class _ThrottlePayload(BaseModel):
+    used_today: int
+    daily_limit: int
+    blocked: bool
+    delay_seconds: int
+    blocked_message: str
+
+
+class FaqMatchResponse(BaseModel):
+    matches: list[_FaqMatchItem]
+    throttle: _ThrottlePayload
+
+
+class AskIrisRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+
+
+class AskIrisResponse(BaseModel):
+    answer: str
+    web_search_used: bool
+    error: str | None
+    throttle: _ThrottlePayload
+
+
+async def _faq_match_payload(
+    db: AsyncSession, reservation_id: str, query: str,
+) -> FaqMatchResponse:
+    """Shared body of the two faq-match endpoints. Resolves throttle state
+    + ranks FAQ matches; returns a flat response the JS handler renders
+    against."""
+    from app.services.faq_match import rank_matches  # noqa: PLC0415
+    from app.services.faq_throttle import get_throttle_state  # noqa: PLC0415
+    ranked = rank_matches(query)
+    state = await get_throttle_state(db, reservation_id)
+    matches = [
+        _FaqMatchItem(
+            slug=entry.slug,
+            question=entry.question,
+            answer=entry.answer,
+            score=score,
+        )
+        for entry, score in ranked
+    ]
+    return FaqMatchResponse(
+        matches=matches,
+        throttle=_ThrottlePayload(
+            used_today=state.used_today,
+            daily_limit=state.daily_limit,
+            blocked=state.blocked,
+            delay_seconds=state.delay_seconds,
+            blocked_message=state.blocked_message,
+        ),
+    )
+
+
+def _day_of_stay(check_in_iso: str | None, now: datetime) -> int | None:
+    """Compute days-into-stay (or pre-stay) for a guest_qa row. -2 = two
+    days before check-in, 0 = arrival day, 1+ = nights in. Returns None
+    if we can't parse the check-in date."""
+    if not check_in_iso:
+        return None
+    try:
+        from datetime import date as _date
+        ci = _date.fromisoformat(str(check_in_iso)[:10])
+        return (now.date() - ci).days
+    except (ValueError, TypeError):
+        return None
+
+
+async def _ask_iris_and_log(
+    db: AsyncSession,
+    reservation_id: str,
+    question: str,
+    request: Request,
+) -> AskIrisResponse:
+    """Shared body of the two ask-iris endpoints. Re-checks the throttle
+    (defending against a race where the client called ask faster than the
+    button-delay UX should have allowed), runs the LLM call, writes the
+    guest_qa row, and returns the response payload."""
+    from app.services.faq_llm import ask_iris  # noqa: PLC0415
+    from app.services.faq_match import rank_matches  # noqa: PLC0415
+    from app.services.faq_throttle import get_throttle_state  # noqa: PLC0415
+    from app.models.guest_qa import GuestQa  # noqa: PLC0415
+
+    pre_state = await get_throttle_state(db, reservation_id)
+    if pre_state.blocked:
+        return AskIrisResponse(
+            answer="",
+            web_search_used=False,
+            error=pre_state.blocked_message,
+            throttle=_ThrottlePayload(
+                used_today=pre_state.used_today,
+                daily_limit=pre_state.daily_limit,
+                blocked=True,
+                delay_seconds=pre_state.delay_seconds,
+                blocked_message=pre_state.blocked_message,
+            ),
+        )
+
+    # Run the LLM call. Re-rank locally so we can log which (if any) FAQ
+    # entries matched -- helps staff later distinguish "guest ignored a
+    # perfect FAQ match" from "no FAQ match existed."
+    ranked = rank_matches(question)
+    matched_slugs = [e.slug for e, _ in ranked[:5]]
+    llm_result = await ask_iris(question)
+
+    # Log the row regardless of error -- audit + visibility matter.
+    res = await get_reservation_by_id(reservation_id)
+    check_in = (res or {}).get("check_in") or ""
+    now = datetime.utcnow()
+    db.add(GuestQa(
+        reservation_id=reservation_id,
+        asked_at=now,
+        question_text=question[:1000],
+        matched_faq_slugs_json=json.dumps(matched_slugs),
+        llm_used=True,
+        llm_response_text=llm_result.get("answer") or None,
+        llm_input_tokens=llm_result.get("input_tokens"),
+        llm_output_tokens=llm_result.get("output_tokens"),
+        day_of_stay=_day_of_stay(check_in, now),
+        client_ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent", "")[:500],
+    ))
+    await db.commit()
+
+    post_state = await get_throttle_state(db, reservation_id)
+    return AskIrisResponse(
+        answer=llm_result.get("answer") or "",
+        web_search_used=bool(llm_result.get("web_search_used")),
+        error=llm_result.get("error"),
+        throttle=_ThrottlePayload(
+            used_today=post_state.used_today,
+            daily_limit=post_state.daily_limit,
+            blocked=post_state.blocked,
+            delay_seconds=post_state.delay_seconds,
+            blocked_message=post_state.blocked_message,
+        ),
+    )
+
+
+@router.get("/g/{token}/faq-match", response_model=FaqMatchResponse)
+async def faq_match_by_token(
+    token: str,
+    q: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(PortalToken, token)
+    if row is None or row.purpose != "guest_portal":
+        raise HTTPException(status_code=404, detail="Link not found.")
+    if row.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="This link has expired.")
+    return await _faq_match_payload(db, row.reservation_id, q)
+
+
+@router.post("/g/{token}/ask-iris", response_model=AskIrisResponse)
+async def ask_iris_by_token(
+    token: str,
+    body: AskIrisRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(PortalToken, token)
+    if row is None or row.purpose != "guest_portal":
+        raise HTTPException(status_code=404, detail="Link not found.")
+    if row.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="This link has expired.")
+    return await _ask_iris_and_log(db, row.reservation_id, body.question, request)
+
+
+@router.get("/h{stem}/faq-match", response_model=FaqMatchResponse)
+async def faq_match_by_prefix(
+    stem: str,
+    request: Request,
+    q: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    prefix = _trim_to_first4_digits(stem)
+    if prefix is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
+    if not verified_res_id or not verified_res_id.startswith(prefix):
+        raise HTTPException(status_code=403, detail="Please re-open the portal.")
+    return await _faq_match_payload(db, verified_res_id, q)
+
+
+@router.post("/h{stem}/ask-iris", response_model=AskIrisResponse)
+async def ask_iris_by_prefix(
+    stem: str,
+    body: AskIrisRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    prefix = _trim_to_first4_digits(stem)
+    if prefix is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
+    if not verified_res_id or not verified_res_id.startswith(prefix):
+        raise HTTPException(status_code=403, detail="Please re-open the portal.")
+    return await _ask_iris_and_log(db, verified_res_id, body.question, request)
+
+
+# ---- FAQ-tap logging ------------------------------------------------------
+#
+# Fires when the guest expands a FAQ result. Creates a guest_qa row with
+# llm_used=False so the staff review page sees BOTH categories of
+# interaction (FAQ-tapped + LLM-asked) and can compute things like "this
+# guest tapped 3 FAQ entries on the same topic then escalated to LLM"
+# -- a strong signal that the FAQ answers weren't satisfying.
+#
+# The client de-dupes by (question, slug) tuple per page session, so we
+# don't get a row every time the guest opens and closes the same
+# accordion.
+
+
+class FaqTapRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+    slug: str = Field(min_length=1, max_length=100)
+
+
+async def _log_faq_tap(
+    db: AsyncSession,
+    reservation_id: str,
+    question: str,
+    slug: str,
+    request: Request,
+) -> None:
+    """Insert a guest_qa row for the FAQ-tap event. Best-effort -- any
+    failure is logged and swallowed so the portal UI doesn't break."""
+    from app.models.guest_qa import GuestQa  # noqa: PLC0415
+    try:
+        res = await get_reservation_by_id(reservation_id)
+        check_in = (res or {}).get("check_in") or ""
+        now = datetime.utcnow()
+        db.add(GuestQa(
+            reservation_id=reservation_id,
+            asked_at=now,
+            question_text=question[:1000],
+            matched_faq_slugs_json=json.dumps([slug]),
+            llm_used=False,
+            llm_response_text=None,
+            llm_input_tokens=None,
+            llm_output_tokens=None,
+            day_of_stay=_day_of_stay(check_in, now),
+            client_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent", "")[:500],
+        ))
+        await db.commit()
+    except Exception as ex:
+        log.warning("portal: log-faq-tap insert failed res=%s slug=%s: %s",
+                    reservation_id, slug, ex)
+
+
+@router.post("/g/{token}/log-faq-tap")
+async def log_faq_tap_by_token(
+    token: str,
+    body: FaqTapRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(PortalToken, token)
+    if row is None or row.purpose != "guest_portal":
+        raise HTTPException(status_code=404, detail="Link not found.")
+    if row.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="This link has expired.")
+    await _log_faq_tap(db, row.reservation_id, body.question, body.slug, request)
+    return {"ok": True}
+
+
+@router.post("/h{stem}/log-faq-tap")
+async def log_faq_tap_by_prefix(
+    stem: str,
+    body: FaqTapRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    prefix = _trim_to_first4_digits(stem)
+    if prefix is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
+    if not verified_res_id or not verified_res_id.startswith(prefix):
+        raise HTTPException(status_code=403, detail="Please re-open the portal.")
+    await _log_faq_tap(db, verified_res_id, body.question, body.slug, request)
+    return {"ok": True}
+
+
+# ---- DCS-facing: guest Q&A review feed ------------------------------------
+#
+# Staff use this to find FAQ gaps. Two derived signals are added on top
+# of the raw rows:
+#
+#   session_id          A short tag grouping consecutive Q&As from the
+#                       same reservation that occurred within 30 minutes
+#                       of each other. Multiple rows in one session ==
+#                       the guest was iterating; that's the prime FAQ-
+#                       improvement signal.
+#
+#   sim_to_previous     Jaccard similarity (0.0-1.0) of this row's
+#                       question tokens to the previous row's. High
+#                       similarity within a session = "guest rephrased
+#                       the same question" == "FAQ didn't satisfy them."
+#
+# Both are computed in Python after fetch -- doable in SQL but messy,
+# and we expect <1000 rows per page request.
+
+
+class GuestQaLogItem(BaseModel):
+    id: int
+    reservation_id: str
+    asked_at: datetime
+    question_text: str
+    matched_faq_slugs: list[str]
+    # For FAQ taps the first slug here is the tapped one; for LLM rows
+    # the slugs are whatever the matcher returned (may be empty).
+    answer_source: str         # "faq" | "llm" | "llm_error"
+    answer_text: str           # answer body (resolved from FAQ entry or LLM)
+    web_search_used: bool
+    day_of_stay: int | None
+    llm_input_tokens: int | None
+    llm_output_tokens: int | None
+    reviewed_at: datetime | None
+    promoted_to_kb: bool
+    session_id: str            # cluster tag, derived
+    sim_to_previous: float     # 0.0-1.0, derived
+
+
+class GuestQaLogResponse(BaseModel):
+    items: list[GuestQaLogItem]
+    has_more: bool
+    next_offset: int
+
+
+_SESSION_GAP_SECONDS = 30 * 60
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    """Token-set Jaccard. 0 if either set is empty -- a 0-token query
+    can't be meaningfully compared, and we don't want a false 1.0 from
+    two empty sets."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _annotate_sessions(rows: list) -> list[tuple[object, str, float]]:
+    """Given GuestQa rows in arbitrary order, return list of
+    (row, session_id, sim_to_previous) annotations.
+
+    Sessions group by reservation_id with a max gap of
+    _SESSION_GAP_SECONDS between consecutive questions. Similarity is
+    measured against the IMMEDIATELY preceding question in the same
+    session (token-set Jaccard with synonym expansion to align with how
+    the matcher sees the input)."""
+    from collections import defaultdict
+    from app.services.faq_match import tokens_for_text  # noqa: PLC0415
+
+    by_res: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_res[r.reservation_id].append(r)
+
+    annotated: list[tuple[object, str, float]] = []
+    for res_id, res_rows in by_res.items():
+        res_rows.sort(key=lambda r: r.asked_at)
+        prev_row = None
+        prev_tokens: frozenset[str] | None = None
+        session_idx = 0
+        for r in res_rows:
+            tokens = tokens_for_text(r.question_text, expand=True)
+            if prev_row is None:
+                session_idx = 1
+                sim = 0.0
+            else:
+                gap = (r.asked_at - prev_row.asked_at).total_seconds()
+                if gap > _SESSION_GAP_SECONDS:
+                    session_idx += 1
+                    sim = 0.0
+                else:
+                    sim = _jaccard(tokens, prev_tokens) if prev_tokens else 0.0
+            sid = f"{res_id[-6:]}-{session_idx}"
+            annotated.append((r, sid, sim))
+            prev_row = r
+            prev_tokens = tokens
+    return annotated
+
+
+def _resolve_answer(
+    row, faq_lookup: dict[str, "object"],
+) -> tuple[str, str, bool]:
+    """Return (source, text, web_search_used) for one row.
+
+    For FAQ-tap rows: source="faq", text is the answer body of the
+    tapped FAQ entry (looked up via slug). For LLM rows: source="llm"
+    (or "llm_error" if the call failed), text is the response. Empty
+    answer text falls back to a placeholder so the table never shows
+    a blank cell."""
+    if row.llm_used:
+        if row.llm_response_text:
+            return "llm", row.llm_response_text, False
+        # No response = LLM call failed
+        return "llm_error", "(LLM call failed -- see logs)", False
+    try:
+        slugs = json.loads(row.matched_faq_slugs_json or "[]")
+    except (ValueError, TypeError):
+        slugs = []
+    if slugs and isinstance(slugs, list) and slugs[0] in faq_lookup:
+        entry = faq_lookup[slugs[0]]
+        return "faq", entry.answer, False
+    return "faq", "(FAQ entry no longer in knowledge base)", False
+
+
+@router.get(
+    "/portal/guest-qa-log",
+    response_model=GuestQaLogResponse,
+    dependencies=[Depends(require_portal_auth)],
+    tags=["portal"],
+)
+async def get_guest_qa_log(
+    since_days: int = 7,
+    reservation_id: str | None = None,
+    unreviewed_only: bool = False,
+    limit: int = 200,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """Staff feed of guest portal questions. Filters:
+      - since_days: only rows from the last N days (default 7)
+      - reservation_id: restrict to one reservation
+      - unreviewed_only: hide rows already marked reviewed
+      - limit / offset: pagination (defaults 200 / 0)
+
+    Returns rows in `asked_at DESC` order with session_id + similarity
+    annotations so the DCS UI can flag iterative guests."""
+    from app.models.guest_qa import GuestQa  # noqa: PLC0415
+    from app.services.faq_kb import get_faq_entries  # noqa: PLC0415
+
+    if limit < 1: limit = 1
+    if limit > 500: limit = 500
+    if offset < 0: offset = 0
+    if since_days < 1: since_days = 1
+    if since_days > 365: since_days = 365
+
+    cutoff = datetime.utcnow() - timedelta(days=since_days)
+    stmt = select(GuestQa).where(GuestQa.asked_at >= cutoff)
+    if reservation_id:
+        stmt = stmt.where(GuestQa.reservation_id == reservation_id)
+    if unreviewed_only:
+        stmt = stmt.where(GuestQa.reviewed_at.is_(None))
+    stmt = stmt.order_by(GuestQa.asked_at.desc()).limit(limit + 1).offset(offset)
+    rows = (await db.execute(stmt)).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    annotated = _annotate_sessions(rows)
+    # Re-sort to newest-first (session grouping above ascending-sorted them)
+    annotated.sort(key=lambda t: -t[0].asked_at.timestamp())
+
+    faq_lookup = {e.slug: e for e in get_faq_entries()}
+    items: list[GuestQaLogItem] = []
+    for row, sid, sim in annotated:
+        try:
+            slugs = json.loads(row.matched_faq_slugs_json or "[]")
+            if not isinstance(slugs, list):
+                slugs = []
+        except (ValueError, TypeError):
+            slugs = []
+        source, text, web_used = _resolve_answer(row, faq_lookup)
+        # The "web_search_used" flag isn't stored separately yet (we
+        # could; it's derivable from llm_response inspection too). For
+        # now expose False from the resolver; future row addition can
+        # populate this.
+        items.append(GuestQaLogItem(
+            id=row.id,
+            reservation_id=row.reservation_id,
+            asked_at=row.asked_at,
+            question_text=row.question_text,
+            matched_faq_slugs=[s for s in slugs if isinstance(s, str)],
+            answer_source=source,
+            answer_text=text,
+            web_search_used=web_used,
+            day_of_stay=row.day_of_stay,
+            llm_input_tokens=row.llm_input_tokens,
+            llm_output_tokens=row.llm_output_tokens,
+            reviewed_at=row.reviewed_at,
+            promoted_to_kb=bool(row.promoted_to_kb),
+            session_id=sid,
+            sim_to_previous=round(sim, 3),
+        ))
+    return GuestQaLogResponse(
+        items=items, has_more=has_more, next_offset=offset + limit,
+    )
+
+
+class GuestQaReviewRequest(BaseModel):
+    promoted_to_kb: bool = False
+
+
+@router.post(
+    "/portal/guest-qa/{qa_id}/review",
+    dependencies=[Depends(require_portal_auth)],
+    tags=["portal"],
+)
+async def mark_guest_qa_reviewed(
+    qa_id: int,
+    body: GuestQaReviewRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Staff marks a row as reviewed (and optionally promoted-to-KB).
+    Idempotent -- re-reviewing updates the timestamp but doesn't break
+    anything."""
+    from app.models.guest_qa import GuestQa  # noqa: PLC0415
+    row = await db.get(GuestQa, qa_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Q&A row not found.")
+    row.reviewed_at = datetime.utcnow()
+    if body.promoted_to_kb:
+        row.promoted_to_kb = True
+    await db.commit()
+    return {"ok": True, "reviewed_at": row.reviewed_at.isoformat()}
+
+
+# DCS-facing read: returns the prioritized list (and the canonical
+# label/tip metadata) for one reservation. Used by the DCS Reservations
+# and Rooms pages to show the guest's prefs during morning-of room
+# assignment. Shared-secret auth (X-Portal-Auth header) -- the same guard
+# as the rest of the DCS-facing portal endpoints.
+
+
+class _GuestPrefItem(BaseModel):
+    key: str
+    label: str
+    tip: str
+    priority: int  # 1-based; 1 = most important to the guest
+
+
+class GuestPrefsResponse(BaseModel):
+    reservation_id: str
+    saved: bool                      # False = guest never engaged with the section
+    locked: bool                     # True = stay is past the editable window
+    items: list[_GuestPrefItem]      # in guest's stated priority order
+    updated_at: datetime | None
+
+
+@router.get(
+    "/portal/guest-preferences/{reservation_id}",
+    response_model=GuestPrefsResponse,
+    dependencies=[Depends(require_portal_auth)],
+    tags=["portal"],
+)
+async def get_guest_preferences(
+    reservation_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """DCS staff view: pull a reservation's prioritized preference list
+    for display next to the booking when assigning rooms. Returns an
+    empty list with saved=False when the guest never engaged with the
+    section -- callers can show 'No preferences set' in that case
+    without distinguishing it from a load error.
+
+    `locked` indicates whether the guest can still edit. It's purely
+    informational -- doesn't change the response shape -- but lets the
+    staff UI say 'preferences (locked)' once the stay starts."""
+    from app.models.guest_preference import GuestPreference
+    row = await db.get(GuestPreference, reservation_id)
+    saved = row is not None
+    try:
+        keys: list[str] = json.loads(row.prioritized_json or "[]") if row else []
+    except (ValueError, TypeError):
+        keys = []
+    if not isinstance(keys, list):
+        keys = []
+    res = await get_reservation_by_id(reservation_id)
+    phase = (res or {}).get("stay_phase") or "unknown"
+    locked = phase not in _PREFS_EDITABLE_PHASES
+    valid = valid_keys()
+    items: list[_GuestPrefItem] = []
+    priority = 0
+    for k in keys:
+        if not isinstance(k, str) or k not in valid:
+            continue
+        pref = next((p for p in AVAILABLE_PREFS if p.key == k), None)
+        if pref is None:
+            continue
+        priority += 1
+        items.append(_GuestPrefItem(
+            key=pref.key, label=pref.label, tip=pref.tip, priority=priority,
+        ))
+    return GuestPrefsResponse(
+        reservation_id=reservation_id,
+        saved=saved,
+        locked=locked,
+        items=items,
+        updated_at=row.updated_at if row else None,
+    )
+
+
+class GuestPrefsBatchResponse(BaseModel):
+    """Result of the batch preferences fetch -- one entry per reservation
+    in the input, in the same order. Missing rows (guest never engaged
+    with the section) come back with saved=False and items=[]."""
+    items: dict[str, GuestPrefsResponse]
+
+
+@router.get(
+    "/portal/guest-preferences-batch",
+    response_model=GuestPrefsBatchResponse,
+    dependencies=[Depends(require_portal_auth)],
+    tags=["portal"],
+)
+async def get_guest_preferences_batch(
+    reservation_ids: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk preferences fetch for the DCS Reservations + Rooms pages.
+    Each page typically renders 10-30 reservations at once; we batch
+    into a single DB query + one Cloudbeds-status check to avoid the
+    N+1 HTTP roundtrip we'd get from calling /guest-preferences/{id} in
+    a loop.
+
+    Input is a comma-separated string of reservation IDs (URL-safe).
+    Empty -> empty response. Unknown IDs come back as saved=False
+    entries so the caller can render "no prefs yet" uniformly without
+    distinguishing "no row" from "no input."""
+    from app.models.guest_preference import GuestPreference  # noqa: PLC0415
+
+    ids = [s.strip() for s in reservation_ids.split(",") if s.strip()]
+    # Cap to keep one bad URL from hammering the DB. Sanity bound only;
+    # the Reservations page never asks for more than the count of active
+    # reservations, which is ~30 max at this property.
+    if len(ids) > 200:
+        ids = ids[:200]
+    if not ids:
+        return GuestPrefsBatchResponse(items={})
+
+    # One query: all matching pref rows
+    stmt = select(GuestPreference).where(GuestPreference.reservation_id.in_(ids))
+    rows = {r.reservation_id: r for r in (await db.execute(stmt)).scalars().all()}
+
+    # Phase lookup needs a Cloudbeds call per reservation -- we batch by
+    # firing them concurrently via gather. ~30 reservations * ~50ms
+    # cached = 1.5s if we did them serially; concurrent gather brings
+    # that under a second. The reservations cache (30s TTL in this same
+    # module) usually makes these near-free anyway.
+    import asyncio  # noqa: PLC0415
+    phases: dict[str, str] = {}
+    async def _phase_for(rid: str) -> tuple[str, str]:
+        res = await get_reservation_by_id(rid)
+        return rid, (res or {}).get("stay_phase") or "unknown"
+    for rid, phase in await asyncio.gather(*[_phase_for(rid) for rid in ids]):
+        phases[rid] = phase
+
+    valid = valid_keys()
+    out: dict[str, GuestPrefsResponse] = {}
+    for rid in ids:
+        row = rows.get(rid)
+        saved = row is not None
+        try:
+            keys: list[str] = json.loads(row.prioritized_json or "[]") if row else []
+        except (ValueError, TypeError):
+            keys = []
+        if not isinstance(keys, list):
+            keys = []
+        phase = phases.get(rid, "unknown")
+        locked = phase not in _PREFS_EDITABLE_PHASES
+        items: list[_GuestPrefItem] = []
+        priority = 0
+        for k in keys:
+            if not isinstance(k, str) or k not in valid:
+                continue
+            pref = next((p for p in AVAILABLE_PREFS if p.key == k), None)
+            if pref is None:
+                continue
+            priority += 1
+            items.append(_GuestPrefItem(
+                key=pref.key, label=pref.label, tip=pref.tip, priority=priority,
+            ))
+        out[rid] = GuestPrefsResponse(
+            reservation_id=rid,
+            saved=saved,
+            locked=locked,
+            items=items,
+            updated_at=row.updated_at if row else None,
+        )
+    return GuestPrefsBatchResponse(items=out)
+
+
 # ---- Signature agreement ----------------------------------------------------
 
 async def _apply_signature(
@@ -2765,9 +4489,17 @@ async def _apply_card_attach(
     card_cvv: str,
     card_address_zip: str,
 ) -> tuple[bool, str]:
-    """Forward the raw card to Cloudbeds postCreditCard. Returns
-    (ok, error_message). Caller is responsible for scrubbing the inputs
-    after this returns (they pass through here once)."""
+    """[DEPRECATED 2026-05-27] Raw-PAN forward to Cloudbeds postCreditCard.
+
+    Replaced by the Stripe Elements -> dashboard_save_credit_card path
+    (see _save_card_via_dashboard above). The dashboard endpoint reliably
+    produces a card the front desk can charge from the UI; postCreditCard
+    sometimes attaches a card that doesn't show up there. Kept as
+    callable code in case we ever need a back-office card-attach path
+    that bypasses the browser (e.g. admin tool calling from the server).
+
+    Returns (ok, error_message). Caller is responsible for scrubbing the
+    inputs after this returns (they pass through here once)."""
     # Strip whitespace + dashes from PAN so the user can paste "4242 4242..."
     pan_clean = "".join(c for c in (card_number or "") if c.isdigit())
     cvv_clean = "".join(c for c in (card_cvv or "") if c.isdigit())
@@ -2804,71 +4536,108 @@ async def _apply_card_attach(
     return True, ""
 
 
+# ---- Card save: JSON in, JSON out -----------------------------------------
+#
+# Both /g/{token}/cards and /h{stem}/cards accept a Stripe.js legacy token
+# (`tok_xxx`) plus the token's `card` metadata block. We resolve booking_id
+# from reservation_id, then call dashboard_save_credit_card -- which posts
+# to https://hotels.cloudbeds.com/hotel/save_credit_card with a cookie
+# session and gets back a Cloudbeds card_id. The browser's Stripe.js had
+# already done the tokenization, so PAN/CVV never reach our backend.
+#
+# Why JSON instead of form-POST + 303 redirect (the pattern used by other
+# portal sections): Stripe Elements is JavaScript-driven and the form
+# submission already runs through Stripe.createToken on the client. Once
+# JS is in the loop, returning JSON and letting JS handle the
+# success-reload / error-display is simpler than coercing the response
+# into a redirect that JS would have to re-detect.
+
+
+class CardSaveRequest(BaseModel):
+    """JSON body for the card-save POST. token_id is the Stripe legacy
+    token (tok_xxx); token_card is Stripe's `card` metadata (brand, last4,
+    exp_month, exp_year, etc.) which we forward to Cloudbeds for the
+    visible card list."""
+    token_id: str = Field(min_length=1, description="Stripe legacy token id (tok_xxx)")
+    token_card: dict = Field(default_factory=dict)
+
+
+async def _save_card_via_dashboard(reservation_id: str, body: CardSaveRequest) -> JSONResponse:
+    """Shared body of the /g and /h POST endpoints. Looks up booking_id,
+    forwards the tokenized card to /hotel/save_credit_card, returns a JSON
+    response the JS form handler understands."""
+    booking_id = await get_booking_id(reservation_id)
+    if not booking_id:
+        log.warning("portal cards: couldn't resolve booking_id for reservation=%s", reservation_id)
+        return JSONResponse(
+            {"success": False, "error": "We couldn't find the reservation. Please contact the front desk."},
+            status_code=400,
+        )
+
+    log.info(
+        "portal cards: reservation=%s booking_id=%s stripe_token=%s last4=%s",
+        reservation_id, booking_id, body.token_id, body.token_card.get("last4"),
+    )
+
+    result = await dashboard_save_credit_card(
+        booking_id=booking_id,
+        legacy_token_id=body.token_id,
+        token_card=body.token_card,
+    )
+
+    if result.get("success"):
+        _invalidate_reservations_cache()
+        log.info(
+            "portal cards: success card_id=%s booking=%s",
+            result.get("card_id"), booking_id,
+        )
+        return JSONResponse({
+            "success": True,
+            "card_id": result.get("card_id"),
+            "last4": (result.get("card_details") or {}).get("card_number"),
+        })
+
+    log.warning("portal cards: dashboard_save_credit_card rejected: %s",
+                json.dumps(result, default=str)[:500])
+    return JSONResponse({
+        "success": False,
+        "error": "We couldn't save your card. Please try again, or contact the front desk.",
+    }, status_code=400)
+
+
 @router.post("/g/{token}/cards")
 async def post_card_by_token(
     token: str,
-    request: Request,
-    card_holder_name: str = Form(default=""),
-    card_number: str = Form(default=""),
-    exp_month: str = Form(default=""),
-    exp_year: str = Form(default=""),
-    card_cvv: str = Form(default=""),
-    card_address_zip: str = Form(default=""),
+    body: CardSaveRequest,
     db: AsyncSession = Depends(get_db),
 ):
     row = await db.get(PortalToken, token)
     if row is None or row.purpose != "guest_portal":
-        return _portal_page("Not found", _NOT_FOUND_PAGE)
+        return JSONResponse({"success": False, "error": "Link not found."}, status_code=404)
     if row.expires_at < datetime.utcnow():
-        return _portal_page("Expired", _EXPIRED_PAGE)
-    ok, err = await _apply_card_attach(
-        row.reservation_id,
-        card_holder_name=card_holder_name, card_number=card_number,
-        exp_month=exp_month, exp_year=exp_year, card_cvv=card_cvv,
-        card_address_zip=card_address_zip,
-    )
-    return RedirectResponse(
-        url=_build_card_redirect(
-            f"/g/{token}", ok, err,
-            card_holder_name=card_holder_name, card_address_zip=card_address_zip,
-        ),
-        status_code=303,
-    )
+        return JSONResponse({"success": False, "error": "This link has expired."}, status_code=403)
+    return await _save_card_via_dashboard(row.reservation_id, body)
 
 
 @router.post("/h{stem}/cards")
 async def post_card_by_prefix(
     stem: str,
+    body: CardSaveRequest,
     request: Request,
-    card_holder_name: str = Form(default=""),
-    card_number: str = Form(default=""),
-    exp_month: str = Form(default=""),
-    exp_year: str = Form(default=""),
-    card_cvv: str = Form(default=""),
-    card_address_zip: str = Form(default=""),
     db: AsyncSession = Depends(get_db),
 ):
     prefix = _trim_to_first4_digits(stem)
     if prefix is None:
-        return _portal_page("Not found", _NOT_FOUND_PAGE)
+        return JSONResponse({"success": False, "error": "Not found."}, status_code=404)
     verified_res_id = _read_verify_cookie(request.cookies.get(VERIFY_COOKIE_NAME))
     if not verified_res_id or not verified_res_id.startswith(prefix):
         log.warning("portal: card POST rejected ip=%s prefix=%s cookie=%s",
                     _client_ip(request), prefix, "yes" if verified_res_id else "no")
-        return RedirectResponse(url=f"/h{prefix}", status_code=303)
-    ok, err = await _apply_card_attach(
-        verified_res_id,
-        card_holder_name=card_holder_name, card_number=card_number,
-        exp_month=exp_month, exp_year=exp_year, card_cvv=card_cvv,
-        card_address_zip=card_address_zip,
-    )
-    return RedirectResponse(
-        url=_build_card_redirect(
-            f"/h{prefix}", ok, err,
-            card_holder_name=card_holder_name, card_address_zip=card_address_zip,
-        ),
-        status_code=303,
-    )
+        return JSONResponse(
+            {"success": False, "error": "Please re-open the portal from your SMS link."},
+            status_code=403,
+        )
+    return await _save_card_via_dashboard(verified_res_id, body)
 
 
 # ---- Cloudbeds Pay-by-Link (UI-automation generated) -----------------------
