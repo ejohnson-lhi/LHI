@@ -1439,10 +1439,10 @@ class IrisAgent(Agent):
             (
                 "exp",
                 (
-                    "Got it. Now the expiration as four digits — "
-                    "month month year year. For example, October "
-                    "twenty-twenty-eight would be 1, 0, 2, 8. "
-                    "Then press pound."
+                    "Got it. Now your expiration date as four digits — "
+                    "two for the month, two for the year. "
+                    "For example, March of twenty-twenty-eight would be "
+                    "zero three two eight. Then press pound."
                 ),
             ),
             (
