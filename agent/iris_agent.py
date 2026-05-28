@@ -1461,19 +1461,49 @@ class IrisAgent(Agent):
         stage_complete = asyncio.Event()
         stage_aborted = asyncio.Event()
 
+        # RFC 4733 / LiveKit SipDTMF convention (verified empirically on
+        # the M1 mute test, 5/28): digit is the printable character,
+        # code is the RFC 4733 numeric value. For 0-9 these are 0-9 and
+        # "0"-"9". For * it's code=10 / digit="*". For # it's code=11 /
+        # digit="#". A-D map to 12-15 / "A"-"D" but are rare on consumer
+        # keypads. We accept both the digit string AND the code as the
+        # source of truth so we don't get wedged if either side reports
+        # the other format. Diagnostic logging on EVERY event so we can
+        # tell from journalctl what each press looked like (PCI-safe:
+        # only the digit/code is logged, never accumulated buffer state).
         def _on_dtmf(dtmf) -> None:
             try:
                 stage_name = STAGES[stage_index[0]][0]
             except IndexError:
                 return
-            d = str(getattr(dtmf, "digit", ""))
-            if d in "0123456789":
-                if len(buffers[stage_name]) < MAX_DIGITS_BY_STAGE[stage_name]:
-                    buffers[stage_name] += d
-            elif d == "#":
+            d_raw = getattr(dtmf, "digit", "")
+            c_raw = getattr(dtmf, "code", -1)
+            d_str = str(d_raw or "").strip()
+            try:
+                c_int = int(c_raw) if c_raw is not None else -1
+            except (TypeError, ValueError):
+                c_int = -1
+            log.info(
+                "capture_card_dtmf[%s]: received digit=%r code=%s",
+                stage_name, d_str, c_int,
+            )
+            # Normalize: figure out what key was pressed.
+            is_pound = d_str == "#" or c_int == 11
+            is_star = d_str == "*" or c_int == 10
+            is_digit_0_9 = d_str in "0123456789" or (0 <= c_int <= 9)
+            if is_pound:
                 stage_complete.set()
-            elif d == "*":
+            elif is_star:
                 stage_aborted.set()
+            elif is_digit_0_9:
+                if d_str in "0123456789":
+                    digit_char = d_str
+                elif 0 <= c_int <= 9:
+                    digit_char = str(c_int)
+                else:
+                    return
+                if len(buffers[stage_name]) < MAX_DIGITS_BY_STAGE[stage_name]:
+                    buffers[stage_name] += digit_char
 
         try:
             self._room.on("sip_dtmf_received", _on_dtmf)
@@ -1550,6 +1580,11 @@ class IrisAgent(Agent):
                 stage_complete.clear()
                 stage_aborted.clear()
 
+                log.info(
+                    "capture_card_dtmf: entering stage %s (timeout=%ds)",
+                    stage_name, STAGE_TIMEOUT_S,
+                )
+
                 # Say the stage prompt
                 try:
                     await self.session.say(prompt_text, allow_interruptions=False)
@@ -1576,18 +1611,36 @@ class IrisAgent(Agent):
                     return "aborted" if abort_t in done_set else "complete"
 
                 outcome = await _wait_stage()
+                log.info(
+                    "capture_card_dtmf: stage %s outcome=%s buffer_len=%d",
+                    stage_name, outcome, len(buffers[stage_name]),
+                )
                 if outcome == "timeout":
                     try:
-                        await self.session.say(
-                            "I didn't get anything. Let's try once more.",
-                            allow_interruptions=False,
-                        )
-                        await self.session.say(prompt_text, allow_interruptions=False)
+                        # Tailor the re-prompt based on whether any digits
+                        # were collected — saying "I didn't get anything"
+                        # when the caller pressed digits but forgot # is
+                        # confusing.
+                        if buffers[stage_name]:
+                            await self.session.say(
+                                "I got some digits but I'm still waiting for the pound sign. Press the pound key — that's the one with the hash marks — when you're done.",
+                                allow_interruptions=False,
+                            )
+                        else:
+                            await self.session.say(
+                                "I didn't get anything. Let's try once more.",
+                                allow_interruptions=False,
+                            )
+                            await self.session.say(prompt_text, allow_interruptions=False)
                     except Exception:
                         pass
                     stage_complete.clear()
                     stage_aborted.clear()
                     outcome = await _wait_stage()
+                    log.info(
+                        "capture_card_dtmf: stage %s second-attempt outcome=%s buffer_len=%d",
+                        stage_name, outcome, len(buffers[stage_name]),
+                    )
                     if outcome == "timeout":
                         log.warning("capture_card_dtmf: %s timeout twice", stage_name)
                         return json.dumps({"status": "timeout", "stage": stage_name})
