@@ -322,6 +322,73 @@ async def _handle_send_card_link_via_sms(args: dict, call: VapiCallObject) -> di
     }
 
 
+async def _handle_save_card_via_token(args: dict, call: VapiCallObject) -> dict:
+    """Attach a Stripe-tokenized card to a Cloudbeds reservation.
+
+    Iris's `capture_card_dtmf` collects PAN/EXP/CVC via the caller's phone
+    keypad and tokenizes the card on the agent side using Cloudbeds'
+    platform publishable key (sk_test/sk_live key for the connected
+    account never touches our infra). Raw card material never reaches
+    this backend — we receive only the resulting `token_id` (`tok_xxx`)
+    plus the Stripe-side `token_card` metadata dict. We resolve the
+    public reservation ID to the dashboard's internal booking_id and
+    hand the token to `dashboard_save_credit_card`.
+
+    Args expected: reservation_id, token_id, token_card (dict).
+
+    Returns: {"success": bool, "card_id": str, "last4": str, "brand": str,
+    "error": str}. `last4`/`brand` are intentionally surfaced so Iris can
+    confirm verbally ("Got it — Visa ending 4958"). PAN/CVC never appear
+    in the return value or the agent-side logs.
+    """
+    reservation_id = (args.get("reservation_id") or "").strip()
+    token_id = (args.get("token_id") or "").strip()
+    token_card = args.get("token_card")
+
+    if not reservation_id:
+        return {"success": False, "error": "reservation_id is required."}
+    if not token_id:
+        return {"success": False, "error": "token_id is required."}
+    if not isinstance(token_card, dict):
+        return {"success": False, "error": "token_card must be an object."}
+
+    # Lazy imports — the cloudbeds_dashboard module pulls in playwright and
+    # heavy deps when its session helpers initialize. Keep the import deferred
+    # until a card-save actually fires.
+    from app.tools.cloudbeds_dashboard import (
+        dashboard_save_credit_card,
+        get_booking_id,
+    )
+
+    booking_id = await get_booking_id(reservation_id)
+    if not booking_id:
+        log.warning("save_card_via_token: no booking_id for reservation=%s", reservation_id)
+        return {
+            "success": False,
+            "error": "Could not resolve reservation to internal booking ID. "
+                     "The session cookie may have expired — re-run the Playwright login.",
+        }
+
+    result = await dashboard_save_credit_card(
+        booking_id=str(booking_id),
+        legacy_token_id=token_id,
+        token_card=token_card,
+    )
+
+    # Sanitize the response. Surface enough for Iris to confirm verbally
+    # but never echo back card material that Cloudbeds might have included
+    # in card_details (some dashboards include a masked PAN or other fields).
+    last4 = (result.get("card_details") or {}).get("card_number") or token_card.get("last4")
+    brand = (result.get("card_details") or {}).get("card_type") or token_card.get("brand")
+    return {
+        "success": bool(result.get("success")),
+        "card_id": str(result.get("card_id") or ""),
+        "last4": str(last4 or ""),
+        "brand": str(brand or ""),
+        "error": result.get("error") or "",
+    }
+
+
 async def _handle_set_call_routing(args: dict, call: VapiCallObject) -> dict:
     return {"success": False, "message": "Stub — routing state DB not yet wired."}
 
@@ -373,6 +440,11 @@ async def send_payment_link(request: VapiToolCallRequest) -> VapiToolCallRespons
 @router.post("/send_card_link_via_sms")
 async def send_card_link_via_sms(request: VapiToolCallRequest) -> VapiToolCallResponse:
     return await _dispatch(request, _handle_send_card_link_via_sms)
+
+
+@router.post("/save_card_via_token")
+async def save_card_via_token(request: VapiToolCallRequest) -> VapiToolCallResponse:
+    return await _dispatch(request, _handle_save_card_via_token)
 
 
 @router.post("/set_call_routing")

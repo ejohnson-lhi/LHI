@@ -177,6 +177,87 @@ TRANSFER_TARGETS: dict[str, tuple[str, str, str]] = {
 # no-answer and returning to the LLM so it can try the fallback.
 TRANSFER_RING_TIMEOUT_S = 30
 
+# Cloudbeds' platform Stripe publishable key — public by design (it's embedded
+# in the Cloudbeds dashboard's iframe src and in our own portal_card.py). When
+# we POST to Stripe /v1/tokens with this key as Basic-auth username, the
+# resulting `tok_xxx` lives on the property's Stripe Connect account
+# (acct_1RYA4xEJ572tmEoR), which is what dashboard_save_credit_card expects.
+# Confirmed working via backend/scripts/test_stripe_pk_tokenize.py (5/23).
+_CLOUDBEDS_PLATFORM_PK = (
+    "pk_live_51GxYvfCkb5UaC5yLKjotmnTBp7MYbmiTqeNvDluaevZJ7xSsbL7RC4f3ZQdglMa9IVY6iPkpfDCdSJGrgdiyvuRo00jZpsTHkv"
+)
+
+
+async def _stripe_tokenize(
+    pan: str,
+    exp_month: int,
+    exp_year: int,
+    cvc: str,
+    *,
+    holder_name: str = "",
+) -> dict:
+    """Tokenize a card via Stripe /v1/tokens using Cloudbeds' platform
+    publishable key. Returns {success, token_id, token_card} or
+    {success: False, error, stripe_code}.
+
+    PCI note: this is the only place raw PAN/CVC leave the agent process
+    boundary. The HTTPS POST to api.stripe.com is end-to-end encrypted and
+    Stripe receives nothing else from us. Caller MUST scrub `pan` and `cvc`
+    from local variables immediately after this returns, regardless of
+    success/failure.
+    """
+    form = {
+        "card[number]":    pan,
+        "card[exp_month]": str(exp_month),
+        "card[exp_year]":  str(exp_year),
+        "card[cvc]":       cvc,
+    }
+    if holder_name:
+        form["card[name]"] = holder_name
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.stripe.com/v1/tokens",
+                data=form,
+                headers=headers,
+                auth=(_CLOUDBEDS_PLATFORM_PK, ""),
+            )
+    except httpx.TimeoutException:
+        return {"success": False, "error": "Stripe tokenize timed out.", "stripe_code": "timeout"}
+    except httpx.HTTPError as e:
+        return {"success": False, "error": f"Stripe HTTP error: {e}", "stripe_code": "http_error"}
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return {"success": False, "error": "Stripe returned non-JSON.", "stripe_code": "non_json"}
+
+    if resp.status_code != 200:
+        err_obj = body.get("error") or {}
+        err = err_obj.get("message") or "Stripe rejected the request"
+        err_code = err_obj.get("code") or "unknown"
+        # IMPORTANT: do not log `body` directly — Stripe error responses
+        # sometimes echo back a `param` field that references which card
+        # field was bad, but never the value itself. The message + code
+        # alone are safe to log.
+        log.warning("Stripe tokenize failed: status=%s code=%s msg=%s",
+                    resp.status_code, err_code, err)
+        return {"success": False, "error": err, "stripe_code": err_code}
+
+    return {
+        "success": True,
+        "token_id": body.get("id"),
+        "token_card": body.get("card") or {},
+    }
+
+
 # Spoken when a transfer attempt does NOT connect (no_answer or exception)
 # and the conversation needs to recover gracefully. Used in two places that
 # both need to offer a deterministic next step to the caller:
@@ -1270,6 +1351,374 @@ class IrisAgent(Agent):
             "digits_received": digits,
             "interpretation": interpretation,
         })
+
+    @function_tool
+    async def capture_card_dtmf(self, reservation_id: str) -> str:
+        """Capture a credit card from the caller via DTMF keypad entry and
+        attach it to a Cloudbeds reservation. Hands-free — the caller never
+        leaves the call.
+
+        Flow (entirely in-call):
+          1. Resolve caller's audio track sid and look up the reservation's
+             internal booking_id.
+          2. Mute the caller's audio track via LiveKit server admin API.
+             This keeps DTMF tones out of the egress recording. sip_dtmf
+             events keep firing (separate signaling channel).
+          3. For each of {card number, expiration MMYY, security code}:
+             prompt the caller, accumulate digits as they're pressed, end
+             stage on `#`, abort stage on `*`. Re-prompt once on timeout.
+          4. Tokenize the collected card via Stripe /v1/tokens with
+             Cloudbeds' platform publishable key. Stripe returns a
+             tok_xxx on the property's connected account.
+          5. Scrub PAN/CVC from local variables (PCI).
+          6. POST the token + token_card to the backend's
+             /save_card_via_token route, which calls Cloudbeds dashboard
+             save_credit_card to attach the card.
+          7. Un-mute the caller, return result JSON.
+
+        Returns JSON with `status` in:
+          success — card attached. Briefly confirm to the caller ("Got it,
+                    that's Visa ending 4-9-5-8 on file").
+          declined — Stripe rejected the card (bad number/CVC/expiry,
+                     declined-by-issuer). Offer to retry or fall back to
+                     the call-front-desk path.
+          timeout — caller stopped pressing keys mid-capture. Same fallback.
+          aborted_by_user — caller pressed `*`. Acknowledge ("Okay, I've
+                            cancelled that") and offer the fallback.
+          error — internal failure (mute API, booking lookup, save failure,
+                  etc.). Apologize and offer the call-front-desk fallback.
+
+        Do NOT call this tool a second time on the same call if a previous
+        capture returned `declined` or `error` — those need a human-mediated
+        decision, not silent retry. Offer the caller a choice instead.
+        """
+        if self._room is None:
+            return json.dumps({"status": "error", "error": "Internal: no room."})
+        reservation_id = (reservation_id or "").strip()
+        if not reservation_id:
+            return json.dumps({"status": "error", "error": "reservation_id is required."})
+
+        # ---- 1. Locate caller's audio track ----
+        caller_participant = None
+        for ident, p in self._room.remote_participants.items():
+            try:
+                for pub in p.track_publications.values():
+                    kind = getattr(pub, "kind", None)
+                    if kind == rtc.TrackKind.KIND_AUDIO or "AUDIO" in str(kind).upper():
+                        caller_participant = p
+                        break
+            except Exception:
+                pass
+            if caller_participant is not None:
+                break
+        if caller_participant is None:
+            return json.dumps({
+                "status": "error",
+                "error": "Caller audio track not found in the room.",
+            })
+
+        audio_track_sid: str | None = None
+        for pub in caller_participant.track_publications.values():
+            kind = getattr(pub, "kind", None)
+            if kind == rtc.TrackKind.KIND_AUDIO or "AUDIO" in str(kind).upper():
+                audio_track_sid = getattr(pub, "sid", None)
+                if audio_track_sid:
+                    break
+        if not audio_track_sid:
+            return json.dumps({
+                "status": "error",
+                "error": "Caller audio track has no SID.",
+            })
+
+        # ---- 2. DTMF state machine setup ----
+        STAGES: tuple[tuple[str, str], ...] = (
+            (
+                "pan",
+                "Please enter your card number, then press pound.",
+            ),
+            (
+                "exp",
+                (
+                    "Got it. Now the expiration as four digits — "
+                    "month month year year. For example, October "
+                    "twenty-twenty-eight would be 1, 0, 2, 8. "
+                    "Then press pound."
+                ),
+            ),
+            (
+                "cvc",
+                (
+                    "Got it. Now your three or four digit security code, "
+                    "then pound."
+                ),
+            ),
+        )
+        STAGE_TIMEOUT_S = 30
+        MAX_DIGITS_BY_STAGE = {"pan": 19, "exp": 4, "cvc": 4}
+
+        buffers: dict[str, str] = {"pan": "", "exp": "", "cvc": ""}
+        stage_index = [0]  # mutable for closure
+        stage_complete = asyncio.Event()
+        stage_aborted = asyncio.Event()
+
+        def _on_dtmf(dtmf) -> None:
+            try:
+                stage_name = STAGES[stage_index[0]][0]
+            except IndexError:
+                return
+            d = str(getattr(dtmf, "digit", ""))
+            if d in "0123456789":
+                if len(buffers[stage_name]) < MAX_DIGITS_BY_STAGE[stage_name]:
+                    buffers[stage_name] += d
+            elif d == "#":
+                stage_complete.set()
+            elif d == "*":
+                stage_aborted.set()
+
+        try:
+            self._room.on("sip_dtmf_received", _on_dtmf)
+        except Exception:
+            log.exception("capture_card_dtmf: could not register DTMF handler")
+            return json.dumps({"status": "error", "error": "Could not register handler."})
+
+        # ---- 3. Mute caller's track + freeze STT ----
+        async def _set_mute(muted: bool) -> bool:
+            try:
+                lk = api.LiveKitAPI()
+                try:
+                    await lk.room.mute_published_track(
+                        api.MuteRoomTrackRequest(
+                            room=self._room.name,
+                            identity=caller_participant.identity,
+                            track_sid=audio_track_sid,
+                            muted=muted,
+                        )
+                    )
+                    return True
+                finally:
+                    await lk.aclose()
+            except Exception:
+                log.exception("capture_card_dtmf: mute(%s) failed", muted)
+                return False
+
+        async def _cleanup() -> None:
+            """Restore caller audio + STT + LLM gating + remove DTMF handler.
+            Always called; idempotent."""
+            try:
+                self._room.off("sip_dtmf_received", _on_dtmf)
+            except Exception:
+                log.exception("capture_card_dtmf cleanup: handler removal failed")
+            await _set_mute(False)
+            try:
+                self.session.input.set_audio_enabled(True)
+            except Exception:
+                pass
+            self._silent = False
+
+        if not await _set_mute(True):
+            try:
+                self._room.off("sip_dtmf_received", _on_dtmf)
+            except Exception:
+                pass
+            return json.dumps({
+                "status": "error",
+                "error": "Could not mute caller audio — refusing to start capture.",
+            })
+
+        # Belt + suspenders: gate STT input + short-circuit LLM turns during
+        # the capture window. The mute should already make STT silent (no
+        # audio frames published), but if anything slips through we don't
+        # want the LLM responding.
+        try:
+            self.session.input.set_audio_enabled(False)
+        except Exception:
+            pass
+        self._silent = True
+
+        log.info(
+            "capture_card_dtmf: muted caller=%s, beginning capture for res=%s",
+            caller_participant.identity, reservation_id,
+        )
+
+        # ---- 4. Per-stage capture loop ----
+        pan_local = ""
+        cvc_local = ""
+        try:
+            for i, (stage_name, prompt_text) in enumerate(STAGES):
+                stage_index[0] = i
+                buffers[stage_name] = ""
+                stage_complete.clear()
+                stage_aborted.clear()
+
+                # Say the stage prompt
+                try:
+                    await self.session.say(prompt_text, allow_interruptions=False)
+                except Exception:
+                    log.exception("capture_card_dtmf: say(%s prompt) failed", stage_name)
+
+                # Wait for stage completion (`#`), abort (`*`), or timeout.
+                # On timeout, re-prompt once before giving up.
+                async def _wait_stage() -> str:
+                    done_t = asyncio.create_task(stage_complete.wait())
+                    abort_t = asyncio.create_task(stage_aborted.wait())
+                    try:
+                        done_set, pending = await asyncio.wait(
+                            {done_t, abort_t},
+                            timeout=STAGE_TIMEOUT_S,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for t in (done_t, abort_t):
+                            if not t.done():
+                                t.cancel()
+                    if not done_set:
+                        return "timeout"
+                    return "aborted" if abort_t in done_set else "complete"
+
+                outcome = await _wait_stage()
+                if outcome == "timeout":
+                    try:
+                        await self.session.say(
+                            "I didn't get anything. Let's try once more.",
+                            allow_interruptions=False,
+                        )
+                        await self.session.say(prompt_text, allow_interruptions=False)
+                    except Exception:
+                        pass
+                    stage_complete.clear()
+                    stage_aborted.clear()
+                    outcome = await _wait_stage()
+                    if outcome == "timeout":
+                        log.warning("capture_card_dtmf: %s timeout twice", stage_name)
+                        return json.dumps({"status": "timeout", "stage": stage_name})
+
+                if outcome == "aborted":
+                    log.info("capture_card_dtmf: caller aborted during %s", stage_name)
+                    return json.dumps({"status": "aborted_by_user", "stage": stage_name})
+
+            # ---- 5. Validate ----
+            pan_local = buffers["pan"]
+            exp_buf = buffers["exp"]
+            cvc_local = buffers["cvc"]
+            if not (13 <= len(pan_local) <= 19):
+                log.warning("capture_card_dtmf: invalid PAN length=%d", len(pan_local))
+                return json.dumps({
+                    "status": "error",
+                    "error": "Card number wasn't 13 to 19 digits.",
+                    "stage": "pan",
+                })
+            if len(exp_buf) != 4:
+                log.warning("capture_card_dtmf: invalid EXP length=%d", len(exp_buf))
+                return json.dumps({
+                    "status": "error",
+                    "error": "Expiration wasn't four digits.",
+                    "stage": "exp",
+                })
+            if not (3 <= len(cvc_local) <= 4):
+                log.warning("capture_card_dtmf: invalid CVC length=%d", len(cvc_local))
+                return json.dumps({
+                    "status": "error",
+                    "error": "Security code wasn't 3 or 4 digits.",
+                    "stage": "cvc",
+                })
+            try:
+                exp_month = int(exp_buf[:2])
+                exp_year_yy = int(exp_buf[2:])
+            except ValueError:
+                return json.dumps({
+                    "status": "error",
+                    "error": "Expiration didn't parse as numbers.",
+                    "stage": "exp",
+                })
+            if not (1 <= exp_month <= 12):
+                return json.dumps({
+                    "status": "error",
+                    "error": "Expiration month wasn't 1 to 12.",
+                    "stage": "exp",
+                })
+            exp_year = 2000 + exp_year_yy if exp_year_yy < 100 else exp_year_yy
+
+            # ---- 6. Tokenize via Stripe ----
+            try:
+                await self.session.say("One moment.", allow_interruptions=False)
+            except Exception:
+                pass
+
+            tok_result = await _stripe_tokenize(
+                pan=pan_local,
+                exp_month=exp_month,
+                exp_year=exp_year,
+                cvc=cvc_local,
+                holder_name="",
+            )
+
+            # ---- 7. PCI scrub: zero out PAN/CVC in all references ----
+            pan_local = ""
+            cvc_local = ""
+            buffers["pan"] = ""
+            buffers["cvc"] = ""
+            buffers["exp"] = ""
+
+            if not tok_result.get("success"):
+                code = tok_result.get("stripe_code", "")
+                msg = tok_result.get("error", "Card processing error.")
+                log.warning("capture_card_dtmf: Stripe declined: code=%s msg=%s", code, msg)
+                # Stripe codes that represent a card the caller could
+                # plausibly retry vs. our infra problems.
+                soft_decline_codes = {
+                    "card_declined", "incorrect_cvc", "expired_card",
+                    "invalid_expiry_month", "invalid_expiry_year",
+                    "invalid_number", "invalid_cvc", "processing_error",
+                }
+                if code in soft_decline_codes:
+                    return json.dumps({"status": "declined", "reason": msg, "stripe_code": code})
+                return json.dumps({"status": "error", "error": msg, "stripe_code": code})
+
+            token_id = tok_result["token_id"]
+            token_card = tok_result["token_card"]
+
+            # ---- 8. Save to Cloudbeds via backend ----
+            save = await _call_backend_tool(
+                "save_card_via_token",
+                {
+                    "reservation_id": reservation_id,
+                    "token_id": token_id,
+                    "token_card": token_card,
+                },
+                self._caller_phone,
+            )
+
+            if not save.get("success"):
+                log.warning("capture_card_dtmf: backend save failed: %s",
+                            save.get("error"))
+                return json.dumps({
+                    "status": "error",
+                    "error": save.get("error") or "Could not save card to reservation.",
+                })
+
+            log.info(
+                "capture_card_dtmf: SUCCESS res=%s card_id=%s last4=%s brand=%s",
+                reservation_id, save.get("card_id"), save.get("last4"),
+                save.get("brand"),
+            )
+            return json.dumps({
+                "status": "success",
+                "card_id": save.get("card_id"),
+                "last4": save.get("last4") or (token_card or {}).get("last4", ""),
+                "brand": save.get("brand") or (token_card or {}).get("brand", ""),
+            })
+
+        except Exception:
+            log.exception("capture_card_dtmf: unhandled exception")
+            return json.dumps({"status": "error", "error": "Unexpected internal error."})
+        finally:
+            # Belt-and-suspenders scrub in case an exception path skipped step 7.
+            pan_local = ""
+            cvc_local = ""
+            buffers["pan"] = ""
+            buffers["cvc"] = ""
+            buffers["exp"] = ""
+            await _cleanup()
 
 
 # =============================================================================
