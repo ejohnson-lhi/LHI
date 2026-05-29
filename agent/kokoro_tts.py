@@ -66,6 +66,58 @@ def _normalize_for_tts(text: str) -> str:
     return text
 
 
+# Split a multi-sentence utterance into clauses for per-clause cache lookup +
+# pipelined synthesis. The pattern matches end-of-sentence punctuation
+# followed by whitespace and a capital letter -- the classic English
+# sentence boundary signal. Lookbehind / lookahead keep the punctuation
+# attached to the LEFT side ("Hello. World." -> ["Hello.", "World."]).
+#
+# Edge cases worth knowing about:
+#   - "Mr. Smith" wouldn't be split because there's no capital-after-period
+#     boundary inside "Mr. " followed by "Smith" (well, "S" IS capital --
+#     so this WOULD wrongly split). The hotel domain rarely produces "Mr."
+#     in Iris's output (she uses guest first names + last names without
+#     titles), so this is acceptable risk. Add an exclusion list if it
+#     bites us in practice.
+#   - Decimal numbers like "$5.99" don't match (no space after the period).
+#   - Quoted sentences end on the closing quote, not the period inside --
+#     we ignore this complexity since Iris doesn't typically quote.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+
+
+def _split_into_clauses(text: str) -> list[str]:
+    """Split an Iris utterance into sentence-level clauses for per-clause
+    cache lookup + pipelined synthesis.
+
+    Returns a list of trimmed clauses. Empty input returns []. A
+    single-sentence input returns a single-element list (the whole
+    text). Clauses are stripped of leading/trailing whitespace so cache
+    keys match prewarmed entries (the prewarm list stores phrases
+    without trailing whitespace).
+
+    Two-sentence utterances like "Of course. Let me check that for you."
+    return ["Of course.", "Let me check that for you."]. With both
+    entries in the PERSISTENT_OPENERS prewarm list, both halves hit the
+    cache and Iris speaks instantly. A confirmation like
+    "Just to confirm... June 3. Is that correct?" returns
+    ["Just to confirm... June 3.", "Is that correct?"] -- the long
+    dynamic half still renders fresh, but "Is that correct?" hits the
+    cache, eliminating the trailing render delay.
+
+    We deliberately DON'T coalesce short clauses. Short standalone
+    phrases ("Sure.", "Of course.", "Yes.") are exactly the high-value
+    cache-hit candidates -- merging them into a longer neighbor would
+    create a fresh-render key that misses the cache. The synthesis
+    overhead per clause is small (a few ms of Python + a single ONNX
+    inference whose cost scales with audio length, not clause count).
+    """
+    text = text.strip()
+    if not text:
+        return []
+    parts = _SENTENCE_BOUNDARY_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
 @dataclass
 class _Opts:
     voice: str
@@ -215,53 +267,111 @@ class _KokoroChunkedStream(tts.ChunkedStream):
         )
 
         text = self.input_text
-        key = self._tts.cache_key(text)
+        kokoro = self._tts._kokoro
 
-        # Cache hit: skip synth entirely, push the pre-rendered bytes.
-        cached = self._tts._cache.get(key)
-        if cached is not None:
-            log.info("TTS cache hit (%d bytes): %r", len(cached), text[:80])
-            output_emitter.push(cached)
+        # FAST PATH: full-utterance cache hit. Covers prewarmed greetings
+        # and any utterance that's been spoken verbatim before. Preserves
+        # the old single-key behavior so existing cache entries (and the
+        # prewarm pass) keep their value.
+        full_key = self._tts.cache_key(text)
+        cached_full = self._tts._cache.get(full_key)
+        if cached_full is not None:
+            log.info("TTS cache hit (full, %d bytes): %r", len(cached_full), text[:80])
+            output_emitter.push(cached_full)
             output_emitter.flush()
             return
 
-        kokoro = self._tts._kokoro
+        # SLOW PATH: split into clauses, render each independently, push
+        # as ready. Two benefits:
+        #
+        #   1. Per-clause cache hits within an otherwise-fresh utterance.
+        #      A response like "Of course. Let me check that for you."
+        #      where the first half is in PERSISTENT_OPENERS but the
+        #      full string isn't, now hits the cache on clause 1 (~60ms)
+        #      and only renders clause 2 fresh. Previously this rendered
+        #      both halves end-to-end (~2.5s).
+        #
+        #   2. Audio starts playing as soon as the first clause is ready.
+        #      Subsequent clauses render during playback. For a 4-clause
+        #      6-second utterance, perceived start-of-speech can drop
+        #      from ~6s (full render) to ~1.5s (first clause render).
+        #
+        # If splitting yields just one clause (Iris said a single
+        # sentence), this devolves to the same path as before but with
+        # the per-clause cache key, which is identical to the full-key
+        # we already missed -- one extra dict lookup, no extra work.
+        clauses = _split_into_clauses(text)
+        if not clauses:
+            output_emitter.flush()
+            return
 
-        def _synth_and_encode() -> bytes:
+        def _synth_clause(clause_text: str) -> bytes:
             # Run synthesis AND the float32→int16 conversion on the worker
             # thread. The numpy clip/multiply/cast looks cheap but on a
             # CPU-constrained host with ONNX Runtime intra-op threads still
             # winding down, this can hold the asyncio loop's GIL for tens of
-            # ms. That long enough to underrun ParticipantAudioOutput's
+            # ms -- long enough to underrun ParticipantAudioOutput's
             # ~250 ms buffer and produce within-word silence gaps in the
             # published Opus stream. Keeping everything off-loop fixes it.
             samples, sr = kokoro.create(
-                _normalize_for_tts(text),
+                _normalize_for_tts(clause_text),
                 voice=opts.voice, speed=opts.speed, lang=opts.lang,
             )
             if sr != KOKORO_SAMPLE_RATE:
                 raise APIConnectionError(
                     f"Unexpected Kokoro sample rate {sr}, expected {KOKORO_SAMPLE_RATE}"
                 )
-            # samples is float32 in [-1, 1]. LiveKit wants 16-bit signed PCM
-            # little-endian. Clip first to avoid overflow on out-of-range
-            # samples (rare but defensive).
             pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
             return pcm16.tobytes()
 
-        try:
-            pcm_bytes = await asyncio.to_thread(_synth_and_encode)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            # Anything from kokoro-onnx (bad text, ORT crash) surfaces here.
-            # Wrap so the framework's retry/backoff sees a known exception.
-            raise APIConnectionError(f"Kokoro synthesis failed: {e}") from e
+        hits = 0
+        misses = 0
+        for clause in clauses:
+            key = self._tts.cache_key(clause)
+            cached = self._tts._cache.get(key)
+            if cached is not None:
+                output_emitter.push(cached)
+                hits += 1
+                continue
+            try:
+                pcm_bytes = await asyncio.to_thread(_synth_clause, clause)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Anything from kokoro-onnx (bad text, ORT crash) surfaces
+                # here. Wrap so the framework's retry/backoff sees a known
+                # exception. Partial audio already pushed for prior clauses
+                # is acceptable -- the framework will discard it on retry.
+                raise APIConnectionError(f"Kokoro synthesis failed: {e}") from e
+            # Cache the per-clause result. Two clauses with the same text
+            # under the same voice share one entry. Across calls, repeated
+            # boilerplate ("Is that correct?", "Got it.", "Of course.")
+            # builds up cache hit rate naturally.
+            self._tts._cache.put(key, pcm_bytes)
+            output_emitter.push(pcm_bytes)
+            misses += 1
 
-        # Cache the result keyed by `[voice]text` so a future call with
-        # the same voice + text hits cache. Two voices keep separate
-        # entries, so switching IRIS_VOICE doesn't serve stale audio.
-        self._tts._cache.put(key, pcm_bytes)
+        # Cache the full utterance too so a second occurrence of this EXACT
+        # text gets the fast path on the next call (avoids the per-clause
+        # iteration cost). Concatenate the bytes from each clause -- byte
+        # ordering matches what we just emitted to the room. Skip the
+        # full-cache write if it'd duplicate a single clause (the per-clause
+        # cache already has it).
+        if len(clauses) > 1:
+            try:
+                full_pcm = b"".join(
+                    self._tts._cache.get(self._tts.cache_key(c)) or b""
+                    for c in clauses
+                )
+                if full_pcm:
+                    self._tts._cache.put(full_key, full_pcm)
+            except Exception:  # noqa: BLE001
+                # Cache write is best-effort. If join fails for any reason,
+                # the per-clause cache still works for next time.
+                log.exception("Failed to write full-utterance cache (clauses cached OK)")
 
-        output_emitter.push(pcm_bytes)
+        log.info(
+            "TTS clauses: %d hit, %d miss, text=%r",
+            hits, misses, text[:80],
+        )
         output_emitter.flush()

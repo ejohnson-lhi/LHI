@@ -345,7 +345,38 @@ PERSISTENT_OPENERS: tuple[str, ...] = (
     "You're right.",
     "Sorry, I didn't catch that.",
     "I'm sorry, I didn't quite catch that.",
+    "I'm sorry, I didn't catch that clearly.",
     "Could you say that again?",
+    "Sorry, could you say that again?",
+    # ----- Booking-flow questions (verified from recent call transcripts;
+    # these are the questions Iris asks on essentially every booking. Each
+    # is a complete sentence so the clause splitter emits them as their
+    # own cache-keyed chunk after any dynamic preceding clause.) -----
+    "And when will you be checking out?",
+    "How many beds will you need?",
+    "How many guests will be staying?",
+    "What is the first name for the reservation?",
+    "And the last name?",
+    "Could you give me the first name again?",
+    "Could you give me the last name again?",
+    "Would you like to go ahead and make this reservation?",
+    "Would you prefer your confirmation by email or by text message?",
+    "Could I get an email address for the confirmation?",
+    "Do you know about when you'll be arriving?",
+    "Will any pets be staying with you?",
+    # ----- Confirmation tails (the second clause of "Just to confirm, X.
+    # Is that correct?" -- the first clause is dynamic but these trailing
+    # questions are verbatim) -----
+    "Is that correct?",
+    "Did I get that right?",
+    "Okay, you're all set.",
+    # ----- Card-capture DTMF flow (Iris reads these verbatim while the
+    # caller types digits on the keypad; each step is cacheable) -----
+    "Okay, ready when you are.",
+    "Listen for each prompt.",
+    "Please enter your card number, then press pound.",
+    "Now your three or four digit security code, then pound.",
+    "Now your expiration date as four digits — two for the month, two for the year.",
     # ----- Transfer flow (system-controlled exact strings) -----
     "Let me transfer you to the front desk now.",
     "Of course. Let me transfer you to the front desk now.",
@@ -492,6 +523,143 @@ async def _call_backend_tool(
 
 
 # =============================================================================
+# LLM prompt-cache warmup via the session's own LLM client
+# =============================================================================
+#
+# Strategy: fire a "warmup turn" through the session's LiveKit anthropic
+# plugin instance, NOT via a direct anthropic_sdk client call. Why this
+# matters: Anthropic's prompt cache keys on the full request prefix
+# (tools + system + cache_control + messages, in that order). Earlier
+# attempts using a direct anthropic_sdk call omitted tools, so the
+# warmup's cached prefix was [system] but the real call's prefix was
+# [tools + system]. Different keys -> cache miss on the real first turn
+# (recording proved cache_hit_ratio=0.0 on the first LLM call). The
+# only way to guarantee the prefix matches is to use the same plugin
+# instance + chat_ctx machinery the real calls use.
+#
+# The sentinel message "blizzard frog" is matched by a system-prompt
+# rule that instructs the LLM to respond with just the single word
+# "Hello" -- output is bounded to 1 token and we drain & discard the
+# stream so nothing reaches TTS. The sentinel is also a safety net: if
+# our discard logic ever leaks audio (it shouldn't), the caller would
+# hear "Hello" overlapping the greeting -- mildly weird but recoverable,
+# vs. the LLM improvising some random response.
+#
+# Cost: the warmup is a cache WRITE (~$0.11 on a 30K-token system
+# prompt) -- but the real first turn would have done that write anyway,
+# so the net difference is ~$0.009 per call (one extra cache READ
+# turn's worth of input pricing). Trade: ~1.5s shaved off the first-
+# turn dead-air window every call.
+
+_WARMUP_TIMEOUT_SECONDS = 12.0
+
+# Sentinel user message paired with the prompt rule in
+# AI_Prompts/Lighthouse_AI_system_prompt.txt under [Internal Warmup
+# Signal]. Must match the prompt rule exactly (case-insensitive there,
+# but we send the canonical lowercase form). If you change one, change
+# both.
+_WARMUP_SENTINEL = "blizzard frog"
+
+
+async def _warm_llm_via_session(agent: "IrisAgent") -> None:
+    """Populate Anthropic's prompt cache by firing a sentinel turn
+    through the agent's own LLM client.
+
+    Runs in parallel with the greeting playback (the caller hears the
+    welcome message while this completes in the background). The
+    sentinel "blizzard frog" matches a prompt rule that yields a 1-token
+    "Hello" response; we drain the stream and discard everything, so
+    nothing reaches TTS and the agent's main chat history is untouched
+    (we use a fresh ChatContext, not the agent's running one).
+
+    The whole point is that this LLM call has EXACTLY the same request
+    prefix (tools + system + cache_control) as the real first turn. The
+    plugin's serialization is identical because it's the same plugin
+    instance handling both calls. Cache hit guaranteed on the real
+    first turn (assuming Anthropic's cache TTL hasn't elapsed -- the
+    warmup completes in ~1-2s; the real first turn fires ~5-15s later
+    when the caller finishes speaking; well within the 5-min window).
+
+    Failures are swallowed -- the real call still works, just paying
+    the cold cache-write cost on first turn instead of warmup time.
+    """
+    started = datetime.now()
+    try:
+        # Local import: livekit.agents.llm exposes ChatContext + ChatMessage
+        # for building turns programmatically. Imported here (not at module
+        # top) so any import problem only affects warmup, not call startup.
+        from livekit.agents.llm import ChatContext, ChatMessage  # noqa: PLC0415
+
+        session = agent.session
+        if session is None or session.llm is None:
+            log.warning("LLM warmup: no session.llm available; skipping")
+            return
+
+        # Build a FRESH chat_ctx (not a copy of the agent's running one) --
+        # the warmup turn must not pollute the real conversation history,
+        # and we don't want chat history quirks affecting the cache key.
+        chat_ctx = ChatContext()
+
+        # Set the instructions. LiveKit's ChatContext usually exposes an
+        # `instructions` attribute that the LLM stringifies into the
+        # system block. If the API differs across versions, just attach
+        # via setattr and trust the plugin's serializer.
+        try:
+            chat_ctx.instructions = agent._system_prompt
+        except (AttributeError, TypeError):
+            log.warning("LLM warmup: couldn't set chat_ctx.instructions; cache may miss")
+
+        # Append the sentinel user message. ChatMessage constructor in the
+        # 1.x series typically takes role + content. If content needs to
+        # be a list-of-blocks, the plugin will handle the conversion.
+        try:
+            chat_ctx.items.append(ChatMessage(role="user", content=_WARMUP_SENTINEL))
+        except TypeError:
+            # Some versions want content as a list
+            chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
+
+        # Fire the LLM call through the session's plugin instance.
+        # Tools come from the agent automatically when the framework
+        # constructs requests -- but for a bare llm.chat() call we may
+        # need to pass them explicitly. Try the most likely access path
+        # for the agent's registered tools. If we can't find them, the
+        # warmup will still write a cache entry but the real call's
+        # cache lookup (which includes tools in the prefix) won't match.
+        # That's a degraded outcome, not a fatal one.
+        tools = None
+        for attr in ("tools", "_tools", "function_tools"):
+            v = getattr(agent, attr, None)
+            if v:
+                tools = v
+                break
+        if not tools:
+            find_fn = getattr(agent, "find_function_tools", None)
+            if callable(find_fn):
+                try:
+                    tools = find_fn()
+                except Exception:
+                    tools = None
+
+        # Fire LLM. Wrap in wait_for so a hung call doesn't outlive the
+        # call itself.
+        async def _drain() -> None:
+            stream = session.llm.chat(chat_ctx=chat_ctx, tools=tools)
+            # LiveKit LLMStream is async-iterable; drain to flush the
+            # full response (including the cache-write completion).
+            async for _chunk in stream:
+                pass
+
+        await asyncio.wait_for(_drain(), timeout=_WARMUP_TIMEOUT_SECONDS)
+
+        elapsed = (datetime.now() - started).total_seconds()
+        log.info("LLM warmup via session done in %.2fs", elapsed)
+    except asyncio.TimeoutError:
+        log.warning("LLM warmup timed out after %.1fs", _WARMUP_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 -- warmup must never crash the call
+        log.exception("LLM warmup via session failed (continuing with cold cache)")
+
+
+# =============================================================================
 # IrisAgent — tools as methods, auto-registered by find_function_tools()
 # =============================================================================
 
@@ -540,11 +708,17 @@ class IrisAgent(Agent):
         # been disabled for this call (after any tool call fires, we defer
         # to the LLM for the rest of the conversation).
         self._intent_state = IntentCallState()
-        super().__init__(instructions=build_system_prompt(
+        # Compute the system prompt once and keep a reference. The base
+        # class stores its own copy too, but we want our own so the
+        # call-start LLM cache warmup uses the EXACT same text -- any
+        # whitespace/template difference would break the prefix match
+        # Anthropic's prompt cache relies on.
+        self._system_prompt = build_system_prompt(
             caller_phone=caller_phone,
             is_admin=self._is_admin,
             persona=persona,
-        ))
+        )
+        super().__init__(instructions=self._system_prompt)
         self._caller_phone = caller_phone
         if self._is_admin:
             log.info("Caller %s recognized as admin", caller_phone)
@@ -681,6 +855,17 @@ class IrisAgent(Agent):
         persona = _persona_for(voice)
         first_message = _first_message_for(persona)
         log.info("Agent on_enter: speaking first message (voice=%s, persona=%s)", voice, persona)
+        # Kick off Anthropic prompt-cache warmup BEFORE the greeting plays.
+        # Runs in parallel: the warmup completes in ~1-2s while the
+        # ~4-second greeting plays out, so by the time the caller finishes
+        # their opening sentence (~10s from now) the prompt cache is hot
+        # and the first real LLM turn hits a cache read instead of a
+        # cold write. The warmup goes through the agent's OWN LLM client
+        # so the cache prefix (tools + system + cache_control) exactly
+        # matches what the real turn will send -- the only reliable way
+        # to make Anthropic's prefix-keyed cache match. See
+        # _warm_llm_via_session for full rationale.
+        asyncio.create_task(_warm_llm_via_session(self))
         # allow_interruptions=False so the greeting plays even if the
         # caller speaks first.
         await self.session.say(first_message, allow_interruptions=False)
@@ -2142,6 +2327,80 @@ async def entrypoint(ctx: JobContext) -> None:
             log.info("metrics %s: %s", kind, attrs)
             _record(f"metrics.{kind}", **attrs)
 
+    # ----- Filler-phrase machinery (#4) ---------------------------------
+    #
+    # When the agent stays in `thinking` state too long (LLM is slow,
+    # either because of cache miss, a tool call round-trip, or just
+    # Sonnet's reasoning phase), play a cached "one moment" so the caller
+    # hears something instead of dead air. Threshold + flag tracking:
+    #
+    #   FILLER_THRESHOLD_SECONDS  Wait this long after entering thinking
+    #                             before deciding the turn is slow. Fast
+    #                             turns (LLM completes inside the window)
+    #                             skip the filler entirely.
+    #
+    #   _filler_played_this_turn  Once a filler plays, don't play another
+    #                             one this turn even if the agent re-enters
+    #                             thinking after a tool call. Reset when
+    #                             the user starts speaking (new turn).
+    #
+    #   _filler_task              The asyncio.Task running the timer.
+    #                             Canceled whenever state leaves thinking
+    #                             so we don't double-play if LLM finishes
+    #                             quickly.
+    #
+    # The filler text is "One moment." — already in PERSISTENT_OPENERS so
+    # it's a cache hit (audio starts in ~60ms). allow_interruptions=True
+    # so the framework can cut it off when the real LLM response is ready
+    # to play (avoids the filler delaying the real response when LLM
+    # happens to finish right after the timer fires).
+    FILLER_PHRASE = "One moment."
+    FILLER_THRESHOLD_SECONDS = 1.5
+    # DISABLED 2026-05-29 after a card-capture + create_reservation call:
+    # filler fired at the 1.5s mark while the LLM was mid-tool-call.
+    # session.say() transitions the agent to "speaking" state, which the
+    # framework treats as the turn's assistant utterance being complete.
+    # When the tool returned and the LLM produced its real response, the
+    # framework's state machine had already moved on and the response
+    # audio was never played. Reservation + card capture themselves
+    # succeeded (the tool function ran to completion) -- only the
+    # post-tool TTS was lost.
+    #
+    # Re-enable after rewriting the filler to either:
+    #   (a) detect "tool call in progress" and skip;
+    #   (b) inject audio at a lower level that doesn't move agent state;
+    #   (c) only fire when state has been thinking for >Ns AND we know
+    #       no tool calls have been emitted yet for this turn.
+    FILLER_ENABLED = False
+    _filler_state = {
+        "task": None,           # asyncio.Task | None
+        "played_this_turn": False,
+        "current_agent_state": "initializing",
+    }
+
+    async def _maybe_speak_filler() -> None:
+        """Sleep for the threshold, then check state and play filler if
+        the agent is still thinking. Designed to be canceled cleanly
+        when state changes early."""
+        try:
+            await asyncio.sleep(FILLER_THRESHOLD_SECONDS)
+        except asyncio.CancelledError:
+            return
+        # Re-check both flags after the sleep. State may have changed; another
+        # filler may already have been played (e.g., user_state_changed
+        # didn't reset because they kept speaking through the interruption).
+        if _filler_state["current_agent_state"] != "thinking":
+            return
+        if _filler_state["played_this_turn"]:
+            return
+        _filler_state["played_this_turn"] = True
+        log.info("Agent thinking >%.1fs; speaking filler %r",
+                 FILLER_THRESHOLD_SECONDS, FILLER_PHRASE)
+        try:
+            await session.say(FILLER_PHRASE, allow_interruptions=True)
+        except Exception:
+            log.exception("Filler say() failed (continuing without filler)")
+
     # Agent state transitions: listening (waiting for user) -> thinking
     # (LLM running) -> speaking (TTS playing). Gaps between these tell us
     # where the wall-clock time is being spent.
@@ -2149,12 +2408,38 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_agent_state(ev) -> None:
         new_state = getattr(ev, "new_state", None) or getattr(ev, "state", None)
         old_state = getattr(ev, "old_state", None)
+        new_state_str = str(new_state)
+        _filler_state["current_agent_state"] = new_state_str
+
+        # Cancel any pending filler timer whenever the state changes --
+        # if the LLM finishes thinking within the window, we don't want
+        # the filler to fire just after the real response starts. The
+        # cancel is a no-op if the task is None or already done.
+        existing = _filler_state["task"]
+        if existing is not None and not existing.done():
+            existing.cancel()
+            _filler_state["task"] = None
+
+        # Schedule a new filler timer ONLY when entering thinking AND we
+        # haven't already played one this turn. After a tool call the
+        # agent goes thinking -> calling tool -> thinking again; a second
+        # filler in the same turn would feel repetitive, so we gate it.
+        # Currently gated off via FILLER_ENABLED -- see the comment block
+        # above FILLER_PHRASE for the failure mode that caused this.
+        if FILLER_ENABLED and new_state_str == "thinking" and not _filler_state["played_this_turn"]:
+            _filler_state["task"] = asyncio.create_task(_maybe_speak_filler())
+
         log.info("agent_state %s -> %s", old_state, new_state)
-        _record("agent_state", state=str(new_state), prev=str(old_state) if old_state else None)
+        _record("agent_state", state=new_state_str, prev=str(old_state) if old_state else None)
 
     @session.on("user_state_changed")
     def _on_user_state(ev) -> None:
         new_state = getattr(ev, "new_state", None) or getattr(ev, "state", None)
+        # When the user starts speaking, it's a fresh turn -- reset the
+        # per-turn filler flag so the next thinking phase can fire a
+        # filler again.
+        if str(new_state) == "speaking":
+            _filler_state["played_this_turn"] = False
         _record("user_state", state=str(new_state))
 
     # STT finalization — useful for measuring "STT finalize -> LLM start" gap.

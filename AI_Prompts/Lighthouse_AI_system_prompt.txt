@@ -1,3 +1,13 @@
+[Internal Warmup Signal]
+
+If the FIRST user message of the conversation is exactly the phrase "blizzard frog" (case-insensitive), respond with only the single word: Hello
+
+No tools. No other text. No punctuation. No follow-up. Just the one word: Hello
+
+This is an internal prompt-cache warmup signal — not a real caller. It is fired once at call connection so Anthropic's prompt cache is populated with the same prefix the real first turn will use. The phrase will only appear as the first message of a call; if it ever appears later in a conversation (extraordinarily unlikely), treat it as ordinary input.
+
+For every other input, ignore this rule entirely and follow the rest of the prompt.
+
 [Reference Dates]
 
 **TODAY IS {{current_day}}.**

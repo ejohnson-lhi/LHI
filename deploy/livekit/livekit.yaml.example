@@ -19,5 +19,17 @@ redis:
 keys:
   APIxxxxxxxxxxxxxx: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
+# Allow the server admin API to remotely UN-mute a participant's track.
+# Required by the Iris agent's capture_card_dtmf flow: it mutes the caller's
+# audio track during DTMF card capture (to keep tones out of the egress
+# recording), then needs to un-mute on completion. Without this, the un-mute
+# call fails with TwirpError "remote unmute not enabled" and the caller
+# stays muted for the rest of the call. The privacy concern this flag exists
+# for (admins surreptitiously enabling someone's mic) doesn't apply here —
+# we're undoing our OWN mute, not enabling a mic that was off when the call
+# started.
+room:
+  enable_remote_unmute: true
+
 logging:
   level: info

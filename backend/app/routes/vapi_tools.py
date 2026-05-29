@@ -360,7 +360,20 @@ async def _handle_save_card_via_token(args: dict, call: VapiCallObject) -> dict:
         get_booking_id,
     )
 
-    booking_id = await get_booking_id(reservation_id)
+    # Wrap both Cloudbeds calls in try/except so the agent gets a useful
+    # error string instead of the dispatcher's generic "Internal error
+    # processing tool call." get_booking_id can raise if the session-cookie
+    # path fails AND the Playwright fallback also fails (e.g., browser
+    # binary missing or login flow regressed). dashboard_save_credit_card
+    # can raise on unexpected dashboard response shapes.
+    try:
+        booking_id = await get_booking_id(reservation_id)
+    except Exception as ex:
+        log.exception("save_card_via_token: get_booking_id raised for res=%s", reservation_id)
+        return {
+            "success": False,
+            "error": f"Could not look up reservation in Cloudbeds: {type(ex).__name__}: {ex}",
+        }
     if not booking_id:
         log.warning("save_card_via_token: no booking_id for reservation=%s", reservation_id)
         return {
@@ -369,11 +382,19 @@ async def _handle_save_card_via_token(args: dict, call: VapiCallObject) -> dict:
                      "The session cookie may have expired — re-run the Playwright login.",
         }
 
-    result = await dashboard_save_credit_card(
-        booking_id=str(booking_id),
-        legacy_token_id=token_id,
-        token_card=token_card,
-    )
+    try:
+        result = await dashboard_save_credit_card(
+            booking_id=str(booking_id),
+            legacy_token_id=token_id,
+            token_card=token_card,
+        )
+    except Exception as ex:
+        log.exception("save_card_via_token: dashboard_save_credit_card raised for booking=%s",
+                      booking_id)
+        return {
+            "success": False,
+            "error": f"Cloudbeds card-save call raised: {type(ex).__name__}: {ex}",
+        }
 
     # Sanitize the response. Surface enough for Iris to confirm verbally
     # but never echo back card material that Cloudbeds might have included
