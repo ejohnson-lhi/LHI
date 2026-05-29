@@ -595,26 +595,31 @@ async def _warm_llm_via_session(agent: "IrisAgent") -> None:
             log.warning("LLM warmup: no session.llm available; skipping")
             return
 
-        # Build a FRESH chat_ctx (not a copy of the agent's running one) --
-        # the warmup turn must not pollute the real conversation history,
-        # and we don't want chat history quirks affecting the cache key.
-        chat_ctx = ChatContext()
-
-        # IMPORTANT: the anthropic format converter
-        # (livekit/agents/llm/_provider_format/anthropic.py line ~36)
-        # picks up system content ONLY from ChatMessage items with
-        # role="system" -- NOT from chat_ctx.instructions or any other
-        # attribute. Setting chat_ctx.instructions is a silent no-op
-        # (we tried; verified against the installed source). The system
-        # text must be a role="system" message in items, BEFORE the
-        # user message.
+        # Prefer the agent's OWN chat_ctx as the base. Whatever system
+        # message the framework set up at agent init time -- with the
+        # exact ChatMessage shape, exact content blocks, exact ordering --
+        # is what real LLM calls will use. Reconstructing it manually
+        # from the raw instructions string risks subtle differences
+        # (different ChatContent block type, different content list
+        # shape, framework-added metadata) that change the system
+        # prefix bytes and break the cache key.
         #
-        # Without this, extra["system"] is empty in the Anthropic
-        # request, the plugin's cache_control marker on system never
-        # writes anything, and our cache prefix is [tools] only --
-        # which matches the observed call-2 hit ratio of ~0.128 (just
-        # the tools section, ~3800 of ~30000 tokens).
-        chat_ctx.items.append(ChatMessage(role="system", content=[agent._system_prompt]))
+        # We .copy() so appending the sentinel doesn't pollute the
+        # agent's running state. If chat_ctx.copy() isn't available on
+        # this framework version, fall back to a fresh ChatContext with
+        # a manually-constructed system message -- works for tools
+        # but may miss on system (the failure mode we just observed
+        # with 0.128 partial hit).
+        base_ctx = getattr(agent, "chat_ctx", None)
+        if base_ctx is not None and hasattr(base_ctx, "copy"):
+            chat_ctx = base_ctx.copy()
+            ctx_source = "agent.chat_ctx.copy()"
+        else:
+            chat_ctx = ChatContext()
+            chat_ctx.items.append(ChatMessage(role="system", content=[agent._system_prompt]))
+            ctx_source = "fresh ChatContext with manual system message"
+        log.info("Warmup chat_ctx source: %s", ctx_source)
+
         chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
 
         # Fire the LLM call through the session's plugin instance. The
