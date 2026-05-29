@@ -267,6 +267,37 @@ class _KokoroChunkedStream(tts.ChunkedStream):
         )
 
         text = self.input_text
+
+        # WARMUP SHORT-CIRCUIT: if the LLM returned just "Hello" (the
+        # canonical response to the internal "blizzard frog" warmup signal
+        # -- see iris_agent.py _WARMUP_SENTINEL and the [Internal Warmup
+        # Signal] rule in AI_Prompts/Lighthouse_AI_system_prompt.txt),
+        # emit ~50 ms of silence instead of synthesizing. The warmup turn
+        # exists only to populate Anthropic's prompt cache with a prefix
+        # that matches the real first turn byte-for-byte; the caller
+        # should not hear it.
+        #
+        # Safety analysis: bare "Hello" is virtually never the LLM's
+        # standalone response during a real call. Real greetings always
+        # include "Lighthouse Inn" / persona name (see PERSISTENT_OPENERS
+        # in iris_agent.py), and mid-call openers are phrases like
+        # "Of course." or "Sure." -- not "Hello". If the LLM ever does
+        # respond with bare "Hello" in a real call, the caller hears a
+        # 50 ms blip instead of a syllable; recoverable, not catastrophic.
+        # Matching strips trailing punctuation/whitespace and lowercases.
+        normalized = text.strip().rstrip(".!?,").strip().lower()
+        if normalized == "hello":
+            silent_ms = 50
+            silent_samples = int(KOKORO_SAMPLE_RATE * silent_ms / 1000)
+            silent_pcm = np.zeros(silent_samples, dtype=np.int16).tobytes()
+            log.info(
+                "TTS warmup short-circuit: emitting %dms of silence for 'Hello' (text=%r)",
+                silent_ms, text,
+            )
+            output_emitter.push(silent_pcm)
+            output_emitter.flush()
+            return
+
         kokoro = self._tts._kokoro
 
         # FAST PATH: full-utterance cache hit. Covers prewarmed greetings

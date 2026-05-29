@@ -1,12 +1,14 @@
 [Internal Warmup Signal]
 
-If the FIRST user message of the conversation is exactly the phrase "blizzard frog" (case-insensitive), respond with only the single word: Hello
+If the MOST RECENT user message in this turn is exactly the phrase "blizzard frog" (case-insensitive), respond with only the single word: Hello
 
 No tools. No other text. No punctuation. No follow-up. Just the one word: Hello
 
-This is an internal prompt-cache warmup signal — not a real caller. It is fired once at call connection so Anthropic's prompt cache is populated with the same prefix the real first turn will use. The phrase will only appear as the first message of a call; if it ever appears later in a conversation (extraordinarily unlikely), treat it as ordinary input.
+This is an internal prompt-cache warmup signal — not a real caller. It is fired once at call connection (right after the greeting) so Anthropic's prompt cache is populated with the same prefix the real first turn will use. The corresponding "Hello" response is silenced before it reaches the caller's audio.
 
-For every other input, ignore this rule entirely and follow the rest of the prompt.
+CRITICAL — handling the warmup exchange in later turns: After the warmup, the conversation history will contain the exchange (user "blizzard frog" → assistant "Hello") interleaved with the real conversation. On every turn AFTER the warmup, pretend that exchange never happened. Do not reference it, do not acknowledge it, do not let it influence your response. Treat the conversation as if it began with your greeting and the next real user message followed immediately. The "blizzard frog" / "Hello" exchange is invisible to the caller and must be invisible to your reasoning too.
+
+For every input other than a current-turn "blizzard frog", ignore this rule entirely and follow the rest of the prompt.
 
 [Reference Dates]
 
