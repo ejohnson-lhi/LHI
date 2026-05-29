@@ -39,13 +39,18 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-GENERATOR_VERSION = "v1"
-ANTHROPIC_MODEL = "claude-sonnet-4-5"
+GENERATOR_VERSION = "v2"
+# Haiku 4.5 instead of Sonnet 4.5: ~4x cheaper input ($0.80/M vs $3/M),
+# ~4x cheaper output ($4/M vs $15/M). Verified 2026-05-29 that
+# claude-haiku-4-5 resolves on the droplet's Anthropic key. Summary
+# quality has been good enough in spot checks; flip back to
+# claude-sonnet-4-5 here if it ever feels off.
+ANTHROPIC_MODEL = "claude-haiku-4-5"
 
-# Keep the summary cheap: Sonnet input is $3/M, output $15/M. A 100-turn
-# call's items + summary prompt is ~3000 input tokens, ~200 output tokens
-# = ~$0.012 per call. Tolerable for an opt-in re-gen + automatic
-# post-call run.
+# Cost per call with Haiku 4.5: ~3000 input tokens * $0.80/M + ~200
+# output tokens * $4/M = ~$0.0032 per call. At ~100 calls/month that's
+# ~$0.32/month. Trivial for the value of auto-attached call context
+# on each reservation.
 SUMMARY_PROMPT = """You are reviewing a phone call between an AI receptionist named Iris (Lighthouse Inn, a small coastal hotel in Florence, Oregon) and a caller.
 
 Read the transcript below and produce a JSON object with these fields:

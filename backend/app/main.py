@@ -5,6 +5,7 @@ Run locally with:
 
 Or use scripts/run_dev.bat which also starts the Cloudflare Tunnel.
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -15,6 +16,7 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.db.database import init_db
 from app.routes import admin, dcs_relay, incoming_call, iris_dashboard, llm, portal, portal_card, sms_signup, vapi_tools
+from app.services.iris_dashboard import call_processor as iris_call_processor
 
 # Ensure SQLAlchemy sees all models before init_db's metadata.create_all runs.
 # Importing the module is enough — the class registers itself with Base.
@@ -37,7 +39,33 @@ async def lifespan(app: FastAPI):
     log.info(f"Starting Lighthouse backend in {settings.app_env} mode")
     log.info(f"Database: {settings.database_url}")
     await init_db()
+
+    # Iris dashboard call processor: scans recordings dir on an interval,
+    # generates Claude summaries for new transcripts, and posts them to
+    # the linked Cloudbeds reservation as a note. Gated by
+    # IRIS_CALL_PROCESSOR_ENABLED env (default true).
+    processor_task: asyncio.Task | None = None
+    if iris_call_processor.is_enabled():
+        processor_task = asyncio.create_task(
+            iris_call_processor.run_loop(iris_call_processor.interval_seconds()),
+            name="iris_call_processor",
+        )
+        log.info(
+            "iris_call_processor started (interval=%ds)",
+            iris_call_processor.interval_seconds(),
+        )
+    else:
+        log.info("iris_call_processor disabled by IRIS_CALL_PROCESSOR_ENABLED")
+
     yield
+
+    if processor_task is not None:
+        processor_task.cancel()
+        try:
+            await processor_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     log.info("Shutting down Lighthouse backend")
 
 

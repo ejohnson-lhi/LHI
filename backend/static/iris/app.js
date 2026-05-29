@@ -372,6 +372,12 @@
         ...summary.issues_observed.map(i => el("li", null, i)),
       ));
     }
+    if (summary.attached_to_reservations && summary.attached_to_reservations.length > 0) {
+      card.appendChild(el("p", { class: "summary-meta" },
+        el("strong", null, "Posted as Cloudbeds note on: "),
+        summary.attached_to_reservations.join(", "),
+      ));
+    }
     if (summary.generated_at) {
       card.appendChild(el("div", { class: "summary-meta" },
         `Generated ${fmtTime(summary.generated_at)} (${summary.generator_version || "?"})`,
