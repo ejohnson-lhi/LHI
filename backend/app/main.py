@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.db.database import init_db
-from app.routes import admin, dcs_relay, incoming_call, llm, portal, portal_card, sms_signup, vapi_tools
+from app.routes import admin, dcs_relay, incoming_call, iris_dashboard, llm, portal, portal_card, sms_signup, vapi_tools
 
 # Ensure SQLAlchemy sees all models before init_db's metadata.create_all runs.
 # Importing the module is enough — the class registers itself with Base.
@@ -62,6 +62,13 @@ app.include_router(llm.router, prefix="/llm", tags=["custom-llm"])
 # /dcs/{path} is namespaced under /dcs/ so it can't collide with portal's
 # /c/, /g/, /h* routes.
 app.include_router(dcs_relay.router, tags=["dcs-relay"])
+
+# Iris call-review dashboard — internal tool for the hotel owner to scan
+# recent calls, listen to merged audio, read transcripts, and see per-call
+# cost and category. Auth via HTTP Basic with portal_shared_secret as the
+# password. Mounted under /iris/* — registered alongside dcs_relay so both
+# share the same auth posture.
+app.include_router(iris_dashboard.router, tags=["iris-dashboard"])
 
 # Guest portal card-capture flow (Stripe.js -> tok_xxx -> Cloudbeds
 # internal save_credit_card). Test endpoints under /portal-card/* — no
