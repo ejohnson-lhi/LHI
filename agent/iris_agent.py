@@ -615,41 +615,86 @@ async def _warm_llm_via_session(agent: "IrisAgent") -> None:
         # form is accepted as a shorthand for a single text block.
         chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
 
-        # Fire the LLM call through the session's plugin instance.
-        # Tools come from the agent automatically when the framework
-        # constructs requests -- but for a bare llm.chat() call we may
-        # need to pass them explicitly. Try the most likely access path
-        # for the agent's registered tools. If we can't find them, the
-        # warmup will still write a cache entry but the real call's
-        # cache lookup (which includes tools in the prefix) won't match.
-        # That's a degraded outcome, not a fatal one.
+        # Fire the LLM call through the session's plugin instance. The
+        # tools must be passed explicitly because llm.chat() is a bare
+        # call -- the framework's normal turn machinery (which auto-
+        # registers the agent's @function_tool methods) isn't involved
+        # here. Without tools, the cache prefix we write is [system] but
+        # the real call's prefix is [tools + system] -- different keys,
+        # no cache hit on call 1.
+        #
+        # Try the framework's registered discovery helper first, then
+        # fall back through likely attribute names. Log what we found
+        # so the next iteration of this code can see what's actually
+        # available on the installed framework version.
         tools = None
-        for attr in ("tools", "_tools", "function_tools"):
-            v = getattr(agent, attr, None)
-            if v:
-                tools = v
-                break
+        tools_source = "none"
+        try:
+            # find_function_tools is a module-level helper in
+            # livekit.agents (per the comment above IrisAgent's
+            # class definition).
+            from livekit.agents import find_function_tools  # noqa: PLC0415
+            tools = find_function_tools(agent)
+            tools_source = "find_function_tools(agent)"
+        except (ImportError, AttributeError, TypeError) as e:
+            log.warning("Warmup: find_function_tools import/call failed: %s", e)
+        if not tools:
+            for attr in ("tools", "_tools", "function_tools"):
+                v = getattr(agent, attr, None)
+                if v:
+                    tools = v
+                    tools_source = f"agent.{attr}"
+                    break
         if not tools:
             find_fn = getattr(agent, "find_function_tools", None)
             if callable(find_fn):
                 try:
                     tools = find_fn()
-                except Exception:
-                    tools = None
+                    tools_source = "agent.find_function_tools()"
+                except Exception as e:
+                    log.warning("Warmup: agent.find_function_tools() raised: %s", e)
+        log.info(
+            "Warmup tools discovery: source=%s, count=%s",
+            tools_source,
+            len(tools) if tools else 0,
+        )
 
         # Fire LLM. Wrap in wait_for so a hung call doesn't outlive the
-        # call itself.
+        # call itself. Capture chunks so we can inspect the response's
+        # usage metadata at the end -- specifically cache_creation_input
+        # _tokens, which proves the cache write happened.
+        captured: list = []
         async def _drain() -> None:
             stream = session.llm.chat(chat_ctx=chat_ctx, tools=tools)
-            # LiveKit LLMStream is async-iterable; drain to flush the
-            # full response (including the cache-write completion).
-            async for _chunk in stream:
-                pass
+            async for chunk in stream:
+                captured.append(chunk)
 
         await asyncio.wait_for(_drain(), timeout=_WARMUP_TIMEOUT_SECONDS)
 
         elapsed = (datetime.now() - started).total_seconds()
-        log.info("LLM warmup via session done in %.2fs", elapsed)
+        # Best-effort extraction of cache stats from the last chunk's usage.
+        # The exact shape varies across plugin versions; if we can't find
+        # it the log just says "?".
+        cache_create = "?"
+        cache_read = "?"
+        for ch in reversed(captured):
+            for attr_path in (("usage", "cache_creation_input_tokens"),
+                              ("metrics", "cache_creation_input_tokens"),
+                              ("raw", "usage", "cache_creation_input_tokens")):
+                obj = ch
+                for p in attr_path:
+                    obj = getattr(obj, p, None)
+                    if obj is None:
+                        break
+                if obj is not None:
+                    cache_create = obj
+                    break
+            if cache_create != "?":
+                break
+        log.info(
+            "LLM warmup via session done in %.2fs (tools_passed=%s, cache_creation_tokens=%s)",
+            elapsed, "yes" if tools else "no", cache_create,
+        )
     except asyncio.TimeoutError:
         log.warning("LLM warmup timed out after %.1fs", _WARMUP_TIMEOUT_SECONDS)
     except Exception:  # noqa: BLE001 -- warmup must never crash the call
