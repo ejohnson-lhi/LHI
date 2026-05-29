@@ -600,19 +600,21 @@ async def _warm_llm_via_session(agent: "IrisAgent") -> None:
         # and we don't want chat history quirks affecting the cache key.
         chat_ctx = ChatContext()
 
-        # Set the instructions. LiveKit's ChatContext usually exposes an
-        # `instructions` attribute that the LLM stringifies into the
-        # system block. If the API differs across versions, just attach
-        # via setattr and trust the plugin's serializer.
-        try:
-            chat_ctx.instructions = agent._system_prompt
-        except (AttributeError, TypeError):
-            log.warning("LLM warmup: couldn't set chat_ctx.instructions; cache may miss")
-
-        # Append the sentinel user message. ChatMessage.content in the
-        # 1.x series is typed as list[ChatContent] (pydantic-validated)
-        # so a bare string raises ValidationError. The list-of-strings
-        # form is accepted as a shorthand for a single text block.
+        # IMPORTANT: the anthropic format converter
+        # (livekit/agents/llm/_provider_format/anthropic.py line ~36)
+        # picks up system content ONLY from ChatMessage items with
+        # role="system" -- NOT from chat_ctx.instructions or any other
+        # attribute. Setting chat_ctx.instructions is a silent no-op
+        # (we tried; verified against the installed source). The system
+        # text must be a role="system" message in items, BEFORE the
+        # user message.
+        #
+        # Without this, extra["system"] is empty in the Anthropic
+        # request, the plugin's cache_control marker on system never
+        # writes anything, and our cache prefix is [tools] only --
+        # which matches the observed call-2 hit ratio of ~0.128 (just
+        # the tools section, ~3800 of ~30000 tokens).
+        chat_ctx.items.append(ChatMessage(role="system", content=[agent._system_prompt]))
         chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
 
         # Fire the LLM call through the session's plugin instance. The
