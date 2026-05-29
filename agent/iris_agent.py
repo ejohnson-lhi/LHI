@@ -523,34 +523,44 @@ async def _call_backend_tool(
 
 
 # =============================================================================
-# LLM prompt-cache warmup via the framework's user-input pipeline
+# LLM prompt-cache warmup via direct agent.llm.chat()
 # =============================================================================
 #
-# Strategy: after the TTS-only greeting plays, fire a synthetic user turn
-# through `session.generate_reply(user_input="blizzard frog")`. This goes
-# through the EXACT same code path as a real STT-triggered turn -- the
-# framework builds the LLM request via its standard chat_ctx serialization,
-# so the prompt-cache prefix written by the warmup matches byte-for-byte
-# what the real first turn will send.
+# Strategy: fire a "warmup turn" using the agent's own LLM plugin instance,
+# but DON'T go through the framework's speech scheduler. We build a
+# ChatContext manually with [system, assistant greeting, user "blizzard frog"]
+# -- the exact prefix the real first turn will send before the caller's
+# message -- and call session.llm.chat() directly. The "Hello" response
+# is drained from the stream and discarded; no TTS, no audio, no
+# transition into agent "speaking" state.
 #
-# The "blizzard frog" sentinel is matched by an [Internal Warmup Signal]
-# rule in the system prompt, which instructs the LLM to respond with just
-# the single word "Hello". That response goes through Kokoro's TTS pipeline
-# and lands at a hardcoded silent short-circuit in kokoro_tts.py (text
-# normalizes to "hello" -> emit 50 ms of silence). The caller hears nothing.
+# Why not session.generate_reply: tried that 5/29 and it dropped the
+# caller's first input. The framework's speech scheduler queued the
+# warmup as a SpeechHandle with allow_interruptions=False; when the
+# caller spoke during the warmup processing window (1-2 s after the
+# greeting ended), the agent was in thinking/speaking state and the
+# framework discarded the caller's audio entirely -- no user transcript
+# was ever produced. Direct llm.chat() doesn't touch the speech state
+# machine, so the caller can speak at any time and STT processes
+# normally.
 #
-# Sequencing: the framework's speech scheduler serializes speech handles,
-# so generate_reply queued after `await session.say(greeting)` runs once
-# the greeting handle completes. In practice that lands in the natural
-# 1-2 s pause callers take after the greeting; if the caller speaks
-# immediately at greeting end, their turn queues behind the warmup
-# (worst-case ~1 s extra TTFT on turn 2).
+# Cache prefix match: pre-constructing the chat_ctx with the greeting
+# message means Anthropic's auto-message-cache (within 5-min TTL) hits
+# the assistant greeting on real turn 2 too, getting us cache_hit_ratio
+# ~0.999. Without the greeting in the warmup chat_ctx, we'd get ~0.983
+# (tools + system only, missing the greeting message prefix).
 #
-# Cost: the warmup is a cache WRITE (~$0.11 on a 30K-token system prompt)
-# -- but the real first turn would have done that write anyway, so the
-# net difference is ~$0.009 per call (one extra cache READ turn's worth
-# of input pricing).
+# Concurrency: kicked off as an asyncio.Task from on_enter BEFORE the
+# greeting starts playing, so warmup LLM runs in parallel with the
+# ~4-second greeting playback. By the time the caller responds, cache
+# is hot.
 #
+# Cost: ~$0.009 per call (one extra cache-READ turn's worth of input
+# pricing -- the cache WRITE would've happened on real turn 1 anyway).
+# Trade: ~1.5 s shaved off first-turn dead air every call.
+
+_WARMUP_TIMEOUT_SECONDS = 12.0
+
 # Sentinel user message paired with the prompt rule in
 # AI_Prompts/Lighthouse_AI_system_prompt.txt under [Internal Warmup
 # Signal]. Must match the prompt rule exactly (case-insensitive there,
@@ -558,6 +568,98 @@ async def _call_backend_tool(
 # both. The string also needs to stay distinct from any plausible real
 # caller utterance.
 _WARMUP_SENTINEL = "blizzard frog"
+
+
+async def _warm_llm_via_session(agent: "IrisAgent", greeting_text: str) -> None:
+    """Populate Anthropic's prompt cache via a direct, scheduler-bypassing
+    LLM call.
+
+    Constructs a chat_ctx matching the prefix the real first turn will
+    send -- [system, assistant greeting, user "blizzard frog"] -- and
+    calls session.llm.chat() directly. The "Hello" response is drained
+    and discarded; no TTS, no audio output, no agent state transition.
+
+    Critical: this MUST NOT go through session.generate_reply or any
+    other path that puts the agent into "speaking" state -- doing so
+    causes the framework to discard caller audio during the warmup
+    window. See the comment block above _WARMUP_TIMEOUT_SECONDS for
+    the full incident analysis.
+
+    Failures are swallowed -- the real call still works, just paying
+    the cold cache-write cost on first turn instead of warmup time.
+    """
+    started = datetime.now()
+    try:
+        # Local import: livekit.agents.llm exposes ChatContext + ChatMessage
+        # for building turns programmatically. Imported here (not at module
+        # top) so any import problem only affects warmup, not call startup.
+        from livekit.agents.llm import ChatContext, ChatMessage  # noqa: PLC0415
+
+        session = agent.session
+        if session is None or session.llm is None:
+            log.warning("LLM warmup: no session.llm available; skipping")
+            return
+
+        # Pre-construct the chat_ctx so it includes the greeting message.
+        # The real session.say(greeting) hasn't completed yet (it's playing
+        # concurrently), so agent.chat_ctx still lacks the greeting -- but
+        # by the time the caller's first real turn fires, agent.chat_ctx
+        # WILL contain the greeting. Including it here in the warmup write
+        # makes Anthropic's auto-message-cache hit on turn 2 (greeting
+        # bytes match), pushing cache_hit_ratio from ~0.983 to ~0.999.
+        chat_ctx = ChatContext()
+        chat_ctx.items.append(ChatMessage(role="system", content=[agent._system_prompt]))
+        chat_ctx.items.append(ChatMessage(role="assistant", content=[greeting_text]))
+        chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
+
+        # Tools must be passed explicitly because llm.chat() is a bare call
+        # -- the framework's normal turn machinery (which auto-registers
+        # @function_tool methods) isn't involved. Without tools, the cache
+        # prefix we write is [system] but the real call's prefix is
+        # [tools + system] -- different keys, no cache hit on turn 1.
+        tools = None
+        try:
+            from livekit.agents import find_function_tools  # noqa: PLC0415
+            tools = find_function_tools(agent)
+        except (ImportError, AttributeError, TypeError) as e:
+            log.warning("Warmup: find_function_tools import/call failed: %s", e)
+        if not tools:
+            for attr in ("tools", "_tools", "function_tools"):
+                v = getattr(agent, attr, None)
+                if v:
+                    tools = v
+                    break
+        if not tools:
+            find_fn = getattr(agent, "find_function_tools", None)
+            if callable(find_fn):
+                try:
+                    tools = find_fn()
+                except Exception as e:
+                    log.warning("Warmup: agent.find_function_tools() raised: %s", e)
+        log.info(
+            "Warmup tools discovery: count=%s",
+            len(tools) if tools else 0,
+        )
+
+        # Fire LLM and drain. The async-for iterates over chunks; we don't
+        # care about the content (the response is just "Hello"). Wrapping
+        # in wait_for so a hung call doesn't outlive the warmup window.
+        async def _drain() -> None:
+            stream = session.llm.chat(chat_ctx=chat_ctx, tools=tools)
+            async for _chunk in stream:
+                pass
+
+        await asyncio.wait_for(_drain(), timeout=_WARMUP_TIMEOUT_SECONDS)
+
+        elapsed = (datetime.now() - started).total_seconds()
+        log.info(
+            "LLM warmup via direct llm.chat done in %.2fs (tools=%s)",
+            elapsed, "yes" if tools else "no",
+        )
+    except asyncio.TimeoutError:
+        log.warning("LLM warmup timed out after %.1fs", _WARMUP_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 -- warmup must never crash the call
+        log.exception("LLM warmup via session failed (continuing with cold cache)")
 
 
 # =============================================================================
@@ -629,6 +731,25 @@ class IrisAgent(Agent):
         )
 
     async def on_enter(self) -> None:
+        # Fire the LLM prompt-cache warmup AS EARLY AS POSSIBLE -- before
+        # the 300 ms SIP-bridge settle sleep below, before anything else
+        # in on_enter. The warmup produces no audio (we drain the LLM
+        # stream and discard), so it has no dependency on the SIP audio
+        # bridge being ready. Resolving voice/persona/first_message takes
+        # a fraction of a millisecond.
+        #
+        # We skip in silent mode (the immediate-transfer DID path doesn't
+        # use the LLM at all -- it bridges straight to the front desk).
+        # The persona name is needed both here (warmup chat_ctx greeting)
+        # and below (session.say greeting), so compute it once up front.
+        if not self._silent:
+            voice = self.session.tts._opts.voice
+            persona = _persona_for(voice)
+            first_message_for_warmup = _first_message_for(persona)
+            asyncio.create_task(
+                _warm_llm_via_session(self, first_message_for_warmup)
+            )
+
         # Brief wait for the SIP audio bridge to settle. Without it the
         # first audio plays into a void on some carriers.
         await asyncio.sleep(0.3)
@@ -756,36 +877,14 @@ class IrisAgent(Agent):
         persona = _persona_for(voice)
         first_message = _first_message_for(persona)
         log.info("Agent on_enter: speaking first message (voice=%s, persona=%s)", voice, persona)
+        # The Anthropic prompt-cache warmup was kicked off at the very
+        # top of on_enter (before the 300 ms SIP-bridge settle sleep), so
+        # by the time we get here it's been running for ~300 ms already
+        # and will complete during the greeting playback below.
         # allow_interruptions=False so the greeting plays even if the
-        # caller speaks first. Awaited so the greeting handle completes
-        # (audio finished + message appended to chat_ctx) BEFORE we queue
-        # the warmup -- the warmup's cache prefix needs to include the
-        # greeting assistant message for the prefix to match what the
-        # real first turn will send.
+        # caller speaks first. The greeting is TTS-only (cache hit) --
+        # no LLM is involved in producing this audio.
         await self.session.say(first_message, allow_interruptions=False)
-
-        # Kick off Anthropic prompt-cache warmup via the framework's
-        # user-input pipeline. session.generate_reply with user_input=
-        # "blizzard frog" goes through the SAME code path as a real
-        # STT-triggered turn -- the cache prefix written here matches
-        # byte-for-byte what the real first turn will send.
-        #
-        # The LLM responds with bare "Hello" (per the [Internal Warmup
-        # Signal] rule in the system prompt); Kokoro short-circuits that
-        # exact text to ~50ms of silence (see kokoro_tts.py
-        # _KokoroChunkedStream._run), so the caller hears nothing.
-        #
-        # We do NOT await the speech handle here. Letting on_enter return
-        # lets the framework move to its normal listening state; the
-        # warmup runs in the background (~1.5-2s for LLM + silent TTS).
-        # If the caller speaks before warmup finishes, their turn queues
-        # behind it -- worst case ~1s extra TTFT on turn 2, average case
-        # zero impact because callers typically pause after the greeting.
-        self.session.generate_reply(
-            user_input=_WARMUP_SENTINEL,
-            allow_interruptions=False,
-        )
-        log.info("LLM warmup queued via generate_reply(%r)", _WARMUP_SENTINEL)
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         """Two responsibilities, in priority order:
