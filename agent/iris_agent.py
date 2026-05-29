@@ -609,14 +609,11 @@ async def _warm_llm_via_session(agent: "IrisAgent") -> None:
         except (AttributeError, TypeError):
             log.warning("LLM warmup: couldn't set chat_ctx.instructions; cache may miss")
 
-        # Append the sentinel user message. ChatMessage constructor in the
-        # 1.x series typically takes role + content. If content needs to
-        # be a list-of-blocks, the plugin will handle the conversion.
-        try:
-            chat_ctx.items.append(ChatMessage(role="user", content=_WARMUP_SENTINEL))
-        except TypeError:
-            # Some versions want content as a list
-            chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
+        # Append the sentinel user message. ChatMessage.content in the
+        # 1.x series is typed as list[ChatContent] (pydantic-validated)
+        # so a bare string raises ValidationError. The list-of-strings
+        # form is accepted as a shorthand for a single text block.
+        chat_ctx.items.append(ChatMessage(role="user", content=[_WARMUP_SENTINEL]))
 
         # Fire the LLM call through the session's plugin instance.
         # Tools come from the agent automatically when the framework
