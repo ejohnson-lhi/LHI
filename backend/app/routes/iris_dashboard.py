@@ -207,7 +207,15 @@ async def api_get_call(
         "items": detail.items,
         "tts_cache_stats": detail.tts_cache_stats,
         "prewarm_stats": detail.prewarm_stats,
-        "track_count": len(detail.track_files),
+        "tracks": [
+            {
+                "track_id": t.track_id,
+                "identity": t.identity,
+                "role": t.role,
+                "label": t.label,
+            }
+            for t in detail.tracks
+        ],
         "has_merged_audio": detail.merged_audio_path is not None,
         "categories": categories,
         "cost": cost,
@@ -248,29 +256,30 @@ async def api_get_merged_audio(
     call_id: Annotated[str, PathParam()],
     swap: int = 0,
 ) -> Response:
-    """Serve the stereo-merged OGG (caller=L, Iris=R; or swapped).
+    """Serve the role-aware stereo-merged OGG.
 
-    On first request we run ffmpeg to produce the merged file; subsequent
-    requests serve it from disk. If ffmpeg isn't available or the merge
-    fails, returns 500 (the frontend falls back to per-track playback).
+    Channel assignment:
+      - LEFT: tracks tagged "caller"
+      - RIGHT: tracks tagged "iris" + "answerer" mixed (these never
+        overlap in time in our call flow, so the right channel plays
+        the AI during the agent portion and the human during transfer)
+      - swap=1 flips LEFT <-> RIGHT
+
+    Returns 500 if the merge fails. The frontend falls back to
+    per-track playback in that case (each track listed with its label).
     """
     call_id = _validate_call_id(call_id)
     detail = call_index.get_call(call_id)
-    if detail is None or not detail.track_files:
+    if detail is None or not detail.tracks:
         raise HTTPException(status_code=404, detail="call has no audio")
 
-    if len(detail.track_files) != 2:
-        # We only know how to merge exactly 2 tracks. With 1 or 3+,
-        # the frontend should fall back to individual tracks.
-        raise HTTPException(
-            status_code=409,
-            detail=f"need exactly 2 tracks to merge, got {len(detail.track_files)}",
-        )
-
     out_path = call_index.merged_audio_path(call_id)
-    sources = [Path(p) for p in detail.track_files]
+    track_dicts = [
+        {"path": t.path, "role": t.role, "track_id": t.track_id}
+        for t in detail.tracks
+    ]
     ok = await audio_merge.merge_to_stereo(
-        sources, out_path, swap_channels=bool(swap), force=bool(swap),
+        track_dicts, out_path, swap_channels=bool(swap), force=bool(swap),
     )
     if not ok:
         raise HTTPException(status_code=500, detail="audio merge failed")
@@ -284,15 +293,16 @@ async def api_get_track(
     call_id: Annotated[str, PathParam()],
     idx: int,
 ) -> Response:
-    """Serve an individual per-participant OGG by index (0 or 1).
+    """Serve an individual per-participant OGG by index.
 
-    Used as a fallback when the stereo merge fails or when the caller
-    wants to hear one side in isolation.
+    Used as a fallback when the stereo merge fails or when the user
+    wants to hear one party in isolation. Index corresponds to the
+    `tracks` array in the call detail response.
     """
     call_id = _validate_call_id(call_id)
     detail = call_index.get_call(call_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="call not found")
-    if not (0 <= idx < len(detail.track_files)):
+    if not (0 <= idx < len(detail.tracks)):
         raise HTTPException(status_code=404, detail="track not found")
-    return FileResponse(detail.track_files[idx], media_type="audio/ogg")
+    return FileResponse(detail.tracks[idx].path, media_type="audio/ogg")

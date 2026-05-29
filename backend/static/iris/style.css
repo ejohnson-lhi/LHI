@@ -180,6 +180,15 @@ td.time { white-space: nowrap; color: #555; }
   font-size: 0.9em;
 }
 
+.per-track {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.track-row { display: flex; flex-direction: column; gap: 4px; }
+.track-label { font-size: 0.9em; }
+.track-identity { font-size: 0.85em; }
+
 /* Cost breakdown */
 .cost-table {
   width: 100%;

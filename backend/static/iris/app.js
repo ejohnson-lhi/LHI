@@ -234,17 +234,21 @@
     );
   }
 
-  function renderAudioCard(callId, trackCount) {
-    if (trackCount === 0) {
+  function renderAudioCard(callId, tracks) {
+    if (!tracks || tracks.length === 0) {
       return el("div", { class: "card" },
         el("h2", null, "Audio"),
         el("p", { class: "muted" }, "No recordings for this call."),
       );
     }
-    // Try merged stereo first; fall back to per-track if it fails.
+    // Track summary line: e.g. "Caller, Iris, Front Desk (3 tracks)"
+    const labels = tracks.map(t => t.label).join(", ");
+    const haveRoles = tracks.some(t => t.role !== "unknown");
+
+    // Try merged stereo first; the per-track players below it always
+    // get shown too so the user can isolate one side if they want.
     const audio = el("audio", { controls: true, preload: "metadata" });
     const swapBtn = el("button", { class: "secondary" }, "Swap L/R");
-    const fallback = el("div");
     const errEl = el("div", { class: "audio-error", style: "display:none" });
 
     let swap = 0;
@@ -253,27 +257,8 @@
     }
 
     audio.addEventListener("error", () => {
-      if (trackCount === 2) {
-        errEl.textContent = "Merged audio failed; playing tracks separately.";
-        errEl.style.display = "";
-      }
-      // Per-track fallback
-      fallback.innerHTML = "";
-      for (let i = 0; i < trackCount; i++) {
-        const trackLabel = trackCount === 2
-          ? (i === 0 ? "Track A" : "Track B")
-          : `Track ${i + 1}`;
-        const t = el("audio", {
-          controls: true,
-          preload: "metadata",
-          src: `/iris/api/calls/${encodeURIComponent(callId)}/track/${i}.ogg`,
-        });
-        fallback.appendChild(el("div", null,
-          el("strong", null, trackLabel),
-          el("br"),
-          t,
-        ));
-      }
+      errEl.textContent = "Merged audio failed; use the per-track players below.";
+      errEl.style.display = "";
     });
 
     swapBtn.addEventListener("click", () => {
@@ -283,15 +268,42 @@
 
     loadMerged();
 
+    // Per-track players (always rendered, with proper labels)
+    const perTrack = el("div", { class: "per-track" });
+    tracks.forEach((t, i) => {
+      const audioEl = el("audio", {
+        controls: true,
+        preload: "metadata",
+        src: `/iris/api/calls/${encodeURIComponent(callId)}/track/${i}.ogg`,
+        style: "width: 100%;",
+      });
+      perTrack.appendChild(el("div", { class: "track-row" },
+        el("div", { class: "track-label" },
+          el("strong", null, t.label),
+          t.role !== "unknown"
+            ? el("span", { class: "muted track-identity" }, ` (${t.role}${t.identity ? ", " + t.identity : ""})`)
+            : (t.identity ? el("span", { class: "muted track-identity" }, ` (${t.identity})`) : null),
+        ),
+        audioEl,
+      ));
+    });
+
+    const channelHint = haveRoles
+      ? "Caller=Left, AI+Answerer=Right."
+      : "Channel mapping is a guess (old recording format).";
+
     return el("div", { class: "card" },
-      el("h2", null, "Audio"),
+      el("h2", null, `Audio · ${labels}`),
       el("div", { class: "audio-controls" },
+        el("div", null,
+          el("strong", null, "Merged stereo "),
+          el("span", { class: "muted" }, channelHint),
+          " ", swapBtn,
+        ),
         audio,
-        trackCount === 2 ? el("div", { class: "audio-swap" },
-          "Caller=Left, Iris=Right (guess).", swapBtn,
-        ) : null,
         errEl,
-        fallback,
+        el("div", { class: "muted", style: "margin-top:12px;" }, "Individual tracks:"),
+        perTrack,
       ),
     );
   }
@@ -383,7 +395,7 @@
 
       const left = el("div", null,
         renderSummaryCard(callId, currentSummary, onRegen, regenInFlight),
-        renderAudioCard(callId, data.track_count),
+        renderAudioCard(callId, data.tracks || []),
         el("div", { class: "card" },
           el("h2", null, "Transcript"),
           renderTranscript(data.items || []),

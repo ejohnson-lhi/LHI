@@ -47,14 +47,99 @@ _TRANSCRIPT_RE = re.compile(
     r"^transcript_(?P<ts>\d{8}_\d{6})_(?P<phone>\d+)\.json$"
 )
 
-# OGG filenames look like:
-#   iris-call-_+15419973221_NRfjPAm6ksFs-TR_AMsSSGfVtkJZB5-2026-05-29T184450.ogg
-# We need the call_id prefix (everything before the first "-TR_") so we
-# can glob all tracks for one call.
-_OGG_RE = re.compile(
-    r"^(?P<call_id>iris-call-[^-]+(?:_[^-]+)*?)-TR_(?P<track>[A-Za-z0-9]+)"
+# OGG filenames come in two flavors, depending on when the call was recorded:
+#
+#   Old (pre-dispatch-rule-update on 2026-05-29):
+#     iris-call-_+15419973221_NRfjPAm6ksFs-TR_AMsSSGfVtkJZB5-2026-05-29T184450.ogg
+#     Pattern: {room_name}-TR_{track_id}-{time}.ogg
+#     No publisher_identity. We label these tracks "Track A", "Track B" --
+#     no automatic role guess.
+#
+#   New (post-dispatch-rule-update):
+#     iris-call-_+15419973221_NRfjPAm6ksFs-agent-AB12-TR_AMsSSGfVtkJZB5-2026-05-29T184450.ogg
+#     Pattern: {room_name}-{publisher_identity}-TR_{track_id}-{time}.ogg
+#     publisher_identity tells us caller vs iris vs answerer (see
+#     identity_to_role below).
+#
+# The new format is matched first; if that fails we fall back to the
+# old format. Either way we end up with track_id + optional identity.
+_OGG_NEW_RE = re.compile(
+    r"^(?P<call_id>iris-call-.+?)-(?P<identity>[^-]+(?:-[^-]+)*?)-TR_(?P<track>[A-Za-z0-9]+)"
     r"-(?P<ts>\d{4}-\d{2}-\d{2}T\d{6})\.ogg$"
 )
+_OGG_OLD_RE = re.compile(
+    r"^(?P<call_id>iris-call-.+?)-TR_(?P<track>[A-Za-z0-9]+)"
+    r"-(?P<ts>\d{4}-\d{2}-\d{2}T\d{6})\.ogg$"
+)
+
+
+def _parse_ogg_name(filename: str, expected_call_id: str) -> dict | None:
+    """Parse an OGG filename, returning {track_id, identity, ts} or None.
+
+    Tries the new format first (with publisher_identity), then the old.
+    Returns None if neither matches OR if the parsed call_id doesn't
+    match the expected one (so we don't accidentally pull adjacent
+    calls' files in).
+    """
+    m = _OGG_NEW_RE.match(filename)
+    if m and m.group("call_id") == expected_call_id:
+        return {
+            "track_id": m.group("track"),
+            "identity": m.group("identity"),
+            "ts": m.group("ts"),
+        }
+    m = _OGG_OLD_RE.match(filename)
+    if m and m.group("call_id") == expected_call_id:
+        return {
+            "track_id": m.group("track"),
+            "identity": None,
+            "ts": m.group("ts"),
+        }
+    return None
+
+
+def identity_to_role(identity: str | None) -> tuple[str, str]:
+    """Map a LiveKit publisher_identity to (role, display_label).
+
+    Roles are stable enum-ish strings the frontend can switch on:
+      "caller"    Inbound PSTN caller via Twilio/SIP
+      "iris"      The AI agent (LiveKit Agents worker)
+      "answerer"  Outbound SIP participant joined via transfer_to
+      "unknown"   Identity didn't match any known pattern
+
+    The labels are user-facing display strings, fine to change without
+    breaking anything.
+
+    Identity prefix conventions (set by our code or LiveKit):
+      transfer-front_desk        -> front-desk transfer destination
+      transfer-front_desk_port2  -> production port-2 front desk (Port 2)
+      transfer-eric              -> Eric's cell
+      agent-*                    -> Iris (LiveKit Agents auto-assigns
+                                   "agent-{uuid}" by default)
+      sip_*                      -> SIP-side caller (LiveKit-SIP convention
+                                   for inbound participants)
+      iris*                      -> Iris if we ever explicitly set it
+
+    Anything else is "unknown" -- the dashboard will still surface it,
+    just without a role tag.
+    """
+    if not identity:
+        return ("unknown", "Unknown")
+    low = identity.lower()
+    if low.startswith("transfer-"):
+        if "eric" in low:
+            return ("answerer", "Eric")
+        if "port2" in low:
+            return ("answerer", "Front Desk (prod)")
+        return ("answerer", "Front Desk")
+    if low.startswith("agent") or low.startswith("iris"):
+        return ("iris", "Iris")
+    if low.startswith("sip"):
+        return ("caller", "Caller")
+    # Bare phone number (some SIP setups use the caller phone as identity)
+    if low.lstrip("+").isdigit():
+        return ("caller", "Caller")
+    return ("unknown", identity)
 
 
 @dataclass
@@ -68,6 +153,16 @@ class CallListEntry:
     item_count: int
     has_summary: bool
     has_merged_audio: bool
+
+
+@dataclass
+class Track:
+    """One per-participant audio track recorded for a call."""
+    path: str
+    track_id: str
+    identity: str | None  # None for old (pre-2026-05-29) recordings
+    role: str             # "caller" | "iris" | "answerer" | "unknown"
+    label: str            # Display label, e.g. "Caller" / "Iris" / "Front Desk"
 
 
 @dataclass
@@ -85,7 +180,7 @@ class CallDetail:
     items: list[dict]
     tts_cache_stats: dict | None
     prewarm_stats: dict | None
-    track_files: list[str] = field(default_factory=list)
+    tracks: list[Track] = field(default_factory=list)
     merged_audio_path: str | None = None
     summary_path: str | None = None
     summary: dict | None = None
@@ -113,25 +208,37 @@ def _call_id_from_transcript(transcript: dict) -> str | None:
     return None
 
 
-def _find_track_oggs(rec_dir: Path, call_id: str) -> list[Path]:
-    """Return all OGG files for a call, sorted by track_id for stability.
+def _find_tracks(rec_dir: Path, call_id: str) -> list[Track]:
+    """Return all per-participant tracks for a call, with parsed identity/role.
 
-    Sorting by track_id is just to give a deterministic order in the UI.
-    Which track is caller vs agent isn't encoded in the filename — the
-    audio_merge module decides L/R based on a heuristic (or the user
-    picks via a swap button in v2).
+    Iterates the recordings dir once. For each OGG that belongs to this
+    call (either format), we parse the filename for track_id + identity
+    and derive a role. Tracks are sorted by role priority so the UI
+    displays caller first, then iris, then answerer (with unknowns
+    last) -- regardless of filesystem order.
     """
-    matches: list[tuple[str, Path]] = []
-    prefix = f"{call_id}-TR_"
+    role_order = {"caller": 0, "iris": 1, "answerer": 2, "unknown": 3}
+    found: list[Track] = []
+    # Prefilter by prefix so we don't parse every OGG in the directory.
+    prefix = f"{call_id}-"
     for entry in rec_dir.iterdir():
         if not entry.name.startswith(prefix) or not entry.name.endswith(".ogg"):
             continue
-        m = _OGG_RE.match(entry.name)
-        if not m:
+        # Skip our own merged-output file -- it starts with "merged_" not the call_id.
+        # (Defensive; the prefix check above already filters it out.)
+        parsed = _parse_ogg_name(entry.name, call_id)
+        if parsed is None:
             continue
-        matches.append((m.group("track"), entry))
-    matches.sort(key=lambda x: x[0])
-    return [p for _, p in matches]
+        role, label = identity_to_role(parsed["identity"])
+        found.append(Track(
+            path=str(entry),
+            track_id=parsed["track_id"],
+            identity=parsed["identity"],
+            role=role,
+            label=label,
+        ))
+    found.sort(key=lambda t: (role_order.get(t.role, 9), t.track_id))
+    return found
 
 
 def _summary_sidecar_path(rec_dir: Path, call_id: str) -> Path:
@@ -233,7 +340,7 @@ def get_call(call_id: str) -> CallDetail | None:
     if transcript is None or transcript_path is None:
         return None
 
-    track_files = [str(p) for p in _find_track_oggs(rec_dir, call_id)]
+    tracks = _find_tracks(rec_dir, call_id)
     merged_path = _merged_audio_path(rec_dir, call_id)
     summary_path = _summary_sidecar_path(rec_dir, call_id)
 
@@ -250,7 +357,7 @@ def get_call(call_id: str) -> CallDetail | None:
         items=transcript.get("items") or [],
         tts_cache_stats=transcript.get("tts_cache_stats"),
         prewarm_stats=transcript.get("prewarm_stats"),
-        track_files=track_files,
+        tracks=tracks,
         merged_audio_path=str(merged_path) if merged_path.exists() else None,
         summary_path=str(summary_path) if summary_path.exists() else None,
         summary=_load_summary(rec_dir, call_id),
