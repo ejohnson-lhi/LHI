@@ -64,6 +64,7 @@ from audio_cache import TTSAudioCache
 from intent_cache import DEFAULT_CACHE as INTENT_CACHE, IntentCallState
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
+import aec  # WebRTC AEC wiring to suppress self-echo of Iris's TTS
 
 load_dotenv()
 log = logging.getLogger("iris")
@@ -731,25 +732,6 @@ class IrisAgent(Agent):
         )
 
     async def on_enter(self) -> None:
-        # Fire the LLM prompt-cache warmup AS EARLY AS POSSIBLE -- before
-        # the 300 ms SIP-bridge settle sleep below, before anything else
-        # in on_enter. The warmup produces no audio (we drain the LLM
-        # stream and discard), so it has no dependency on the SIP audio
-        # bridge being ready. Resolving voice/persona/first_message takes
-        # a fraction of a millisecond.
-        #
-        # We skip in silent mode (the immediate-transfer DID path doesn't
-        # use the LLM at all -- it bridges straight to the front desk).
-        # The persona name is needed both here (warmup chat_ctx greeting)
-        # and below (session.say greeting), so compute it once up front.
-        if not self._silent:
-            voice = self.session.tts._opts.voice
-            persona = _persona_for(voice)
-            first_message_for_warmup = _first_message_for(persona)
-            asyncio.create_task(
-                _warm_llm_via_session(self, first_message_for_warmup)
-            )
-
         # Brief wait for the SIP audio bridge to settle. Without it the
         # first audio plays into a void on some carriers.
         await asyncio.sleep(0.3)
@@ -870,6 +852,24 @@ class IrisAgent(Agent):
         # synthesized one was layering on top. RINGBACK_CACHE_KEY and
         # _generate_ringback_pcm are still defined upstream as dead code
         # in case the silent-connect gap returns.)
+
+        # Enable WebRTC AEC on the input/output audio path BEFORE the
+        # greeting plays so the greeting's outgoing frames are captured
+        # into APM's reverse stream from frame zero. Without this, two
+        # pathologies were biting us on real calls:
+        #   - VAD false-positives on Iris's own echo, causing mid-word
+        #     burble (transcript 19:08 around "Just to confirm...")
+        #   - STT phantom user turns from Iris's echoed voice, causing
+        #     duplicate closings (transcript 17:36, "Is there anything
+        #     else I can help you with today?" said twice)
+        # Both vanish if VAD/STT never sees Iris's voice. AEC is the fix.
+        # See agent/aec.py for wiring details. Failures are swallowed --
+        # call continues without AEC if anything goes wrong.
+        try:
+            aec.enable_aec(self.session)
+        except Exception:
+            log.exception("AEC: enable_aec raised; continuing without AEC")
+
         # Greeting uses the persona name for the current voice. Cache key
         # is voice-aware so this is also a cache hit (pre-rendered in
         # prewarm or entrypoint when voice changed).
@@ -877,10 +877,17 @@ class IrisAgent(Agent):
         persona = _persona_for(voice)
         first_message = _first_message_for(persona)
         log.info("Agent on_enter: speaking first message (voice=%s, persona=%s)", voice, persona)
-        # The Anthropic prompt-cache warmup was kicked off at the very
-        # top of on_enter (before the 300 ms SIP-bridge settle sleep), so
-        # by the time we get here it's been running for ~300 ms already
-        # and will complete during the greeting playback below.
+        # Kick off Anthropic prompt-cache warmup CONCURRENTLY with the
+        # greeting. The warmup runs as a background asyncio.Task using a
+        # direct session.llm.chat() call -- it doesn't go through the
+        # framework's speech scheduler, so it never puts the agent into
+        # "speaking" state. That means the caller's microphone audio is
+        # NOT discarded if they speak during the warmup window (which
+        # was the breakage we hit when this used session.generate_reply).
+        # The warmup's chat_ctx includes the greeting message so the
+        # cache prefix bytes match what the real first turn will send,
+        # pushing cache_hit_ratio to ~0.999 on turn 2.
+        asyncio.create_task(_warm_llm_via_session(self, first_message))
         # allow_interruptions=False so the greeting plays even if the
         # caller speaks first. The greeting is TTS-only (cache hit) --
         # no LLM is involved in producing this audio.
