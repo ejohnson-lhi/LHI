@@ -118,13 +118,24 @@
       return;
     }
 
+    const legend = el("div", { class: "list-legend muted" },
+      el("span", null,
+        el("span", { class: "has-flag summary" }), " summary cached  ",
+        el("span", { class: "has-flag audio" }), " merged audio ready  ",
+        el("span", { class: "has-flag off" }), " not yet generated",
+      ),
+    );
+    root.appendChild(legend);
+
     const table = el("table", { class: "calls" },
       el("thead", null,
         el("tr", null,
           el("th", null, "Started"),
           el("th", null, "Caller"),
           el("th", { class: "duration" }, "Duration"),
-          el("th", { class: "items" }, "Turns"),
+          el("th", null, "Outcome"),
+          el("th", null, "Summary"),
+          el("th", { class: "cost" }, "Cost"),
           el("th", null, "Flags"),
         )
       ),
@@ -134,15 +145,29 @@
             el("td", { class: "time" }, fmtTime(c.started_at)),
             el("td", { class: "phone" }, fmtPhone(c.caller_phone)),
             el("td", { class: "duration" }, fmtDuration(c.duration_seconds)),
-            el("td", { class: "items" }, c.item_count),
+            el("td", null,
+              c.outcome
+                ? el("span", { class: tagClass(c.outcome) }, c.outcome)
+                : el("span", { class: "muted" }, "—"),
+            ),
+            el("td", { class: "summary-cell" },
+              c.summary_short
+                ? c.summary_short
+                : el("span", { class: "muted" }, c.has_summary ? "—" : "(rule-based)"),
+            ),
+            el("td", { class: "cost" },
+              c.cost_total_usd && c.cost_total_usd > 0
+                ? fmtMoney(c.cost_total_usd)
+                : el("span", { class: "muted" }, "—"),
+            ),
             el("td", null,
               el("span", {
                 class: "has-flag " + (c.has_summary ? "summary" : "off"),
-                title: c.has_summary ? "Summary cached" : "No summary yet",
+                title: c.has_summary ? "Summary cached" : "No summary yet (rule-based outcome only)",
               }),
               el("span", {
                 class: "has-flag " + (c.has_merged_audio ? "audio" : "off"),
-                title: c.has_merged_audio ? "Merged audio ready" : "Audio not merged yet",
+                title: c.has_merged_audio ? "Merged stereo OGG ready" : "Audio not merged yet",
               }),
             ),
           )
@@ -450,9 +475,103 @@
     }
   }
 
+  // ----- password change ------------------------------------------
+
+  async function openPasswordModal() {
+    const modal = $("#password-modal");
+    const title = $("#password-modal-title");
+    const msg = $("#password-message");
+
+    // Reset fields each time so a previous attempt's values don't linger.
+    $("#current-password").value = "";
+    $("#new-password").value = "";
+    $("#confirm-password").value = "";
+    msg.textContent = "";
+    msg.className = "modal-message";
+
+    // Fetch auth status to set the title (set vs change) and the min length.
+    try {
+      const status = await fetchJSON("/iris/api/auth/status");
+      title.textContent = status.custom_password_set
+        ? "Change password"
+        : "Set custom password";
+      $("#min-pw-len").textContent = status.min_password_length;
+    } catch (err) {
+      // If we can't reach the status endpoint (e.g. logged out), don't
+      // open the modal at all -- something else is wrong.
+      alert("Could not load auth status: " + err.message);
+      return;
+    }
+
+    modal.style.display = "";
+    $("#current-password").focus();
+  }
+
+  function closePasswordModal() {
+    $("#password-modal").style.display = "none";
+  }
+
+  async function submitPasswordChange(ev) {
+    ev.preventDefault();
+    const msg = $("#password-message");
+    const submitBtn = $("#password-submit");
+    const current = $("#current-password").value;
+    const next = $("#new-password").value;
+    const confirm = $("#confirm-password").value;
+
+    if (next !== confirm) {
+      msg.textContent = "New password and confirmation don't match.";
+      msg.className = "modal-message error";
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Updating…";
+    msg.textContent = "";
+    msg.className = "modal-message";
+
+    try {
+      const resp = await fetch("/iris/api/auth/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_password: current,
+          new_password: next,
+          confirm_password: confirm,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data.detail || `${resp.status} ${resp.statusText}`;
+        msg.textContent = "Failed: " + detail;
+        msg.className = "modal-message error";
+      } else {
+        msg.textContent = data.message || "Password updated.";
+        msg.className = "modal-message success";
+        // Don't auto-close; let the user read the "you'll be logged out"
+        // hint and decide when to reload.
+      }
+    } catch (err) {
+      msg.textContent = "Network error: " + err.message;
+      msg.className = "modal-message error";
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Update password";
+    }
+  }
+
+  // ----- wiring ----------------------------------------------------
+
   window.addEventListener("hashchange", route);
   window.addEventListener("DOMContentLoaded", () => {
     $("#refresh-btn").addEventListener("click", route);
+    $("#change-password-btn").addEventListener("click", openPasswordModal);
+    $("#password-cancel").addEventListener("click", closePasswordModal);
+    $("#password-form").addEventListener("submit", submitPasswordChange);
+    // Click outside the modal box to dismiss.
+    $("#password-modal").addEventListener("click", (e) => {
+      if (e.target.id === "password-modal") closePasswordModal();
+    });
     route();
   });
 })();

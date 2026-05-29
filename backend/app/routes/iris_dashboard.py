@@ -20,16 +20,18 @@ from __future__ import annotations
 
 import base64
 import logging
-import secrets
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path as PathParam, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from pydantic import BaseModel, Field
+
 from app.config import settings
 from app.services.iris_dashboard import (
     audio_merge,
+    auth_password,
     call_categorize,
     call_cost,
     call_index,
@@ -60,33 +62,53 @@ def _unauthorized() -> HTTPException:
     )
 
 
-async def require_iris_auth(
-    authorization: Annotated[str | None, Header()] = None,
-) -> None:
-    """HTTP Basic guard. Username is ignored; password must match
-    settings.portal_shared_secret (constant-time compare).
+def _extract_basic_password(authorization: str | None) -> str | None:
+    """Decode a 'Basic ...' header to its password component.
 
-    If portal_shared_secret is unset, every request gets 503 instead
-    of being silently exposed. This is the same posture portal.py uses
-    when its DCS guard is unconfigured.
+    Username is intentionally discarded -- the dashboard is single-user,
+    only the password matters. Returns None on any parse failure.
     """
-    if not settings.portal_shared_secret:
-        log.warning("iris-dashboard: portal_shared_secret unset; refusing request")
-        raise HTTPException(status_code=503, detail="iris dashboard not configured")
-
     if not authorization or not authorization.lower().startswith("basic "):
-        raise _unauthorized()
-
+        return None
     try:
         encoded = authorization.split(" ", 1)[1]
         decoded = base64.b64decode(encoded).decode("utf-8", errors="replace")
-        # decoded is "username:password"
         _, _, password = decoded.partition(":")
     except (ValueError, UnicodeDecodeError):
+        return None
+    return password
+
+
+async def require_iris_auth(
+    authorization: Annotated[str | None, Header()] = None,
+) -> str:
+    """HTTP Basic guard. Returns the verified password for the change
+    endpoint's reuse (so it can require "current_password" match without
+    re-parsing the header).
+
+    Resolution: tries the custom dashboard password (data/iris_dashboard_password.json)
+    first, falls back to settings.portal_shared_secret. The fallback
+    lets the dashboard work the first time someone visits, before any
+    custom password has been set.
+
+    503 if NEITHER source has a value (totally unconfigured).
+    """
+    custom_set = auth_password.is_custom_set()
+    if not custom_set and not settings.portal_shared_secret:
+        log.warning(
+            "iris-dashboard: no dashboard password set and "
+            "portal_shared_secret unset; refusing request"
+        )
+        raise HTTPException(status_code=503, detail="iris dashboard not configured")
+
+    password = _extract_basic_password(authorization)
+    if password is None:
         raise _unauthorized()
 
-    if not secrets.compare_digest(password, settings.portal_shared_secret):
+    if not auth_password.verify(password, env_fallback=settings.portal_shared_secret):
         raise _unauthorized()
+
+    return password
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +155,92 @@ async def dashboard_static(path: str) -> FileResponse:
 # JSON API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Auth status + password change
+# ---------------------------------------------------------------------------
+
+
+class ChangePasswordRequest(BaseModel):
+    """Payload for /iris/api/change-password.
+
+    current_password must match whatever the user is logged in with
+    (defense in depth -- the require_iris_auth dependency has already
+    verified them, but re-checking here means the user must explicitly
+    re-enter their password to authorize a change, vs an attacker who
+    found an open session being able to silently rotate the password).
+    """
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=auth_password.MIN_PASSWORD_LENGTH)
+    confirm_password: str = Field(min_length=auth_password.MIN_PASSWORD_LENGTH)
+
+
+@router.get("/iris/api/auth/status",
+            dependencies=[Depends(require_iris_auth)])
+async def api_auth_status() -> JSONResponse:
+    """Tells the UI whether a custom password has been set yet, so
+    the change-password form can be labeled correctly ("Set password"
+    on first run vs "Change password" once a custom one exists)."""
+    return JSONResponse({
+        "custom_password_set": auth_password.is_custom_set(),
+        "min_password_length": auth_password.MIN_PASSWORD_LENGTH,
+    })
+
+
+@router.post("/iris/api/auth/change-password")
+async def api_change_password(
+    body: ChangePasswordRequest,
+    current_authed_password: Annotated[str, Depends(require_iris_auth)],
+) -> JSONResponse:
+    """Change the dashboard password.
+
+    Defense in depth: require_iris_auth has already verified the user
+    knows the current password via the browser's Basic Auth header.
+    We ALSO verify body.current_password matches -- this catches the
+    case where the user typed something different in the form (e.g.,
+    pasted wrong text) before they update the storage.
+
+    After success, the browser still has the OLD password cached for
+    Basic Auth. The user will be prompted to re-enter on the next
+    navigation/refresh. We return that hint in the response so the
+    frontend can tell the user.
+    """
+    # The two confirm fields must match.
+    if body.new_password != body.confirm_password:
+        raise HTTPException(
+            status_code=400, detail="New password and confirmation don't match",
+        )
+    # And current_password (from the FORM) must match what the auth header had.
+    # If the user is half-way through a session, current_authed_password is
+    # the password the browser is sending; body.current_password is what
+    # they typed into the form. Mismatch usually means they fat-fingered.
+    if body.current_password != current_authed_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Current password (form) doesn't match what you're logged in with",
+        )
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=400, detail="New password must differ from current",
+        )
+
+    try:
+        auth_password.set_password(body.new_password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        log.exception("Failed to write new dashboard password")
+        raise HTTPException(status_code=500, detail="could not save password")
+
+    return JSONResponse({
+        "ok": True,
+        "message": (
+            "Password updated. Close and reopen your browser, or do a "
+            "force-refresh (Ctrl+Shift+R), and log in again with the "
+            "new password."
+        ),
+    })
+
+
 @router.get("/iris/api/calls",
             dependencies=[Depends(require_iris_auth)])
 async def api_list_calls(limit: int = 200) -> JSONResponse:
@@ -155,6 +263,10 @@ async def api_list_calls(limit: int = 200) -> JSONResponse:
                 "item_count": e.item_count,
                 "has_summary": e.has_summary,
                 "has_merged_audio": e.has_merged_audio,
+                "categories": e.categories,
+                "outcome": e.outcome,
+                "summary_short": e.summary_short,
+                "cost_total_usd": e.cost_total_usd,
             }
             for e in entries
         ]

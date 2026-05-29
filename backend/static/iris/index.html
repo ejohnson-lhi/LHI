@@ -12,12 +12,37 @@
   <div class="header-right">
     <span id="call-count" class="muted"></span>
     <button id="refresh-btn" type="button">Refresh</button>
+    <button id="change-password-btn" type="button" class="secondary">Change password</button>
   </div>
 </header>
 
 <main id="root">
   <div class="loading">Loading…</div>
 </main>
+
+<!-- Change-password modal. Hidden by default; toggled by header button. -->
+<div id="password-modal" class="modal-overlay" style="display:none">
+  <div class="modal">
+    <h2 id="password-modal-title">Change password</h2>
+    <form id="password-form">
+      <label for="current-password">Current password</label>
+      <input id="current-password" type="password" autocomplete="current-password" required>
+
+      <label for="new-password">New password (min <span id="min-pw-len">10</span> characters)</label>
+      <input id="new-password" type="password" autocomplete="new-password" required>
+
+      <label for="confirm-password">Confirm new password</label>
+      <input id="confirm-password" type="password" autocomplete="new-password" required>
+
+      <div class="modal-message" id="password-message"></div>
+
+      <div class="modal-actions">
+        <button type="button" id="password-cancel" class="secondary">Cancel</button>
+        <button type="submit" id="password-submit">Update password</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <script src="/iris/static/app.js"></script>
 </body>

@@ -90,6 +90,95 @@ table.calls td.duration, table.calls td.cost, table.calls td.items {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+table.calls th.duration, table.calls th.cost, table.calls th.items {
+  text-align: right;
+}
+table.calls td.summary-cell {
+  max-width: 420px;
+  font-size: 0.9em;
+  color: #333;
+  line-height: 1.35;
+}
+
+.list-legend {
+  margin-bottom: 12px;
+  font-size: 0.85em;
+  padding: 4px 8px;
+}
+.list-legend .has-flag { vertical-align: -2px; }
+
+/* ============================================================
+ * Change-password modal
+ * ============================================================ */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal {
+  background: #fff;
+  border-radius: 10px;
+  padding: 24px 28px;
+  width: 100%;
+  max-width: 420px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+}
+.modal h2 {
+  margin: 0 0 16px 0;
+  font-size: 1.15em;
+  font-weight: 600;
+  color: #1d1d1f;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.modal form { display: flex; flex-direction: column; gap: 6px; }
+.modal label {
+  font-size: 0.85em;
+  font-weight: 500;
+  color: #555;
+  margin-top: 6px;
+}
+.modal input[type="password"] {
+  font-size: 0.95em;
+  padding: 8px 10px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  font-family: inherit;
+}
+.modal input[type="password"]:focus {
+  outline: none;
+  border-color: #007aff;
+  box-shadow: 0 0 0 3px rgba(0,122,255,0.15);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+.modal-message {
+  font-size: 0.88em;
+  margin-top: 12px;
+  min-height: 1.2em;
+}
+.modal-message.error {
+  color: #721c24;
+  background: #f8d7da;
+  padding: 8px 10px;
+  border-radius: 5px;
+}
+.modal-message.success {
+  color: #155724;
+  background: #d4edda;
+  padding: 8px 10px;
+  border-radius: 5px;
+}
 
 td.phone { font-family: ui-monospace, SFMono-Regular, monospace; }
 td.time { white-space: nowrap; color: #555; }

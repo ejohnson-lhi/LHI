@@ -144,7 +144,19 @@ def identity_to_role(identity: str | None) -> tuple[str, str]:
 
 @dataclass
 class CallListEntry:
-    """Lightweight per-call info for the list view. Cheap to compute."""
+    """Per-call info for the list view. Fields are populated as cheaply as
+    possible -- we read each transcript once and run the deterministic
+    cost + categorize passes inline so the list shows them without an
+    extra round trip per row.
+
+    Derived fields:
+      categories: rule-based tags from call_categorize.categorize().
+      outcome: from cached summary's "outcome" field if available; falls
+               back to the most specific category tag otherwise.
+      summary_short: ~120 chars of the cached summary if available, else
+                     a one-line stub describing the call shape.
+      cost_total_usd: deterministic total from call_cost.calculate_cost.
+    """
     call_id: str
     transcript_path: str
     started_at: str  # ISO format
@@ -153,6 +165,10 @@ class CallListEntry:
     item_count: int
     has_summary: bool
     has_merged_audio: bool
+    categories: list[str] = field(default_factory=list)
+    outcome: str | None = None
+    summary_short: str | None = None
+    cost_total_usd: float = 0.0
 
 
 @dataclass
@@ -268,9 +284,17 @@ def list_calls(limit: int = 200) -> list[CallListEntry]:
 
     Reads the recordings dir, parses every transcript_*.json that matches
     the expected filename pattern, and assembles a list entry per call.
-    No LLM, no expensive computation. The `limit` is applied AFTER sorting
-    by start time so we keep the most recent ones regardless of dir order.
+    Each entry includes the deterministic cost + rule-based categories
+    so the list view can show them inline (no per-row drill-down needed).
+
+    The `limit` is applied AFTER sorting by start time so we keep the
+    most recent ones regardless of directory order.
     """
+    # Local imports break a circular dep with call_cost/call_categorize
+    # at module load time (they don't currently import call_index but
+    # let's not paint ourselves into a corner).
+    from . import call_cost, call_categorize  # noqa: PLC0415
+
     rec_dir = _recordings_dir()
     if not rec_dir.is_dir():
         log.warning("Recordings dir does not exist: %s", rec_dir)
@@ -290,10 +314,29 @@ def list_calls(limit: int = 200) -> list[CallListEntry]:
         caller_phone = transcript.get("caller_phone") or ""
         duration = float(transcript.get("duration_seconds") or 0.0)
         item_count = int(transcript.get("item_count") or 0)
-        # has_summary check is cheap (just a file exists); doing it here
-        # so the list view can render an icon without an extra round trip.
         has_summary = _summary_sidecar_path(rec_dir, call_id).exists()
         has_merged_audio = _merged_audio_path(rec_dir, call_id).exists()
+
+        # Cheap deterministic derivations -- no LLM.
+        categories = call_categorize.categorize(transcript)
+        cost = call_cost.calculate_cost(transcript)
+
+        # Outcome + summary preview: prefer the cached LLM summary's
+        # "outcome" field if it exists; otherwise fall back to the most
+        # specific category tag. summary_short is a 120-char preview
+        # of the cached summary if available, else None.
+        cached = _load_summary(rec_dir, call_id) if has_summary else None
+        outcome = None
+        summary_short = None
+        if cached is not None:
+            outcome = cached.get("outcome")
+            s = (cached.get("summary") or "").strip()
+            if s:
+                summary_short = s if len(s) <= 200 else s[:197] + "..."
+        if outcome is None and categories:
+            # First (most-specific) category as outcome fallback.
+            outcome = categories[0]
+
         entries.append(CallListEntry(
             call_id=call_id,
             transcript_path=str(entry),
@@ -303,6 +346,10 @@ def list_calls(limit: int = 200) -> list[CallListEntry]:
             item_count=item_count,
             has_summary=has_summary,
             has_merged_audio=has_merged_audio,
+            categories=categories,
+            outcome=outcome,
+            summary_short=summary_short,
+            cost_total_usd=cost.total_usd,
         ))
 
     # Sort newest first. ISO-8601 strings sort lexicographically by time,

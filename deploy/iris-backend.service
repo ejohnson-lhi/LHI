@@ -17,7 +17,12 @@ StandardError=journal
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/iris-backend/backend/data
+# /opt/iris-backend/backend/data — SQLite DB lives here.
+# /opt/iris-backend/recordings — the dashboard at /iris/ writes merged
+#   stereo OGGs (merged_{call_id}.ogg) and Claude summary sidecars
+#   (summary_{call_id}.json) into this directory alongside the agent's
+#   transcripts and per-track OGGs.
+ReadWritePaths=/opt/iris-backend/backend/data /opt/iris-backend/recordings
 PrivateTmp=true
 
 [Install]
