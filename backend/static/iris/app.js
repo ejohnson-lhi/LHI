@@ -157,7 +157,18 @@
       ),
       el("tbody", null,
         ...calls.map(c =>
-          el("tr", { onClick: () => { location.hash = `#/call/${c.call_id}`; } },
+          el("tr", {
+              onClick: () => {
+                // Open in a new tab so the list view stays open while
+                // browsing through calls. Using the full URL (not just
+                // the hash) so the new tab loads the page fresh and the
+                // router renders the detail view from scratch. noopener
+                // is the standard hardening on window.open _blank.
+                const url = new URL(location.href);
+                url.hash = `#/call/${c.call_id}`;
+                window.open(url.toString(), "_blank", "noopener");
+              },
+            },
             el("td", { class: "time" }, fmtTime(c.started_at)),
             el("td", { class: "phone" }, fmtPhone(c.caller_phone)),
             el("td", { class: "duration" }, fmtDuration(c.duration_seconds)),
