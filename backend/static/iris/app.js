@@ -48,10 +48,26 @@
     return m > 0 ? `${m}m ${s.toString().padStart(2, "0")}s` : `${s}s`;
   }
 
+  function parseAgentIso(iso) {
+    // The agent process writes call timestamps as ISO strings from
+    // datetime.now(timezone.utc).isoformat() — those carry a `+00:00`
+    // suffix and parse correctly. Older transcripts (pre 2026-06-03)
+    // used datetime.now().isoformat() with no timezone marker. The
+    // droplet runs in UTC so those naive timestamps ARE UTC, but JS's
+    // `new Date(iso)` interprets unmarked ISO strings as the browser's
+    // local time and ends up displaying them off by ~7 hours during
+    // Pacific Daylight Time. Append a "Z" suffix when no timezone
+    // marker is present so the parse is correct.
+    if (!iso) return null;
+    const trailingTz = /([Z]|[+\-]\d{2}:?\d{2})$/;
+    const hasTz = trailingTz.test(iso);
+    return new Date(hasTz ? iso : iso + "Z");
+  }
+
   function fmtTime(iso) {
     if (!iso) return "—";
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
+    const d = parseAgentIso(iso);
+    if (!d || isNaN(d.getTime())) return iso;
     // Local time, short format. Show year only if not current year.
     const now = new Date();
     const opts = d.getFullYear() === now.getFullYear()

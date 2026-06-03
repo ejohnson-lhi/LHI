@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic as anthropic_sdk  # raw SDK, used to construct a custom client
@@ -967,6 +967,24 @@ class IrisAgent(Agent):
             intent_id, chosen[:80], self._intent_state.user_turn_count,
         )
         self._intent_state.used_response_texts.add(chosen)
+
+        # Preserve the user's message in chat_ctx BEFORE we speak the
+        # cached response. Without this, the StopResponse we raise below
+        # causes the framework to discard new_message, and the question
+        # that triggered the cache hit (e.g. "Connect me to the front
+        # desk" or "What's your dog policy?") never appears in the
+        # transcript JSON's `items` list. The viewer reads only `items`,
+        # so the call looks like Iris monologued: greeting -> canned
+        # answer, with no question between them. Append BEFORE the
+        # assistant response so the order in chat_ctx is correct.
+        try:
+            turn_ctx.items.append(new_message)
+        except Exception:
+            log.exception(
+                "Could not preserve user message in chat_ctx (intent=%s)",
+                intent_id,
+            )
+
         try:
             # session.say() adds the assistant message to chat_ctx and
             # plays the audio. The text is in the TTS cache (prewarmed),
@@ -2048,7 +2066,7 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["prewarm_stats"] = {
         "status": "running",
         "total_phrases": len(prewarm_phrases),
-        "started_at": datetime.now().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
     def _bg_prerender_phrases() -> None:
@@ -2113,7 +2131,7 @@ def prewarm(proc: JobProcess) -> None:
             "total": len(prewarm_phrases),
             "openers": len(PERSISTENT_OPENERS),
             "intent_cache_chunks": len(intent_response_chunks),
-            "finished_at": datetime.now().isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
         }
     log.info(
         "Spawning background prerender of %d phrases (%d openers + %d intent-cache sentence chunks, deduped to %d, non-blocking)...",
@@ -2298,7 +2316,12 @@ async def entrypoint(ctx: JobContext) -> None:
         preemptive_generation=False,
     )
 
-    started_at = datetime.now()
+    # Timezone-aware so the transcript JSON's started_at/ended_at carry
+    # a `+00:00` suffix. Without it, the viewer's `new Date(iso)` treats
+    # the timestamp as the browser's local time and shows calls at the
+    # wrong hour (e.g., a 6:26 PM Pacific call appears as "01:26 AM" the
+    # next day because the droplet writes UTC without a marker).
+    started_at = datetime.now(timezone.utc)
 
     # Per-call event timeline. Every interesting framework event gets pushed
     # here with an elapsed-seconds timestamp from call start, then dumped to
@@ -2309,7 +2332,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     def _record(event_type: str, **fields) -> None:
         events.append({
-            "t": round((datetime.now() - started_at).total_seconds(), 3),
+            "t": round((datetime.now(timezone.utc) - started_at).total_seconds(), 3),
             "event": event_type,
             **fields,
         })
@@ -2553,8 +2576,8 @@ async def entrypoint(ctx: JobContext) -> None:
                 "room": ctx.room.name,
                 "caller_phone": caller_phone,
                 "started_at": started_at.isoformat(),
-                "ended_at": datetime.now().isoformat(),
-                "duration_seconds": (datetime.now() - started_at).total_seconds(),
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "duration_seconds": (datetime.now(timezone.utc) - started_at).total_seconds(),
                 "item_count": len(items),
                 "event_count": len(events),
                 "tts_cache_stats": cache_stats,
