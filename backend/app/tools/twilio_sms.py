@@ -20,9 +20,35 @@ async def send_sms(to: str, body: str, *, from_: str | None = None) -> dict:
     `from_` defaults to TWILIO_HOTEL_NUMBER. The sender must be a Twilio-owned
     SMS-capable number on the same account.
 
+    Test-mode safety: when settings.sms_test_redirect is on (the default until
+    A2P 10DLC is approved), the message is redirected to ERIC_CELL_NUMBER and
+    the real recipient is never texted. send_sms is the single chokepoint for
+    all outbound SMS, so guarding here covers every call site. Fail-closed: if
+    the redirect is on but ERIC_CELL_NUMBER is empty, we refuse to send.
+
     Returns {"success": True, "sid": "<message_sid>"} or
-    {"success": False, "error": "..."}. Never raises.
+    {"success": False, "error": "..."}. Never raises. A redirected message
+    also carries {"redirected_to_eric": True, "original_to": "<real number>"}.
     """
+    # Global test-mode redirect (see docstring). Runs before anything else so
+    # no code path can bypass it.
+    original_to = to
+    redirected = False
+    if settings.sms_test_redirect:
+        orig_last4 = original_to[-4:] if original_to and len(original_to) >= 4 else "?"
+        if not settings.eric_cell_number:
+            log.warning(
+                "send_sms: SMS_TEST_REDIRECT on but ERIC_CELL_NUMBER empty; "
+                "refusing to send (intended recipient ends %s)", orig_last4)
+            return {"success": False,
+                    "error": "SMS_TEST_REDIRECT on but ERIC_CELL_NUMBER not configured; refusing to send."}
+        if to != settings.eric_cell_number:
+            log.info("send_sms: TEST redirect -> Eric (intended recipient ends %s)", orig_last4)
+            # Prefix so Eric can tell which guest each redirected text was for.
+            body = f"[TEST->{orig_last4}] {body}"
+        to = settings.eric_cell_number
+        redirected = True
+
     if not settings.twilio_account_sid or not settings.twilio_auth_token:
         return {"success": False, "error": "Twilio credentials not configured."}
 
@@ -58,8 +84,13 @@ async def send_sms(to: str, body: str, *, from_: str | None = None) -> dict:
 
     body_json = response.json()
     sid = body_json.get("sid")
-    log.info("Twilio SMS sent: sid=%s to=%s", sid, to)
-    return {"success": True, "sid": sid, "status": body_json.get("status")}
+    log.info("Twilio SMS sent: sid=%s to=%s%s", sid, to,
+             " (redirected)" if redirected else "")
+    result = {"success": True, "sid": sid, "status": body_json.get("status")}
+    if redirected:
+        result["redirected_to_eric"] = True
+        result["original_to"] = original_to
+    return result
 
 
 async def get_message_status(message_sid: str) -> dict:

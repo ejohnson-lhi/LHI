@@ -86,6 +86,16 @@ class Settings(BaseSettings):
     # --- Eric's contact ---
     eric_cell_number: str = ""
 
+    # --- SMS test-mode safety ---
+    # Until the Twilio A2P 10DLC campaign is approved, redirect EVERY outbound
+    # SMS to ERIC_CELL_NUMBER instead of the real recipient. Enforced centrally
+    # inside send_sms(), so it covers every call site (portal checkout, signup
+    # confirmation, door codes, card links, etc.) so no guest is ever texted
+    # during testing. Fail-closed: if this is on but ERIC_CELL_NUMBER is empty,
+    # send_sms refuses to send rather than risk texting the guest. Set
+    # SMS_TEST_REDIRECT=false in .env only once 10DLC is approved.
+    sms_test_redirect: bool = True
+
     # --- Guest portal ---
     # Shared secret DCS uses to call portal admin endpoints (X-Portal-Auth header).
     # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
