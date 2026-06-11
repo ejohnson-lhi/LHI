@@ -325,6 +325,15 @@ async def api_get_call(
                 "identity": t.identity,
                 "role": t.role,
                 "label": t.label,
+                # Diarize-batch fields (None when the nightly batch hasn't
+                # processed this OGG yet). When present, the viewer
+                # renders a "Post-transfer conversation" section below
+                # Iris's chat history.
+                "start_offset_seconds": t.start_offset_seconds,
+                "diarize_segments": t.diarize_segments,
+                "matched_name": t.matched_name,
+                "match_score": t.match_score,
+                "is_post_transfer": t.role == "answerer",
             }
             for t in detail.tracks
         ],

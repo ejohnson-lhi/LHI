@@ -206,6 +206,99 @@
 
   // ----- detail view ------------------------------------------------
 
+  function fmtSecondsAsClock(s) {
+    // Format a duration-in-seconds as MM:SS (or H:MM:SS for long calls).
+    // Used for the post-transfer transcript timestamps so the viewer can
+    // line them up against the merged audio player above.
+    if (s === null || s === undefined || s < 0) return "—";
+    const total = Math.floor(s);
+    const ss = (total % 60).toString().padStart(2, "0");
+    const mm = Math.floor(total / 60) % 60;
+    const hh = Math.floor(total / 3600);
+    if (hh > 0) return `${hh}:${mm.toString().padStart(2, "0")}:${ss}`;
+    return `${mm}:${ss}`;
+  }
+
+  function renderPostTransferTranscript(tracks) {
+    // Build the "Post-transfer conversation" section from the diarize
+    // batch's per-track JSONs. Only renders tracks where the role is
+    // "answerer" (the transfer destination — front desk or Eric); the
+    // caller and Iris legs are already covered by the Transcript card
+    // above via the agent's chat-history items.
+    //
+    // Three states per answerer track:
+    //   - segments present: render each line with a call-relative timestamp.
+    //   - segments null:    diarize batch hasn't processed this OGG yet
+    //                       (runs nightly at 11 PM Pacific). Render a
+    //                       gentle placeholder so the user knows it's
+    //                       coming, not broken.
+    //   - segments empty:   batch ran but found no speech (e.g., transfer
+    //                       hit voicemail and the OGG only contains the
+    //                       greeting outgoing message). Render a short
+    //                       "no speech detected" note.
+    const transferTracks = (tracks || []).filter(t => t.is_post_transfer);
+    if (transferTracks.length === 0) {
+      // No transfer happened on this call — don't render the section at all.
+      return null;
+    }
+
+    const card = el("div", { class: "card" },
+      el("h2", null, "Post-transfer conversation"),
+    );
+
+    for (const t of transferTracks) {
+      const header = [
+        el("strong", null, t.label || "Unknown leg"),
+      ];
+      // The diarize fingerprint identifies the speaker if enrolled. Most
+      // useful for distinguishing "this leg is Eric" vs "this leg is
+      // someone else who answered Eric's cell".
+      if (t.matched_name && t.matched_name !== "unknown") {
+        header.push(
+          " ",
+          el("span", { class: "muted" },
+            `(voice matched: ${t.matched_name}${t.match_score != null ? `, ${t.match_score.toFixed(2)}` : ""})`,
+          ),
+        );
+      }
+      if (t.start_offset_seconds > 0) {
+        header.push(
+          " ",
+          el("span", { class: "muted" },
+            `· started ${fmtSecondsAsClock(t.start_offset_seconds)} into the call`,
+          ),
+        );
+      }
+      card.appendChild(el("div", { class: "post-transfer-leg-header" }, ...header));
+
+      if (t.diarize_segments === null || t.diarize_segments === undefined) {
+        card.appendChild(el("div", { class: "muted post-transfer-pending" },
+          "Audio not yet transcribed — the diarize batch runs nightly around 11 PM Pacific. Check back tomorrow morning.",
+        ));
+        continue;
+      }
+      if (t.diarize_segments.length === 0) {
+        card.appendChild(el("div", { class: "muted post-transfer-empty" },
+          "No speech detected in this leg's audio.",
+        ));
+        continue;
+      }
+
+      const offset = t.start_offset_seconds || 0;
+      const list = el("div", { class: "post-transfer-segments" });
+      for (const seg of t.diarize_segments) {
+        const callRelStart = offset + (seg.start || 0);
+        list.appendChild(el("div", { class: "post-transfer-segment" },
+          el("span", { class: "post-transfer-ts muted" }, fmtSecondsAsClock(callRelStart)),
+          " ",
+          el("span", null, seg.text || ""),
+        ));
+      }
+      card.appendChild(list);
+    }
+    return card;
+  }
+
   function renderTranscript(items) {
     // chat-style. Filter out empty messages and the blizzard frog warmup.
     const out = el("div", { class: "transcript" });
@@ -458,6 +551,7 @@
           el("h2", null, "Transcript"),
           renderTranscript(data.items || []),
         ),
+        renderPostTransferTranscript(data.tracks || []),
         el("details", null,
           el("summary", null, "Raw events (debug)"),
           el("pre", null, JSON.stringify(data.events, null, 2)),

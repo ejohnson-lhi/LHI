@@ -359,6 +359,35 @@ td.time { white-space: nowrap; color: #555; }
 }
 .msg.user .role { color: #0062cc; }
 
+/* Post-transfer transcript (diarize-batch segments from front desk / Eric legs) */
+.post-transfer-leg-header {
+  margin: 12px 0 6px 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #e6e6ec;
+  font-size: 0.95em;
+}
+.post-transfer-leg-header:first-child {
+  margin-top: 0;
+}
+.post-transfer-segments {
+  margin-bottom: 12px;
+}
+.post-transfer-segment {
+  padding: 4px 0;
+  font-size: 0.95em;
+  line-height: 1.45;
+}
+.post-transfer-ts {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.85em;
+  margin-right: 6px;
+}
+.post-transfer-pending,
+.post-transfer-empty {
+  padding: 8px 0;
+  font-size: 0.9em;
+}
+
 /* Collapsible raw data */
 details {
   background: #fff;

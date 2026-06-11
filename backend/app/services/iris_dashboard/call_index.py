@@ -173,12 +173,30 @@ class CallListEntry:
 
 @dataclass
 class Track:
-    """One per-participant audio track recorded for a call."""
+    """One per-participant audio track recorded for a call.
+
+    Diarize-batch fields (segments / matched_name / match_score) are
+    populated lazily from the JSON the diarize cron writes under
+    `recordings/transcribed/<basename>.json`. They're None when the
+    diarize batch hasn't yet processed this OGG (e.g., same-day calls
+    before the nightly run at 11 PM Pacific).
+
+    start_offset_seconds is when this track was published into the room
+    relative to the call's started_at. The agent and caller legs are
+    usually 0; transfer legs (front_desk / eric) start later — they begin
+    when the destination SIP participant joins, after the ring delay.
+    Adding this offset to each segment's `start` gives a unified
+    call-relative timeline the viewer can interleave.
+    """
     path: str
     track_id: str
     identity: str | None  # None for old (pre-2026-05-29) recordings
     role: str             # "caller" | "iris" | "answerer" | "unknown"
     label: str            # Display label, e.g. "Caller" / "Iris" / "Front Desk"
+    start_offset_seconds: float = 0.0  # when this leg joined the room (relative to call start)
+    diarize_segments: list[dict] | None = None  # [{start, end, text}], or None if not yet transcribed
+    matched_name: str | None = None     # speaker fingerprint result ("eric" / "unknown" / etc.)
+    match_score: float | None = None    # cosine-sim score against enrolled profile
 
 
 @dataclass
@@ -224,7 +242,59 @@ def _call_id_from_transcript(transcript: dict) -> str | None:
     return None
 
 
-def _find_tracks(rec_dir: Path, call_id: str) -> list[Track]:
+def _parse_ogg_ts(ts: str) -> datetime | None:
+    """Parse the OGG filename timestamp (`2026-06-03T012655`) into a UTC
+    datetime. Returns None if the format doesn't match.
+
+    The 6-digit time has no colons (egress filename convention); strptime
+    with `%H%M%S` handles it. We treat it as UTC because that's what egress
+    writes — the droplet's clock is UTC and the dispatch rule's filepath
+    template uses {time} which is UTC."""
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_call_started_at(started_at: str) -> datetime | None:
+    """Parse the transcript's `started_at` into a UTC datetime, tolerating
+    both timezone-aware (`+00:00` suffix) and timezone-naive formats.
+
+    Naive timestamps come from older transcripts; the agent writes
+    timezone-aware ones now. Naive is treated as UTC (the droplet runs
+    in UTC and the agent always called datetime.now())."""
+    if not started_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(started_at)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _load_diarize_for_ogg(rec_dir: Path, ogg_basename: str) -> dict | None:
+    """Look up the diarize-batch JSON for an OGG basename.
+
+    The diarize batch (tools/diarize/diarize_batch.py) writes one JSON per
+    OGG into `recordings/transcribed/<basename>.json` with the same
+    stem as the OGG. Returns the parsed dict on success, None when the
+    file doesn't exist (call hasn't been processed yet) or fails to
+    parse (corrupt — rare)."""
+    stem = ogg_basename[:-4] if ogg_basename.endswith(".ogg") else ogg_basename
+    path = rec_dir / "transcribed" / f"{stem}.json"
+    if not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        log.exception("Could not read diarize JSON %s", path)
+        return None
+
+
+def _find_tracks(rec_dir: Path, call_id: str, call_started_at: str = "") -> list[Track]:
     """Return all per-participant tracks for a call, with parsed identity/role.
 
     Iterates the recordings dir once. For each OGG that belongs to this
@@ -232,8 +302,16 @@ def _find_tracks(rec_dir: Path, call_id: str) -> list[Track]:
     and derive a role. Tracks are sorted by role priority so the UI
     displays caller first, then iris, then answerer (with unknowns
     last) -- regardless of filesystem order.
+
+    For each track we also (a) compute its start offset relative to the
+    call's started_at (from the OGG filename's timestamp), and (b) attach
+    the diarize batch's transcribed segments + matched speaker name if
+    the diarize JSON has been written. Diarize is None when the call
+    hasn't been processed by the nightly batch yet — the viewer renders
+    "audio not yet transcribed" in that case.
     """
     role_order = {"caller": 0, "iris": 1, "answerer": 2, "unknown": 3}
+    call_start_dt = _parse_call_started_at(call_started_at)
     found: list[Track] = []
     # Prefilter by prefix so we don't parse every OGG in the directory.
     prefix = f"{call_id}-"
@@ -246,12 +324,48 @@ def _find_tracks(rec_dir: Path, call_id: str) -> list[Track]:
         if parsed is None:
             continue
         role, label = identity_to_role(parsed["identity"])
+
+        # Compute start-offset relative to call start. If we can't parse
+        # either timestamp, leave it at 0.0 — the viewer can still show
+        # segments, just with per-leg times rather than call-relative.
+        offset = 0.0
+        ogg_dt = _parse_ogg_ts(parsed["ts"])
+        if ogg_dt is not None and call_start_dt is not None:
+            offset = max(0.0, (ogg_dt - call_start_dt).total_seconds())
+
+        # Diarize JSON is keyed by OGG basename. Will be None until the
+        # nightly batch runs.
+        diarize = _load_diarize_for_ogg(rec_dir, entry.name)
+        diarize_segments: list[dict] | None = None
+        matched_name: str | None = None
+        match_score: float | None = None
+        if diarize is not None:
+            raw_segments = diarize.get("segments")
+            if isinstance(raw_segments, list):
+                diarize_segments = [
+                    {
+                        "start": float(s.get("start") or 0.0),
+                        "end": float(s.get("end") or 0.0),
+                        "text": str(s.get("text") or "").strip(),
+                    }
+                    for s in raw_segments
+                    if isinstance(s, dict) and str(s.get("text") or "").strip()
+                ]
+            matched_name = diarize.get("matched_name") or None
+            ms = diarize.get("match_score")
+            if isinstance(ms, (int, float)):
+                match_score = float(ms)
+
         found.append(Track(
             path=str(entry),
             track_id=parsed["track_id"],
             identity=parsed["identity"],
             role=role,
             label=label,
+            start_offset_seconds=offset,
+            diarize_segments=diarize_segments,
+            matched_name=matched_name,
+            match_score=match_score,
         ))
     found.sort(key=lambda t: (role_order.get(t.role, 9), t.track_id))
     return found
@@ -387,14 +501,15 @@ def get_call(call_id: str) -> CallDetail | None:
     if transcript is None or transcript_path is None:
         return None
 
-    tracks = _find_tracks(rec_dir, call_id)
+    started_at_str = transcript.get("started_at") or ""
+    tracks = _find_tracks(rec_dir, call_id, started_at_str)
     merged_path = _merged_audio_path(rec_dir, call_id)
     summary_path = _summary_sidecar_path(rec_dir, call_id)
 
     return CallDetail(
         call_id=call_id,
         transcript_path=str(transcript_path),
-        started_at=transcript.get("started_at") or "",
+        started_at=started_at_str,
         ended_at=transcript.get("ended_at") or "",
         caller_phone=transcript.get("caller_phone") or "",
         duration_seconds=float(transcript.get("duration_seconds") or 0.0),

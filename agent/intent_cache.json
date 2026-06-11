@@ -236,7 +236,7 @@
       ]
     },
     "wifi": {
-      "_doc": "Caller asks about Wi-Fi or internet access.",
+      "_doc": "Caller asks about Wi-Fi or internet access. Give the network name and password directly — guests asking for WiFi want to connect, not be transferred. Network: LighthouseInn, Password: happyguestn.",
       "trigger_phrases": [
         "wifi", "wi-fi", "wi fi", "wireless internet", "wireless",
         "internet", "internet access", "internet connection",
@@ -247,10 +247,9 @@
         "get online", "going online", "get on the internet"
       ],
       "responses": [
-        {"text": "Free Wi-Fi is available everywhere in the building.", "weight": 1.0},
-        {"text": "Yes — we have free Wi-Fi throughout the inn.", "weight": 1.0},
-        {"text": "Free Wi-Fi, available everywhere.", "weight": 1.0},
-        {"text": "Yes, free Wi-Fi all through the building.", "weight": 1.0}
+        {"text": "Free Wi-Fi all through the inn. The network is Lighthouse Inn — that's one word — and the password is happyguestn, all lowercase, one word.", "weight": 1.0},
+        {"text": "Yes — free Wi-Fi everywhere. The network is Lighthouse Inn, one word, and the password is happyguestn, all lowercase.", "weight": 1.0},
+        {"text": "We have free Wi-Fi throughout the building. Connect to the network Lighthouse Inn — one word — with the password happyguestn, lowercase.", "weight": 1.0}
       ]
     },
     "breakfast": {
