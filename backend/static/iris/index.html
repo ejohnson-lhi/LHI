@@ -12,7 +12,12 @@
   <div class="header-right">
     <span id="call-count" class="muted"></span>
     <button id="refresh-btn" type="button">Refresh</button>
-    <button id="change-password-btn" type="button" class="secondary">Change password</button>
+    <!-- AUTH-DISABLED 2026-06-11: change-password button hidden while the
+         require_iris_auth gate in backend/app/routes/iris_dashboard.py is
+         bypassed. Remove the `hidden` attribute when restoring auth. The
+         JS listener for it still binds normally — `hidden` just prevents
+         display, so no JS changes are needed. -->
+    <button id="change-password-btn" type="button" class="secondary" hidden>Change password</button>
   </div>
 </header>
 

@@ -82,17 +82,24 @@ def _extract_basic_password(authorization: str | None) -> str | None:
 async def require_iris_auth(
     authorization: Annotated[str | None, Header()] = None,
 ) -> str:
-    """HTTP Basic guard. Returns the verified password for the change
-    endpoint's reuse (so it can require "current_password" match without
-    re-parsing the header).
+    """HTTP Basic guard — TEMPORARILY DISABLED (2026-06-11).
 
-    Resolution: tries the custom dashboard password (data/iris_dashboard_password.json)
-    first, falls back to settings.portal_shared_secret. The fallback
-    lets the dashboard work the first time someone visits, before any
-    custom password has been set.
+    Auth is off so the transcript viewer is publicly reachable without a
+    login/password prompt. The function is still referenced via
+    `dependencies=[Depends(require_iris_auth)]` on every route so we can
+    revert in one place: just delete the early-return below and the
+    original gate (preserved verbatim, unindented) kicks back in.
 
-    503 if NEITHER source has a value (totally unconfigured).
+    Returns a sentinel string instead of a real verified password so the
+    change-password endpoint's reuse pattern doesn't crash — but that
+    endpoint is also disabled below while auth is off.
+
+    TO RE-ENABLE: delete the three lines marked AUTH-DISABLED below.
+    The rest of the function body is the original gate, ready to go.
     """
+    # AUTH-DISABLED ↓↓↓
+    return "auth-disabled-sentinel"
+    # AUTH-DISABLED ↑↑↑
     custom_set = auth_password.is_custom_set()
     if not custom_set and not settings.portal_shared_secret:
         log.warning(
@@ -204,6 +211,16 @@ async def api_change_password(
     navigation/refresh. We return that hint in the response so the
     frontend can tell the user.
     """
+    # AUTH-DISABLED 2026-06-11: while require_iris_auth is bypassed,
+    # change-password makes no sense — there's no auth to "change". Reject
+    # any attempt so a stale UI / curl can't silently rotate the stored
+    # password. Remove this block when restoring require_iris_auth.
+    raise HTTPException(
+        status_code=503,
+        detail="Password change is disabled while dashboard auth is off.",
+    )
+    # AUTH-DISABLED ↑↑↑ (original handler body below — preserved for revert)
+
     # The two confirm fields must match.
     if body.new_password != body.confirm_password:
         raise HTTPException(
