@@ -538,9 +538,65 @@ async def check_availability(
     data = body.get("data")
     if not isinstance(data, list):
         return None
-    log.info("check_availability: %d property entries for %s..%s adults=%d",
-             len(data), check_in, check_out, adults)
-    return _summarize_availability(data)
+    nights = _nights_between(check_in, check_out)
+    log.info(
+        "check_availability: %d property entries for %s..%s adults=%d nights=%s",
+        len(data), check_in, check_out, adults, nights,
+    )
+    return _summarize_availability(data, nights=nights)
+
+
+def _nights_between(check_in: str, check_out: str) -> int | None:
+    """Number of nights between two YYYY-MM-DD dates. Returns None if either
+    string fails to parse. Used to filter out rate plans whose minimum-stay
+    rules don't actually apply to this booking — e.g., the weekly rate plan
+    that Cloudbeds sometimes returns for stays shorter than seven nights."""
+    from datetime import date
+    try:
+        d1 = date.fromisoformat(check_in)
+        d2 = date.fromisoformat(check_out)
+    except (TypeError, ValueError):
+        return None
+    delta = (d2 - d1).days
+    return delta if delta > 0 else None
+
+
+def _rate_plan_min_nights(name: str | None) -> int:
+    """Inferred minimum-stay length implied by a rate plan's name.
+
+    The Lighthouse Inn (and most Cloudbeds properties) name length-of-stay
+    rate plans descriptively: "Weekly rate", "5-night stay discount",
+    "Monthly rate", etc. Cloudbeds itself doesn't reliably enforce the
+    plan's min-stay before returning it in getAvailableRoomTypes, so we
+    have to filter based on the plan name. Returns 1 for plans with no
+    length-of-stay implication (standard rate, direct-call discount, etc.)
+    so they always pass the filter.
+
+    Heuristic — string-match against well-known patterns. Adding a new
+    named tier means adding a pattern here.
+    """
+    if not name:
+        return 1
+    n = name.lower()
+    # "Monthly" / "30-night" / "30 night" plans
+    if "month" in n:
+        return 30
+    if "30-night" in n or "30 night" in n:
+        return 30
+    # "Weekly" / "7-night" / "7 night" plans
+    if "week" in n:
+        return 7
+    if "7-night" in n or "7 night" in n:
+        return 7
+    # "N-night" / "N night" / "N day" / "N-day" patterns (2-night, 3-night, ...)
+    import re
+    m = re.search(r"\b(\d+)[- ](?:night|day)\b", n)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    return 1
 
 
 def _avg_nightly(detailed_rates: object) -> float | None:
@@ -562,9 +618,21 @@ def _avg_nightly(detailed_rates: object) -> float | None:
     return round(sum(rates) / len(rates), 2)
 
 
-def _summarize_availability(data: list) -> list[dict]:
-    """Group Cloudbeds availability rows by room type with nested rate plans."""
+def _summarize_availability(data: list, nights: int | None = None) -> list[dict]:
+    """Group Cloudbeds availability rows by room type with nested rate plans.
+
+    Filters out rate plans whose name implies a minimum stay longer than
+    the actual booking (e.g., "Weekly rate" for a 5-night stay). Cloudbeds'
+    getAvailableRoomTypes sometimes returns those plans anyway with a
+    cheaper-looking `total`, and the prompt's "always pick the lowest
+    applicable rate" rule then quotes the wrong rate for the actual stay
+    length. See _rate_plan_min_nights for the heuristic.
+
+    When `nights` is None (date math failed upstream), the filter is
+    skipped — better to return all plans than to silently drop them.
+    """
     grouped: dict[str, dict] = {}
+    dropped_total = 0
     for prop in data:
         if not isinstance(prop, dict):
             continue
@@ -575,6 +643,17 @@ def _summarize_availability(data: list) -> list[dict]:
             rt_id = r.get("roomTypeID")
             if not rt_id:
                 continue
+            plan_name = r.get("ratePlanNamePublic")
+            if nights is not None:
+                min_nights_req = _rate_plan_min_nights(plan_name)
+                if min_nights_req > nights:
+                    log.info(
+                        "check_availability: dropping rate plan %r — implies "
+                        "min %d nights but stay is %d nights",
+                        plan_name, min_nights_req, nights,
+                    )
+                    dropped_total += 1
+                    continue
             if rt_id not in grouped:
                 grouped[rt_id] = {
                     "room_type_id": rt_id,
@@ -585,10 +664,12 @@ def _summarize_availability(data: list) -> list[dict]:
                     "rate_plans": [],
                 }
             grouped[rt_id]["rate_plans"].append({
-                "name": r.get("ratePlanNamePublic"),
+                "name": plan_name,
                 "total": r.get("roomRate"),
                 "nightly": _avg_nightly(r.get("roomRateDetailed")),
             })
+    if dropped_total:
+        log.info("check_availability: dropped %d rate plan rows total based on min-nights heuristic", dropped_total)
     # Sort each room type's rate plans cheapest first so Iris sees the best
     # quote at index 0.
     for entry in grouped.values():

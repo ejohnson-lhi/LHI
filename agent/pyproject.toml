@@ -22,6 +22,12 @@ dependencies = [
     "numpy>=1.26.0",
     # For calling Iris's FastAPI tools from inside the agent (future use):
     "httpx>=0.27.0",
+    # IANA timezone data for zoneinfo.ZoneInfo("America/Los_Angeles") —
+    # used in iris_prompt.py to render the {{current_day}} / {{tomorrow}}
+    # placeholders in the hotel's local time instead of UTC. Linux droplet
+    # has system tzdata so this is redundant there; pinned for portability
+    # to Windows / containers that don't ship a system tz db.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

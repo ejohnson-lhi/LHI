@@ -86,14 +86,20 @@ class Settings(BaseSettings):
     # --- Eric's contact ---
     eric_cell_number: str = ""
 
-    # --- SMS test-mode safety ---
-    # Until the Twilio A2P 10DLC campaign is approved, redirect EVERY outbound
-    # SMS to ERIC_CELL_NUMBER instead of the real recipient. Enforced centrally
-    # inside send_sms(), so it covers every call site (portal checkout, signup
-    # confirmation, door codes, card links, etc.) so no guest is ever texted
-    # during testing. Fail-closed: if this is on but ERIC_CELL_NUMBER is empty,
-    # send_sms refuses to send rather than risk texting the guest. Set
-    # SMS_TEST_REDIRECT=false in .env only once 10DLC is approved.
+    # --- SMS sending controls ---
+    # MASTER KILL SWITCH. Until the Twilio A2P 10DLC campaign is approved, do
+    # NOT transmit any SMS at all: sending unregistered A2P traffic risks
+    # carrier filtering/fines and can jeopardize the pending registration.
+    # When false, send_sms() logs the intended message and returns without
+    # ever calling Twilio. Flip to true (SMS_SENDING_ENABLED=true) once the
+    # campaign is approved.
+    sms_sending_enabled: bool = False
+    # Secondary safety net (only matters once sending is enabled): redirect
+    # EVERY outbound SMS to ERIC_CELL_NUMBER instead of the real recipient,
+    # enforced centrally in send_sms() so every call site is covered and no
+    # guest is texted during testing. Fail-closed: if on but ERIC_CELL_NUMBER
+    # is empty, send_sms refuses. Set SMS_TEST_REDIRECT=false to text real
+    # guests (only after validating with redirected test sends).
     sms_test_redirect: bool = True
 
     # --- Guest portal ---

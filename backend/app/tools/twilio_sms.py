@@ -29,7 +29,23 @@ async def send_sms(to: str, body: str, *, from_: str | None = None) -> dict:
     Returns {"success": True, "sid": "<message_sid>"} or
     {"success": False, "error": "..."}. Never raises. A redirected message
     also carries {"redirected_to_eric": True, "original_to": "<real number>"}.
+
+    Master kill switch: when settings.sms_sending_enabled is false (the default
+    until A2P 10DLC is approved), no SMS is transmitted at all; the intended
+    message is logged and a {"success": False, "suppressed": True} result is
+    returned without calling Twilio.
     """
+    # Master kill switch: do not transmit ANY SMS until the A2P 10DLC campaign
+    # is approved. Unregistered A2P traffic risks carrier filtering and fines
+    # and can jeopardize the pending registration. Checked first, so no code
+    # path (including the Eric test-redirect below) can send.
+    if not settings.sms_sending_enabled:
+        last4 = to[-4:] if to and len(to) >= 4 else "?"
+        log.warning("send_sms: sending DISABLED (SMS_SENDING_ENABLED=false); "
+                    "not sending (intended recipient ends %s)", last4)
+        return {"success": False, "suppressed": True,
+                "error": "SMS sending disabled until A2P 10DLC campaign is approved."}
+
     # Global test-mode redirect (see docstring). Runs before anything else so
     # no code path can bypass it.
     original_to = to

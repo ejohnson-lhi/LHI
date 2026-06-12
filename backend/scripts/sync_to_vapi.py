@@ -14,6 +14,14 @@ import asyncio
 import os
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+# The hotel is in Florence, Oregon — Pacific time. Date placeholders
+# ({{current_datetime_long}}, {{tomorrow}}, etc.) must be computed in
+# the hotel's local timezone, not UTC. The droplet runs UTC; without
+# this fix the prompt says "tomorrow" anytime between 5pm Pacific
+# (DST: 4pm) and midnight Pacific. Mirrors agent/iris_prompt.py.
+_HOTEL_TZ = ZoneInfo("America/Los_Angeles")
 from pathlib import Path
 
 backend_root = Path(__file__).parent.parent
@@ -257,7 +265,7 @@ def _render_placeholders(prompt: str) -> str:
     `{{customer.number}}` so Vapi substitutes it per call automatically.
     Unfilled feature-flag placeholders become empty strings.
     """
-    now = datetime.now()
+    now = datetime.now(_HOTEL_TZ)
     today = now.date()
 
     def fmt_long(d) -> str:

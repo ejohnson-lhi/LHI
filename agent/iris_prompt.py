@@ -9,6 +9,16 @@ When the prompt format changes, update both copies.
 """
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# The hotel is in Florence, Oregon — Pacific time. Use this for the
+# {{current_datetime_long}} / {{current_day}} / {{tomorrow}} / etc.
+# placeholders. The droplet runs in UTC; datetime.now() without a
+# timezone gives UTC, which produces "tomorrow" anytime between
+# 5pm Pacific (DST: 4pm) and midnight Pacific — exactly when guests
+# are most likely to call about same-day or next-day arrivals.
+# zoneinfo handles DST transitions automatically (PDT ↔ PST).
+_HOTEL_TZ = ZoneInfo("America/Los_Angeles")
 
 # Repo layout:  <repo>/AI_Prompts/...   <repo>/agent/iris_prompt.py
 PROMPTS_DIR = Path(__file__).parent.parent / "AI_Prompts"
@@ -18,7 +28,7 @@ SYSTEM_PROMPT_FILE = PROMPTS_DIR / "Lighthouse_AI_system_prompt.txt"
 
 
 def _render_placeholders(prompt: str, caller_phone: str | None = None) -> str:
-    now = datetime.now()
+    now = datetime.now(_HOTEL_TZ)
     today = now.date()
 
     def fmt_long(d) -> str:
