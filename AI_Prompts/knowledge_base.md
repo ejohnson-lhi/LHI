@@ -140,6 +140,17 @@ Yes, you can text us at (541) 256-2320.
 
 Yes! We welcome family reunions and groups. We can try to place your group in nearby rooms. Let us know when booking that you're part of a group so we can coordinate.
 
+### What rooms work for families or groups?
+
+Our group-friendly options:
+- **2 family suites** — two rooms connected by a bathroom; one room has a queen bed and balcony, the other has a queen bed and a twin bed (sleeps up to 5 per suite).
+- **1 room with two queen beds** (sleeps up to 4).
+- **1 room with two king beds** (sleeps up to 4).
+- **Queen + Queen suite** — two rooms connected by a bathroom, each with a queen bed (sleeps up to 4).
+- Most other rooms are single king or single queen rooms — for larger groups, two adjacent rooms is the usual alternative when one of the larger options is not available.
+
+If a family suite is unavailable for the requested dates, suggest the two-queen room, two-king room, or Queen + Queen suite as alternatives BEFORE transferring.
+
 ### Can you help me?
 
 I'll try. I'm programmed to answer questions about the hotel as well as make reservations.
@@ -388,6 +399,10 @@ Call us at (541) 997-3221 and we'll be happy to help you book over the phone.
 ### Is breakfast included?
 
 Yes, homemade breakfast is included with your stay.
+
+### Is my room good? / Are the rooms nice? / What are the rooms like?
+
+The Lighthouse Inn was built in 1938, so the rooms aren't huge by modern standards — they have a classic, characterful feel rather than chain-hotel uniformity. What guests most often compliment: the quality of our beds, the homemade breakfast, and the location. Every room includes a private bathroom, microwave, mini-fridge, flat-screen TV, free Wi-Fi, heating, and our standard toiletries (soap, shampoo, conditioner, body wash, washcloths, hand towels, bath towels). Specific room layouts and exact dimensions get assigned closer to check-in.
 
 ### Is coffee available?
 
