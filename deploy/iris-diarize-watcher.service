@@ -28,13 +28,21 @@ RuntimeDirectory=iris/active_calls
 RuntimeDirectoryMode=0775
 RuntimeDirectoryPreserve=yes
 
-# Caps on the WATCHER itself. It polls and execs children — should
-# stay tiny. The diarize child runs as a separate (unrestricted-by-this-
-# cgroup) process, controlled by our pause/kill logic, not cgroup limits.
-# If MemoryHigh on the watcher itself ever fires, that's a code bug.
-MemoryHigh=128M
-MemoryMax=256M
-CPUQuota=10%
+# NO cgroup memory/CPU caps. The previous version had MemoryMax=256M
+# and CPUQuota=10% intended for the tiny watcher daemon — but systemd
+# cgroup limits apply to the WHOLE service cgroup including child
+# processes. The diarize batch needs ~3-4 GB for Whisper large-v3 int8
+# and gets ~50%+ of one CPU even at nice -n 19; both were strangled
+# by those limits. Verified 2026-06-16: the diarize child got stuck in
+# mem_cgroup_handle_over_high (kernel throttle) for 2:45 with no
+# forward progress before this fix.
+#
+# Resource management is handled OUTSIDE the cgroup:
+#   - nice -n 19 / ionice -c 3 on the diarize child (in diarize_watcher.py)
+#     for CPU/IO yielding when other work is ready.
+#   - Explicit SIGKILL by the watcher when /proc/meminfo's MemAvailable
+#     drops below MEM_PAUSE_THRESHOLD_MB during a live call.
+# Both mechanisms are unaffected by cgroup-level limits.
 
 # Hardening (matches iris-agent.service)
 NoNewPrivileges=true

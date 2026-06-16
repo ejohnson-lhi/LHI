@@ -221,38 +221,55 @@
 
   function renderPostTransferTranscript(tracks) {
     // Build the "Post-transfer conversation" section from the diarize
-    // batch's per-track JSONs. Only renders tracks where the role is
-    // "answerer" (the transfer destination — front desk or Eric); the
-    // caller and Iris legs are already covered by the Transcript card
-    // above via the agent's chat-history items.
+    // batch's per-track JSONs.
+    //
+    // Includes TWO kinds of tracks:
+    //
+    //  1. ANSWERER tracks (is_post_transfer=true) — the transfer
+    //     destination (front desk or Eric). All of their segments are
+    //     post-transfer by definition since the track only starts
+    //     existing at pickup.
+    //
+    //  2. CALLER track (role=caller) — caller's continued speech after
+    //     the transfer. The Iris-side chat history items DON'T cover
+    //     this period because Iris went silent on transfer (the LLM
+    //     and Deepgram STT stop generating turns), but the caller-leg
+    //     OGG keeps recording. Filter caller segments by the transfer
+    //     time so only post-transfer speech appears here; pre-transfer
+    //     caller speech is already in the main Transcript card above
+    //     via Iris's chat history items.
     //
     // Three states per answerer track:
     //   - segments present: render each line with a call-relative timestamp.
-    //   - segments null:    diarize batch hasn't processed this OGG yet
-    //                       (runs nightly at 11 PM Pacific). Render a
-    //                       gentle placeholder so the user knows it's
-    //                       coming, not broken.
+    //   - segments null:    diarize batch hasn't processed this OGG yet.
+    //                       Render a placeholder.
     //   - segments empty:   batch ran but found no speech (e.g., transfer
-    //                       hit voicemail and the OGG only contains the
-    //                       greeting outgoing message). Render a short
-    //                       "no speech detected" note.
+    //                       hit voicemail). Render a short note.
     const transferTracks = (tracks || []).filter(t => t.is_post_transfer);
     if (transferTracks.length === 0) {
-      // No transfer happened on this call — don't render the section at all.
       return null;
     }
+
+    // The transfer time = the earliest answerer track's join offset.
+    // Caller segments whose call-time >= this are post-transfer.
+    const transferOffsetS = Math.min(
+      ...transferTracks.map(t => t.start_offset_seconds || 0),
+    );
+
+    // Caller tracks (typically just one). Multiple iris-call-*-sip_*
+    // OGGs are rare but the role classifier in call_index handles them
+    // identically, so we render all of them.
+    const callerTracks = (tracks || []).filter(t => t.role === "caller");
 
     const card = el("div", { class: "card" },
       el("h2", null, "Post-transfer conversation"),
     );
 
-    for (const t of transferTracks) {
+    const renderLegSegments = (t, segFilter) => {
+      // Shared rendering helper: header + segment list (or placeholder).
       const header = [
         el("strong", null, t.label || "Unknown leg"),
       ];
-      // The diarize fingerprint identifies the speaker if enrolled. Most
-      // useful for distinguishing "this leg is Eric" vs "this leg is
-      // someone else who answered Eric's cell".
       if (t.matched_name && t.matched_name !== "unknown") {
         header.push(
           " ",
@@ -273,20 +290,22 @@
 
       if (t.diarize_segments === null || t.diarize_segments === undefined) {
         card.appendChild(el("div", { class: "muted post-transfer-pending" },
-          "Audio not yet transcribed — the diarize batch runs nightly around 11 PM Pacific. Check back tomorrow morning.",
+          "Audio not yet transcribed — the diarize batch will process this within minutes of the call ending; refresh in a bit.",
         ));
-        continue;
-      }
-      if (t.diarize_segments.length === 0) {
-        card.appendChild(el("div", { class: "muted post-transfer-empty" },
-          "No speech detected in this leg's audio.",
-        ));
-        continue;
+        return;
       }
 
       const offset = t.start_offset_seconds || 0;
+      const filtered = (t.diarize_segments || []).filter(segFilter);
+      if (filtered.length === 0) {
+        card.appendChild(el("div", { class: "muted post-transfer-empty" },
+          "No speech detected in this leg's audio.",
+        ));
+        return;
+      }
+
       const list = el("div", { class: "post-transfer-segments" });
-      for (const seg of t.diarize_segments) {
+      for (const seg of filtered) {
         const callRelStart = offset + (seg.start || 0);
         list.appendChild(el("div", { class: "post-transfer-segment" },
           el("span", { class: "post-transfer-ts muted" }, fmtSecondsAsClock(callRelStart)),
@@ -295,7 +314,25 @@
         ));
       }
       card.appendChild(list);
+    };
+
+    // 1. Answerer legs — show ALL segments (entire leg is post-transfer).
+    for (const t of transferTracks) {
+      renderLegSegments(t, () => true);
     }
+
+    // 2. Caller leg(s) — show only segments at/after the transfer offset.
+    // Caller track's local seg.start is relative to its own track start
+    // (which is call-start for the caller's leg, offset 0). So segments
+    // where (callerOffset + seg.start) >= transferOffsetS are post-transfer.
+    for (const t of callerTracks) {
+      const callerOffset = t.start_offset_seconds || 0;
+      renderLegSegments(
+        t,
+        (seg) => (callerOffset + (seg.start || 0)) >= transferOffsetS,
+      );
+    }
+
     return card;
   }
 
