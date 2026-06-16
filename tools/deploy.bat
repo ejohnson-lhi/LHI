@@ -91,17 +91,24 @@ if errorlevel 1 (
 )
 echo.
 
-echo === Pulling on droplet, syncing deps, restarting both services ===
+echo === Pulling on droplet, syncing deps, restarting all services ===
 REM On the droplet: pull, run pip install (idempotent; picks up any new
 REM dependency from backend/pyproject.toml so we don't crash-loop the
 REM service on a missing module — we've hit this with phonenumbers and
-REM python-multipart), sync the systemd unit file (cp -u skips if no
-REM change), then restart BOTH services. iris-agent is the LiveKit
+REM python-multipart), sync the systemd unit files (cp -u skips if no
+REM change), then restart ALL THREE services. iris-agent is the LiveKit
 REM worker; iris-backend is the uvicorn FastAPI that serves the guest
-REM portal + the /dcs/* relay. They have separate codepaths but both
-REM live in this repo, so a deploy that doesn't restart both leaves
-REM one of them running stale code.
-"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo cp -u deploy/iris-backend.service /etc/systemd/system/iris-backend.service && sudo systemctl daemon-reload && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12"
+REM portal + the /dcs/* relay; iris-diarize-watcher polls for new OGGs
+REM and runs the diarize batch at low priority, pausing/killing it
+REM when a live call comes in (see tools/diarize/diarize_watcher.py).
+REM
+REM Legacy cron disable: the watcher replaces /etc/cron.d/iris-diarize.
+REM First deploy renames the cron file to .disabled; subsequent deploys
+REM no-op via the test -f check.
+REM
+REM systemctl enable for the watcher is idempotent — first deploy
+REM enables for boot, subsequent deploys do nothing.
+"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo cp -u deploy/iris-backend.service /etc/systemd/system/iris-backend.service && sudo cp -u deploy/iris-diarize-watcher.service /etc/systemd/system/iris-diarize-watcher.service && (sudo test -f /etc/cron.d/iris-diarize && sudo mv /etc/cron.d/iris-diarize /etc/cron.d/iris-diarize.disabled || true) && sudo systemctl daemon-reload && sudo systemctl enable iris-diarize-watcher.service && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && sudo systemctl restart iris-diarize-watcher.service && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12 && echo --- iris-diarize-watcher --- && sudo systemctl status iris-diarize-watcher.service --no-pager -l | head -12"
 
 REM Clear the message file so a stale message doesn't get reused on the next run.
 if exist "%MSG_FILE%" del "%MSG_FILE%"

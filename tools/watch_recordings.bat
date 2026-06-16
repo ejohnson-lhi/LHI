@@ -42,6 +42,7 @@ if errorlevel 1 (
 )
 
 set /a NEW=0
+set "NEW_OGG=0"
 for /f "usebackq delims=" %%F in ("%TMP%") do (
     set "REL=%%F"
     set "REL_WIN=!REL:/=\!"
@@ -53,11 +54,32 @@ for /f "usebackq delims=" %%F in ("%TMP%") do (
         echo [%TIME%] pulling !REL!
         "%SCP%" -q "%REMOTE%:%REMOTE_DIR%/!REL!" "!LOCAL_FILE!"
         set /a NEW+=1
+        REM Flag any new .ogg (case-insensitive) so we know to kick
+        REM diarize after the loop. Other extensions (.json, .wav) don't
+        REM need transcription.
+        set "EXT=!REL:~-4!"
+        if /i "!EXT!"==".ogg" set "NEW_OGG=1"
     )
 )
 del "%TMP%" 2>nul
 
 if !NEW! gtr 0 echo [%TIME%] !NEW! new files added
+
+REM Per-call diarize trigger: kick the wrapper at low CPU priority when
+REM a new OGG arrived this cycle. The wrapper's single-instance lock
+REM keeps overlapping kicks (back-to-back calls) from launching the
+REM batch twice; the batch is idempotent so a single in-flight run will
+REM still pick up whatever arrived during its execution on its next
+REM invocation. Latency: ~5-10x realtime, so most calls have transcripts
+REM available within minutes of hangup, vs the nightly 2 AM batch.
+REM Fire-and-forget: the watcher loop keeps polling.
+if "!NEW_OGG!"=="1" (
+    echo [%TIME%] kicking diarize at low priority
+    REM "diarize" title gives the minimized taskbar tile a name.
+    REM /min: open the new console minimized so diarize output doesn't
+    REM steal focus. /low: idle CPU priority class - python inherits it.
+    start "diarize" /min /low "%~dp0run_diarize_lowprio.bat"
+)
 
 :sleep
 timeout /t %INTERVAL% /nobreak >nul

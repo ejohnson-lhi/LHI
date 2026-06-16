@@ -299,7 +299,7 @@
     return card;
   }
 
-  function renderTranscript(items) {
+  function renderTranscript(items, tracks) {
     // chat-style. Filter out empty messages and the blizzard frog warmup.
     const out = el("div", { class: "transcript" });
     for (const it of items) {
@@ -329,6 +329,25 @@
           `← tool result: ${preview}`
         ));
       }
+    }
+    // Synthesize transfer markers from answerer tracks. The
+    // session.history items don't always carry the transfer tool call
+    // (intent-cache path bypasses the framework's @function_tool
+    // dispatch; June-16 production calls also had transfers where the
+    // LLM only spoke "Let me transfer you" without an actual tool call,
+    // and a SIP participant joined anyway via a path outside the agent).
+    // Either way, the answerer OGGs prove a transfer happened — so we
+    // surface a marker per leg in the transcript flow so the reader
+    // doesn't have to scan the Post-transfer card below to know one
+    // occurred.
+    const transferTracks = (tracks || []).filter(t => t.is_post_transfer);
+    for (const t of transferTracks) {
+      const offsetLabel = (t.start_offset_seconds > 0)
+        ? ` at ${fmtSecondsAsClock(t.start_offset_seconds)}`
+        : "";
+      out.appendChild(el("div", { class: "msg tool transfer-marker" },
+        `↪ Transfer connected: ${t.label || "Unknown leg"}${offsetLabel}`,
+      ));
     }
     return out;
   }
@@ -549,7 +568,7 @@
         renderAudioCard(callId, data.tracks || []),
         el("div", { class: "card" },
           el("h2", null, "Transcript"),
-          renderTranscript(data.items || []),
+          renderTranscript(data.items || [], data.tracks || []),
         ),
         renderPostTransferTranscript(data.tracks || []),
         el("details", null,

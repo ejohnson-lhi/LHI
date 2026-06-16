@@ -32,5 +32,15 @@ ProtectSystem=strict
 ReadWritePaths=/home/iris/.cache /opt/iris-backend/agent /opt/iris-backend/recordings
 PrivateTmp=true
 
+# /run/iris/active_calls — call-active flag dir read by the diarize
+# watcher daemon (iris-diarize-watcher.service). Group-writable so the
+# watcher (also User=iris, Group=iris) can prune stale flags. Preserve=yes
+# keeps the directory across restarts of THIS unit so the watcher's
+# in-flight diarize doesn't lose its coordination signal if the agent
+# restarts mid-call. Mode 0775 = owner/group rwx, others rx.
+RuntimeDirectory=iris/active_calls
+RuntimeDirectoryMode=0775
+RuntimeDirectoryPreserve=yes
+
 [Install]
 WantedBy=multi-user.target

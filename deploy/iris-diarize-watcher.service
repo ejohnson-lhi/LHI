@@ -1,0 +1,64 @@
+[Unit]
+Description=Iris per-call diarize watcher
+# The watcher tolerates the agent being absent (it'll just see no call
+# flags and run diarize freely). Order helps log readability.
+After=network.target iris-agent.service
+Wants=iris-agent.service
+
+[Service]
+Type=simple
+User=iris
+Group=iris
+WorkingDirectory=/opt/iris-backend/tools/diarize
+
+# Use the diarize venv — separate from the agent venv (Whisper +
+# pyannote vs LiveKit Agents). The watcher itself only uses stdlib,
+# but it execs the venv's python for the diarize batch child.
+ExecStart=/opt/iris-backend/tools/diarize/.venv/bin/python /opt/iris-backend/tools/diarize/diarize_watcher.py
+
+# Restart on crash with a small backoff so a persistent error (e.g.,
+# corrupt OGG that triggers a Whisper crash) doesn't hot-loop.
+Restart=on-failure
+RestartSec=10s
+
+# Shared runtime dir with the agent. See iris-agent.service for
+# RuntimeDirectory= rationale. Both services declare the same dir;
+# systemd creates it once and both can read/write (matching User/Group).
+RuntimeDirectory=iris/active_calls
+RuntimeDirectoryMode=0775
+RuntimeDirectoryPreserve=yes
+
+# Caps on the WATCHER itself. It polls and execs children — should
+# stay tiny. The diarize child runs as a separate (unrestricted-by-this-
+# cgroup) process, controlled by our pause/kill logic, not cgroup limits.
+# If MemoryHigh on the watcher itself ever fires, that's a code bug.
+MemoryHigh=128M
+MemoryMax=256M
+CPUQuota=10%
+
+# Hardening (matches iris-agent.service)
+NoNewPrivileges=true
+ProtectSystem=strict
+# Writable paths:
+#  - /opt/iris-backend/recordings — diarize batch writes transcribed
+#    JSONs here under transcribed/
+#  - /opt/iris-backend/tools/diarize — venv + any cached models
+#  - /home/iris/.cache — Hugging Face pyannote model cache
+ReadWritePaths=/opt/iris-backend/recordings /opt/iris-backend/tools/diarize /home/iris/.cache
+PrivateTmp=true
+
+# Environment overrides (uncomment to tune; defaults are calibrated
+# for the 8 GB droplet):
+#Environment=MEM_PAUSE_THRESHOLD_MB=1500
+#Environment=CALL_POLL_INTERVAL_S=2.0
+#Environment=OGG_POLL_INTERVAL_S=10.0
+#Environment=IRIS_RECORDINGS_DIR=/opt/iris-backend/recordings
+#Environment=IRIS_CALL_ACTIVE_DIR=/run/iris/active_calls
+#Environment=DIARIZE_VENV=/opt/iris-backend/tools/diarize/.venv
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iris-diarize-watcher
+
+[Install]
+WantedBy=multi-user.target

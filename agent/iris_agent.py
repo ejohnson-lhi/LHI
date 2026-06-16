@@ -64,6 +64,7 @@ from audio_cache import TTSAudioCache
 from intent_cache import DEFAULT_CACHE as INTENT_CACHE, IntentCallState
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
+from stt_vocabulary import HOTEL_KEYWORDS
 import aec  # WebRTC AEC wiring to suppress self-echo of Iris's TTS
 
 load_dotenv()
@@ -309,6 +310,19 @@ TTS_CACHE_WAV_DIR = Path(os.environ.get(
 
 BACKEND_URL = os.environ.get("IRIS_BACKEND_URL", "http://127.0.0.1:8000")
 BACKEND_TIMEOUT_S = 15.0
+
+# Call-active flag directory. The diarize_watcher daemon
+# (tools/diarize/diarize_watcher.py) polls this dir; on every call we
+# write a per-worker PID-tagged flag here on entrypoint, and delete it
+# on session shutdown. The watcher uses presence/absence of any file in
+# this dir to decide whether to pause (SIGSTOP) or kill (SIGKILL) its
+# in-flight diarize subprocess. Failures to write/delete the flag are
+# logged but do NOT block the call — the watcher prunes stale flags by
+# PID liveness check, so a missed delete just means at most one cycle
+# of incorrect "call active" state.
+CALL_ACTIVE_DIR = Path(os.environ.get(
+    "IRIS_CALL_ACTIVE_DIR", "/run/iris/active_calls",
+))
 
 # Where to write per-call transcripts. Gitignored. Each call gets a single
 # JSON file with the full chat history + timestamps so we can investigate
@@ -705,6 +719,51 @@ class IrisAgent(Agent):
         # and (2) override on_user_turn_completed to short-circuit the
         # LLM-invocation pipeline via StopResponse.
         self._silent = (called_number == IMMEDIATE_TRANSFER_DID)
+        # Transfer-in-flight guard. Production call 2026-06-15 (transcript
+        # iris-call-_+16086304094_NDymrD2EUkSx) had the LLM emit two
+        # transfer_to("front_desk") tool calls in a single completion. Both
+        # reached create_sip_participant with the same participant_identity
+        # "transfer-front_desk"; two SIP legs landed in the room, the
+        # second clobbered the first, and the caller heard "ringing then
+        # dial tone" while front desk was actually already on the line.
+        # The flag is checked-and-set in the synchronous prefix of
+        # transfer_to before any await, so a parallel asyncio.gather of
+        # two coroutines will reliably see one True and short-circuit the
+        # second. _transfer_attempt is a monotonically increasing
+        # per-call counter used as a log tag and as a participant_identity
+        # suffix so even if the guard somehow fails (subclass override,
+        # future refactor) the two legs no longer collide on identity.
+        self._transfer_in_flight: bool = False
+        self._transfer_attempt: int = 0
+        # Registry of every transfer this agent code-path KICKED OFF,
+        # keyed by participant_identity ("transfer-front_desk",
+        # "transfer-eric", "transfer-front_desk-attempt2", ...). The
+        # entrypoint's participant_connected handler consults this to
+        # classify joining transfer-* participants as EXPECTED (we
+        # initiated, log under the right attempt id) vs UNEXPECTED (a
+        # SIP-level participant joined without going through any of our
+        # code paths — i.e. Twilio dial-out failover, external SIP REFER,
+        # or a misconfigured trunk). The 2026-06-16 production calls
+        # had transfer-front_desk OGGs appear in the recording set with
+        # NO matching transfer_to invocation anywhere in the transcript;
+        # this registry plus the UNEXPECTED log line is how we catch and
+        # diagnose that class of incident from the live logs.
+        #
+        # Entries: {identity: {"attempt_id": int, "initiated_via": str,
+        #                     "destination": str, "t_start": float,
+        #                     "t_connected": float | None,
+        #                     "t_failed": float | None}}
+        self._known_transfer_attempts: dict[str, dict] = {}
+        # Initiator hint, read-and-clear by transfer_to() on entry. The
+        # @function_tool LLM dispatch goes straight to transfer_to() and
+        # leaves this None (defaults to "llm_function_tool" inside). The
+        # silent-mode on_enter and intent-cache code paths set this
+        # immediately before calling transfer_to() so the diagnostic logs
+        # carry the right caller. There's no per-coroutine state — set
+        # synchronously, read synchronously at top of transfer_to before
+        # any await, so a parallel LLM call from gather() will see the
+        # default while the internal path's value is in-flight.
+        self._next_transfer_initiated_via: str | None = None
         # Intent-cache state: per-call. The cache fires on common static-fact
         # questions (pet fee, check-in time, etc.) so the LLM is skipped on
         # the easy turns. State tracks which response variants we've already
@@ -791,8 +850,12 @@ class IrisAgent(Agent):
             # side state.
             import time as _time
             _transfer_t0 = _time.monotonic()
-            log.info("transfer_to: starting (dest=%s)", IMMEDIATE_TRANSFER_DESTINATION)
+            log.info("transfer_to: starting (dest=%s) via=silent_mode_on_enter", IMMEDIATE_TRANSFER_DESTINATION)
             _status: str = ""
+            # Tag the initiator BEFORE the call so transfer_to's diagnostic
+            # logs attribute this attempt correctly. See __init__ for the
+            # registry's role in catching UNEXPECTED transfer participants.
+            self._next_transfer_initiated_via = "silent_mode_on_enter"
             try:
                 _transfer_result = await self.transfer_to(IMMEDIATE_TRANSFER_DESTINATION)
                 _transfer_elapsed = _time.monotonic() - _transfer_t0
@@ -1037,6 +1100,15 @@ class IrisAgent(Agent):
         # play between now and either pickup or no_answer.
         self._silent = True
         status = ""
+        # Tag the initiator BEFORE the call so transfer_to's diagnostic
+        # logs (and the _known_transfer_attempts registry consulted by
+        # the entrypoint participant_connected handler) attribute this
+        # attempt to the intent-cache code path, not the LLM tool path.
+        self._next_transfer_initiated_via = "intent_cache_post_action"
+        log.info(
+            "INTENT-CACHE invoking transfer_to(%s) via _execute_transfer_with_fallback",
+            destination,
+        )
         try:
             result_json = await self.transfer_to(destination)
             try:
@@ -1204,10 +1276,36 @@ class IrisAgent(Agent):
 
     @function_tool
     async def transfer_to(self, destination: str) -> str:
-        """Warm-transfer the caller to a human. `destination` is 'front_desk' or 'eric'. Iris stays on the call (silent) while the destination is connected, so the LiveKit recording captures the full conversation. The destination sees the hotel number as caller-ID, not the original caller's number. Returns JSON: status='connected' (destination joined the call) or status='no_answer' (timeout or rejected). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate."""
+        """Warm-transfer the caller to a human. `destination` is 'front_desk' or 'eric'. Iris stays on the call (silent) while the destination is connected, so the LiveKit recording captures the full conversation. The destination sees the hotel number as caller-ID, not the original caller's number. Returns JSON: status='connected' (destination joined the call), status='no_answer' (timeout or rejected), or status='already_in_progress' (another transfer attempt is currently in flight — do not call again on the same turn). On no_answer, follow the [Transfer Scope Rules] fallback: try the other destination if appropriate."""
+
+        # Synchronous prefix — no awaits until after we set the flag, so a
+        # parallel asyncio.gather of two transfer_to() coroutines (the
+        # 2026-06-15 production failure mode) reliably sees one True and
+        # short-circuits. See __init__ for the full incident write-up.
+        self._transfer_attempt += 1
+        attempt_id = self._transfer_attempt
+        # Read-and-clear the initiator hint. Internal callers (silent-mode
+        # on_enter, intent-cache post_action) set this just before calling
+        # us; the @function_tool LLM dispatch leaves it None.
+        initiated_via = self._next_transfer_initiated_via or "llm_function_tool"
+        self._next_transfer_initiated_via = None
+        tag = f"[xfer #{attempt_id} {destination} via={initiated_via}]"
+
+        if self._transfer_in_flight:
+            log.warning(
+                "%s SKIP: another transfer already in flight; "
+                "returning already_in_progress",
+                tag,
+            )
+            return json.dumps({
+                "status": "already_in_progress",
+                "destination": destination,
+                "attempt": attempt_id,
+            })
 
         target = TRANSFER_TARGETS.get(destination)
         if target is None:
+            log.warning("%s UNKNOWN destination", tag)
             return json.dumps({
                 "error": f"Unknown destination: {destination!r}",
                 "valid_destinations": list(TRANSFER_TARGETS),
@@ -1215,21 +1313,46 @@ class IrisAgent(Agent):
 
         sip_to, label, trunk_id = target
         if not trunk_id:
-            log.error(
-                "Transfer to %s requested but trunk env var is empty",
-                destination,
-            )
+            log.error("%s trunk env var for %s is empty", tag, destination)
             return json.dumps({
                 "error": f"{destination} routing is not configured on the agent.",
             })
         if self._room is None:
-            log.error("Transfer requested but agent has no room reference")
+            log.error("%s no room reference; cannot transfer", tag)
             return json.dumps({"error": "Internal: no room available."})
+
+        # Claim the in-flight slot immediately, BEFORE any await. The
+        # finally block at the bottom of the function resets it. Any new
+        # path added between here and the final return must funnel through
+        # the same finally, or _transfer_in_flight will be permanently
+        # stuck True for the rest of the call.
+        self._transfer_in_flight = True
+
         room_name = self._room.name
+        try:
+            _participants_before = sorted(
+                (getattr(p, "identity", "<no-id>") or "<no-id>")
+                for p in (
+                    getattr(self._room, "remote_participants", {}) or {}
+                ).values()
+            )
+        except Exception:
+            _participants_before = ["<error-enumerating>"]
         log.info(
-            "Warm-bridge transfer: %s -> %s via %s (room=%s)",
-            destination, sip_to, trunk_id, room_name,
+            "%s START sip_to=%s trunk=%s room=%s remote_participants=%s",
+            tag, sip_to, trunk_id, room_name, _participants_before,
         )
+
+        # Attempt-scoped identity. Without the suffix, a parallel duplicate
+        # transfer would reuse the same identity "transfer-front_desk" and
+        # the LiveKit server would treat the second join as a replacement
+        # of the first (kicking the already-answered front-desk leg).
+        # Including the attempt id makes each leg uniquely addressable and
+        # makes the per-track egress OGGs trivially correlatable with the
+        # log timeline ([xfer #N] suffix matches the OGG name suffix).
+        participant_identity = f"transfer-{destination}"
+        if attempt_id > 1:
+            participant_identity = f"{participant_identity}-attempt{attempt_id}"
 
         # Background ringback during the SIP ring wait. Same rationale as
         # the silent-mode (Port 2) fix: callers will hang up after ~13s of
@@ -1237,6 +1360,15 @@ class IrisAgent(Agent):
         # ringback (1.5s tone + ~3.5s pause) approximates US ring cadence
         # (2s on / 4s off) so the caller hears the line is alive while the
         # destination phone rings.
+        #
+        # ring_cycles is bumped each time the loop starts a new ring play.
+        # We log it on completion / failure so logs answer "how many rings
+        # did the caller actually hear before pickup / hangup". Useful for
+        # diagnosing the 2026-06-15 "ringing then dial tone" report — if
+        # ring_cycles is high but status=no_answer, ringback was running
+        # but the bridge never connected.
+        ring_cycles = 0
+
         async def _ringback_loop():
             # add_to_chat_ctx=False keeps the "__ringback_tone__" sentinel
             # out of the LLM's chat history. Without it, every ring would
@@ -1251,9 +1383,11 @@ class IrisAgent(Agent):
             # the destination picks up, because allow_interruptions=False
             # blocks user-driven interruption AND awaiting an async-cancel
             # doesn't stop already-queued audio. handle.interrupt() does.
+            nonlocal ring_cycles
             handle = None
             try:
                 while True:
+                    ring_cycles += 1
                     try:
                         try:
                             handle = self.session.say(
@@ -1267,7 +1401,7 @@ class IrisAgent(Agent):
                                 allow_interruptions=False,
                             )
                     except Exception:
-                        log.exception("Ringback say() failed; stopping loop")
+                        log.exception("%s ringback say() failed; stopping loop", tag)
                         return
                     try:
                         if hasattr(handle, "wait_for_playout"):
@@ -1279,7 +1413,7 @@ class IrisAgent(Agent):
                             try:
                                 handle.interrupt()
                             except Exception:
-                                log.exception("Could not interrupt in-flight ringback")
+                                log.exception("%s could not interrupt in-flight ringback", tag)
                         raise
                     handle = None
                     # 3.2s gap + 0.8s tone above = 4s ring cycle, close to
@@ -1292,11 +1426,28 @@ class IrisAgent(Agent):
                 # the interrupt.
                 raise
 
+        loop = asyncio.get_running_loop()
+        t_start = loop.time()
+        # Register this attempt in the registry BEFORE create_sip_participant
+        # fires. The entrypoint's participant_connected handler reads this
+        # to classify joining transfer-* participants as EXPECTED vs
+        # UNEXPECTED. Without this registration, a fast SIP answer (e.g.,
+        # frontdesk2 picking up in under a second) could fire
+        # participant_connected before we've recorded that we initiated
+        # the transfer — the handler would then mis-flag it as UNEXPECTED.
+        self._known_transfer_attempts[participant_identity] = {
+            "attempt_id": attempt_id,
+            "initiated_via": initiated_via,
+            "destination": destination,
+            "t_start": t_start,
+            "t_connected": None,
+            "t_failed": None,
+        }
         ringback_task: asyncio.Task | None = None
         try:
             ringback_task = asyncio.create_task(_ringback_loop())
         except Exception:
-            log.exception("Could not start ringback loop (continuing silently)")
+            log.exception("%s could not start ringback loop (continuing silently)", tag)
 
         async def _stop_ringback() -> None:
             if ringback_task is None or ringback_task.done():
@@ -1307,63 +1458,116 @@ class IrisAgent(Agent):
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # Everything below this point MUST run inside the try, so the
+        # finally below always clears _transfer_in_flight. Without that,
+        # a single exception path leaks the in-flight slot for the rest
+        # of the call and every subsequent transfer_to() returns
+        # already_in_progress until the call ends.
         try:
-            lk = api.LiveKitAPI()
+            log.info(
+                "%s create_sip_participant START identity=%s timeout=%ds",
+                tag, participant_identity, TRANSFER_RING_TIMEOUT_S,
+            )
+            t_csp = loop.time()
             try:
-                await lk.sip.create_sip_participant(
-                    api.CreateSIPParticipantRequest(
-                        sip_trunk_id=trunk_id,
-                        sip_call_to=sip_to,
-                        room_name=room_name,
-                        participant_identity=f"transfer-{destination}",
-                        participant_name=label,
-                        # play_dialtone=False: we play our own synthetic
-                        # ringback in the background loop above. Letting
-                        # LiveKit also play dialtone would double-stack
-                        # tones on the caller's line.
-                        play_dialtone=False,
-                        wait_until_answered=True,
-                        ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
+                lk = api.LiveKitAPI()
+                try:
+                    await lk.sip.create_sip_participant(
+                        api.CreateSIPParticipantRequest(
+                            sip_trunk_id=trunk_id,
+                            sip_call_to=sip_to,
+                            room_name=room_name,
+                            participant_identity=participant_identity,
+                            participant_name=label,
+                            # play_dialtone=False: we play our own synthetic
+                            # ringback in the background loop above. Letting
+                            # LiveKit also play dialtone would double-stack
+                            # tones on the caller's line.
+                            play_dialtone=False,
+                            wait_until_answered=True,
+                            ringing_timeout=timedelta(seconds=TRANSFER_RING_TIMEOUT_S),
+                        )
                     )
+                finally:
+                    await lk.aclose()
+            except Exception:
+                csp_elapsed = loop.time() - t_csp
+                log.exception(
+                    "%s create_sip_participant FAILED after %.2fs (ring_cycles=%d)",
+                    tag, csp_elapsed, ring_cycles,
                 )
-            finally:
-                await lk.aclose()
-        except Exception:
-            log.exception("Transfer to %s failed", destination)
+                # Stamp failure on the registry entry so the
+                # participant_disconnected log (if it fires for the
+                # ring-but-no-answer leg) can correlate.
+                self._known_transfer_attempts.get(
+                    participant_identity, {}
+                )["t_failed"] = loop.time()
+                await _stop_ringback()
+                return json.dumps({
+                    "status": "no_answer",
+                    "destination": destination,
+                    "display": label,
+                    "attempt": attempt_id,
+                    "elapsed_s": round(csp_elapsed, 2),
+                    "ring_cycles": ring_cycles,
+                })
+
+            csp_elapsed = loop.time() - t_csp
+            # Stamp connect on the registry entry; the participant_connected
+            # handler may already have fired or may fire imminently.
+            self._known_transfer_attempts.get(
+                participant_identity, {}
+            )["t_connected"] = loop.time()
             await _stop_ringback()
+            try:
+                _participants_after = sorted(
+                    (getattr(p, "identity", "<no-id>") or "<no-id>")
+                    for p in (
+                        getattr(self._room, "remote_participants", {}) or {}
+                    ).values()
+                )
+            except Exception:
+                _participants_after = ["<error-enumerating>"]
+            log.info(
+                "%s CONNECTED after %.2fs (ring_cycles=%d) "
+                "remote_participants=%s",
+                tag, csp_elapsed, ring_cycles, _participants_after,
+            )
+
+            # Auto-mute Iris's audio output and set _silent so subsequent STT
+            # turns short-circuit before the LLM. Without this, the LLM kept
+            # getting invoked on each STT event during the human-to-human
+            # conversation and, despite the [Transfer Scope Rules] prompt
+            # instructing it to stop responding, eventually broke in with
+            # phantom lines like "I'm sorry, I'm still on the line"
+            # (observed in production testing 2026-05-17). The LLM may still
+            # generate its prompt-mandated "You're connected — I'll step out"
+            # line via the tool-return path, but with output muted the caller
+            # never hears it — small UX loss for robust silencing. The egress
+            # recording captures all room audio regardless of Iris's mute
+            # state, so the human conversation is still preserved.
+            try:
+                self.session.output.set_audio_enabled(False)
+                log.info("%s muted Iris audio output", tag)
+            except Exception:
+                log.exception("%s could not mute audio output after connect", tag)
+            self._silent = True
+
             return json.dumps({
-                "status": "no_answer",
+                "status": "connected",
                 "destination": destination,
                 "display": label,
+                "attempt": attempt_id,
+                "elapsed_s": round(csp_elapsed, 2),
+                "ring_cycles": ring_cycles,
             })
-
-        await _stop_ringback()
-        log.info("Transfer to %s connected", destination)
-
-        # Auto-mute Iris's audio output and set _silent so subsequent STT
-        # turns short-circuit before the LLM. Without this, the LLM kept
-        # getting invoked on each STT event during the human-to-human
-        # conversation and, despite the [Transfer Scope Rules] prompt
-        # instructing it to stop responding, eventually broke in with
-        # phantom lines like "I'm sorry, I'm still on the line"
-        # (observed in production testing 2026-05-17). The LLM may still
-        # generate its prompt-mandated "You're connected — I'll step out"
-        # line via the tool-return path, but with output muted the caller
-        # never hears it — small UX loss for robust silencing. The egress
-        # recording captures all room audio regardless of Iris's mute
-        # state, so the human conversation is still preserved.
-        try:
-            self.session.output.set_audio_enabled(False)
-            log.info("Connected transfer: muted Iris audio output")
-        except Exception:
-            log.exception("Could not mute audio output after connected transfer")
-        self._silent = True
-
-        return json.dumps({
-            "status": "connected",
-            "destination": destination,
-            "display": label,
-        })
+        finally:
+            self._transfer_in_flight = False
+            total_elapsed = loop.time() - t_start
+            log.info(
+                "%s END in_flight cleared (total %.2fs, ring_cycles=%d)",
+                tag, total_elapsed, ring_cycles,
+            )
 
     @function_tool
     async def admin_set_voice(self, voice: str) -> str:
@@ -2161,6 +2365,52 @@ async def entrypoint(ctx: JobContext) -> None:
     log.info("Job received for room %s", ctx.room.name)
     await ctx.connect()
 
+    # Tell the diarize watcher this call is active so it pauses (or kills,
+    # on memory pressure) its in-flight batch. Best-effort: any failure
+    # here is logged but does NOT block the call. The watcher prunes
+    # stale flags by PID-liveness check, so a missed clear at shutdown
+    # just means at most one watcher poll cycle of incorrect "active"
+    # state — harmless.
+    _call_flag: Path | None = None
+    try:
+        CALL_ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+        # Filename format matches what diarize_watcher.prune_stale_call_flags
+        # parses: "call_<pid>_<sanitized_room>". Slash in room name (rare,
+        # but LiveKit allows it) would create a nested path on disk; flat
+        # filename keeps the parse trivial.
+        room_safe = ctx.room.name.replace("/", "_").replace("\\", "_")
+        _call_flag = CALL_ACTIVE_DIR / f"call_{os.getpid()}_{room_safe}"
+        _call_flag.write_text(
+            f"started_at={datetime.now(timezone.utc).isoformat()}\n"
+            f"pid={os.getpid()}\n"
+            f"room={ctx.room.name}\n"
+        )
+        log.info("Wrote call-active flag for diarize watcher: %s", _call_flag)
+    except Exception:
+        log.exception(
+            "Could not write call-active flag at %s (continuing — "
+            "diarize batch will not pause for this call)",
+            CALL_ACTIVE_DIR,
+        )
+
+    async def _clear_call_active_flag() -> None:
+        if _call_flag is None:
+            return
+        try:
+            _call_flag.unlink(missing_ok=True)
+            log.info("Cleared call-active flag: %s", _call_flag)
+        except Exception:
+            log.exception("Could not clear call-active flag at %s", _call_flag)
+
+    ctx.add_shutdown_callback(_clear_call_active_flag)
+
+    # Mutable holder for the agent instance — the room event handlers
+    # below are registered NOW (before participants arrive) but need to
+    # consult _known_transfer_attempts on the IrisAgent built ~150 lines
+    # down. Populated after agent construction; handlers read [0] if non-
+    # empty. List instead of dict so closures don't need `nonlocal`.
+    _agent_holder: list["IrisAgent"] = []
+
     # Diagnostic instrumentation 2026-05-15: log every participant
     # join/leave on this room so we can correlate Python-side state
     # with LiveKit-SIP bridge state. For silent-mode 5070 transfers
@@ -2168,35 +2418,117 @@ async def entrypoint(ctx: JobContext) -> None:
     # (2) the outbound SIP participant (frontdesk2) joining once the
     # transfer completes. If we see (2) join but audio doesn't flow,
     # the bug is in livekit-sip's RTP relay, not in our agent code.
+    #
+    # 2026-06-16 enhancement: classify joining transfer-* participants
+    # as EXPECTED (agent code initiated the transfer; the join matches
+    # an entry in _known_transfer_attempts) or UNEXPECTED (SIP-level
+    # routing outside the agent — Twilio failover, external SIP REFER).
+    # The production calls _+1529989800458_* on 6/16 had transfer-* OGGs
+    # appear WITHOUT any transfer_to invocation in the transcript JSON;
+    # this is how we catch that class of incident from the live logs.
     @ctx.room.on("participant_connected")
     def _on_pc(participant) -> None:
+        identity = getattr(participant, "identity", "<unknown>") or "<unknown>"
+        kind = getattr(participant, "kind", "<unknown>")
+        sid = getattr(participant, "sid", "<unknown>")
+        attrs = dict(getattr(participant, "attributes", {}) or {})
         log.info(
             "ROOM: participant_connected identity=%s kind=%s sid=%s attrs=%s",
-            getattr(participant, "identity", "<unknown>"),
-            getattr(participant, "kind", "<unknown>"),
-            getattr(participant, "sid", "<unknown>"),
-            dict(getattr(participant, "attributes", {}) or {}),
+            identity, kind, sid, attrs,
         )
+        if identity.startswith("transfer-"):
+            sip_attrs = {
+                k: v for k, v in attrs.items()
+                if k.lower().startswith("sip.")
+            }
+            agent = _agent_holder[0] if _agent_holder else None
+            known = (
+                getattr(agent, "_known_transfer_attempts", {}) or {}
+                if agent is not None else {}
+            )
+            if identity in known:
+                info = known[identity]
+                log.info(
+                    "TRANSFER PARTICIPANT JOINED — EXPECTED: identity=%s "
+                    "attempt=#%s via=%s destination=%s sip_attrs=%s",
+                    identity,
+                    info.get("attempt_id"),
+                    info.get("initiated_via"),
+                    info.get("destination"),
+                    sip_attrs,
+                )
+            else:
+                log.warning(
+                    "TRANSFER PARTICIPANT JOINED — UNEXPECTED: identity=%s "
+                    "kind=%s — no matching entry in _known_transfer_attempts. "
+                    "This means a transfer-prefixed SIP participant joined "
+                    "WITHOUT the agent's transfer_to() being the initiator. "
+                    "Likely sources: Twilio dial-out failover, external SIP "
+                    "REFER, or a misconfigured trunk fallback. "
+                    "Cross-check the Twilio console for outbound dials at "
+                    "this timestamp. sip_attrs=%s known_attempts=%s",
+                    identity, kind, sip_attrs, list(known.keys()),
+                )
 
     @ctx.room.on("participant_disconnected")
     def _on_pd(participant) -> None:
+        identity = getattr(participant, "identity", "<unknown>") or "<unknown>"
+        kind = getattr(participant, "kind", "<unknown>")
+        sid = getattr(participant, "sid", "<unknown>")
+        reason = getattr(participant, "disconnect_reason", "<unknown>")
         log.info(
             "ROOM: participant_disconnected identity=%s kind=%s sid=%s reason=%s",
-            getattr(participant, "identity", "<unknown>"),
-            getattr(participant, "kind", "<unknown>"),
-            getattr(participant, "sid", "<unknown>"),
-            getattr(participant, "disconnect_reason", "<unknown>"),
+            identity, kind, sid, reason,
         )
+        if identity.startswith("transfer-"):
+            agent = _agent_holder[0] if _agent_holder else None
+            known = (
+                getattr(agent, "_known_transfer_attempts", {}) or {}
+                if agent is not None else {}
+            )
+            info = known.get(identity)
+            if info is not None:
+                log.info(
+                    "TRANSFER PARTICIPANT LEFT: identity=%s attempt=#%s "
+                    "via=%s reason=%s (connected=%s, failed=%s)",
+                    identity,
+                    info.get("attempt_id"),
+                    info.get("initiated_via"),
+                    reason,
+                    info.get("t_connected") is not None,
+                    info.get("t_failed") is not None,
+                )
+            else:
+                log.warning(
+                    "TRANSFER PARTICIPANT LEFT — no registry entry: "
+                    "identity=%s reason=%s — same UNEXPECTED class as "
+                    "above. Likely externally initiated.",
+                    identity, reason,
+                )
 
     @ctx.room.on("track_subscribed")
     def _on_ts(track, publication, participant) -> None:
+        identity = getattr(participant, "identity", "<unknown>") or "<unknown>"
         log.info(
             "ROOM: track_subscribed from=%s kind=%s source=%s muted=%s",
-            getattr(participant, "identity", "<unknown>"),
+            identity,
             getattr(track, "kind", "<unknown>"),
             getattr(publication, "source", "<unknown>"),
             getattr(publication, "muted", "<unknown>"),
         )
+        # When a transfer-* participant publishes audio it's the clearest
+        # signal that the bridge is actually working (vs. just SIP-level
+        # connected). Production 2026-05-14/15 had cases where SIP showed
+        # both legs "Completed" but no audio frames flowed.
+        if identity.startswith("transfer-"):
+            log.info(
+                "TRANSFER AUDIO TRACK SUBSCRIBED: identity=%s — RTP relay "
+                "is delivering frames from this leg into the agent room. "
+                "If the caller still reports silence after this, the bridge "
+                "is one-way (caller → leg works, leg → caller doesn't); "
+                "check Twilio media-stream side.",
+                identity,
+            )
 
     @ctx.room.on("track_unsubscribed")
     def _on_tu(track, publication, participant) -> None:
@@ -2206,6 +2538,15 @@ async def entrypoint(ctx: JobContext) -> None:
             getattr(track, "kind", "<unknown>"),
             getattr(publication, "source", "<unknown>"),
         )
+
+    # Disconnect event on the room itself — fires when the agent's leg or
+    # the whole room ends. Reason codes help us tell "caller hung up" vs.
+    # "framework killed the session" vs. "SIP errored". Without this log
+    # the only signal we get for unexpected call termination is the
+    # transcript ending; this gives an authoritative reason.
+    @ctx.room.on("disconnected")
+    def _on_room_disc(reason=None) -> None:
+        log.info("ROOM: room disconnected reason=%s", reason)
 
     # Re-read voice state file in case admin_set_voice was called by an
     # earlier call AFTER this worker finished prewarming. Without this,
@@ -2259,7 +2600,14 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession(
         vad=silero.VAD.load(),
-        stt=deepgram.STT(model="nova-3"),
+        # Custom vocabulary: see agent/stt_vocabulary.py. Boosts hotel-
+        # specific proper nouns (Heceta, VRBO, Lighthouse Inn) and terms
+        # that recurred mis-transcribed in production (e.g., "river view"
+        # heard as "rivalry" on 2026-06-16). If the plugin version on the
+        # droplet doesn't expose `keywords=` (was added in 1.5.x), STT
+        # construction will TypeError loudly at startup — preferred over
+        # silently dropping the vocabulary.
+        stt=deepgram.STT(model="nova-3", keywords=HOTEL_KEYWORDS),
         # Sonnet 4.5 with three workarounds for known livekit-plugins-anthropic
         # bugs (see research notes / GitHub issues):
         #
@@ -2618,14 +2966,22 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(write_transcript)
     ctx.add_shutdown_callback(save_tts_cache)
 
+    iris = IrisAgent(
+        caller_phone=caller_phone,
+        persona=_persona_for(tts._opts.voice),
+        room=ctx.room,
+        called_number=called_number,
+    )
+    # Publish the agent instance to the event-handler holder defined at
+    # the top of entrypoint(), so participant_connected /
+    # participant_disconnected can consult _known_transfer_attempts to
+    # classify joining transfer-* participants. Without this, every
+    # handler call gets an empty registry and every transfer-* join
+    # gets logged as UNEXPECTED.
+    _agent_holder.append(iris)
     await session.start(
         room=ctx.room,
-        agent=IrisAgent(
-            caller_phone=caller_phone,
-            persona=_persona_for(tts._opts.voice),
-            room=ctx.room,
-            called_number=called_number,
-        ),
+        agent=iris,
     )
 
 
