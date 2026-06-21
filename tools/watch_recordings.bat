@@ -65,21 +65,21 @@ del "%TMP%" 2>nul
 
 if !NEW! gtr 0 echo [%TIME%] !NEW! new files added
 
-REM Per-call diarize trigger: kick the wrapper at low CPU priority when
-REM a new OGG arrived this cycle. The wrapper's single-instance lock
-REM keeps overlapping kicks (back-to-back calls) from launching the
-REM batch twice; the batch is idempotent so a single in-flight run will
-REM still pick up whatever arrived during its execution on its next
-REM invocation. Latency: ~5-10x realtime, so most calls have transcripts
-REM available within minutes of hangup, vs the nightly 2 AM batch.
-REM Fire-and-forget: the watcher loop keeps polling.
-if "!NEW_OGG!"=="1" (
-    echo [%TIME%] kicking diarize at low priority
-    REM "diarize" title gives the minimized taskbar tile a name.
-    REM /min: open the new console minimized so diarize output doesn't
-    REM steal focus. /low: idle CPU priority class - python inherits it.
-    start "diarize" /min /low "%~dp0run_diarize_lowprio.bat"
-)
+REM Per-call diarize trigger when a new OGG arrived this cycle. The
+REM wrapper has its own single-instance lock so overlapping kicks from
+REM back-to-back calls just no-op; the batch itself is idempotent.
+REM Latency target: ~5-10x realtime end-to-end.
+REM
+REM Implementation note: we avoid a parenthesized if-block here. cmd.exe
+REM collapses newlines inside a (..) block to & separators and then
+REM re-tokenizes, which makes REM comments inside the body unsafe -
+REM /min: and /low: in a REM line get parsed as switches, swallow the
+REM word prefix, and the tail (e.g. her from watcher, imized from
+REM minimized) is run as a phantom command. Burned us on 2026-06-16.
+REM Single-condition goto-skip avoids the whole class of parser issues.
+if not "!NEW_OGG!"=="1" goto :sleep
+echo [%TIME%] kicking diarize at low priority
+start "diarize" /min /low "%~dp0run_diarize_lowprio.bat"
 
 :sleep
 timeout /t %INTERVAL% /nobreak >nul

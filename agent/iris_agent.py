@@ -64,7 +64,7 @@ from audio_cache import TTSAudioCache
 from intent_cache import DEFAULT_CACHE as INTENT_CACHE, IntentCallState
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
-from stt_vocabulary import HOTEL_KEYWORDS
+from stt_vocabulary import HOTEL_KEYTERMS
 import aec  # WebRTC AEC wiring to suppress self-echo of Iris's TTS
 
 load_dotenv()
@@ -2600,14 +2600,15 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession(
         vad=silero.VAD.load(),
-        # Custom vocabulary: see agent/stt_vocabulary.py. Boosts hotel-
-        # specific proper nouns (Heceta, VRBO, Lighthouse Inn) and terms
-        # that recurred mis-transcribed in production (e.g., "river view"
-        # heard as "rivalry" on 2026-06-16). If the plugin version on the
-        # droplet doesn't expose `keywords=` (was added in 1.5.x), STT
-        # construction will TypeError loudly at startup — preferred over
-        # silently dropping the vocabulary.
-        stt=deepgram.STT(model="nova-3", keywords=HOTEL_KEYWORDS),
+        # Custom vocabulary: see agent/stt_vocabulary.py. Nova-3 uses
+        # Keyterm Prompting (param `keyterm`, plain string list). The
+        # plugin's _validate_keyterm REJECTS `keywords=` on Nova-3 with
+        # a ValueError inside __init__; that crashes the entrypoint
+        # silently per-call and the caller gets no answer. Production
+        # was broken for 4 days (2026-06-16 to 2026-06-20) before this
+        # bug was caught. Do NOT switch to `keywords=` for Nova-3
+        # regardless of how convenient the boost values look.
+        stt=deepgram.STT(model="nova-3", keyterm=HOTEL_KEYTERMS),
         # Sonnet 4.5 with three workarounds for known livekit-plugins-anthropic
         # bugs (see research notes / GitHub issues):
         #
