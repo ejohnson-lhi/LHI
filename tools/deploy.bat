@@ -10,10 +10,13 @@ setlocal enabledelayedexpansion
 
 if exist "%SystemRoot%\Sysnative\OpenSSH\ssh.exe" (
     set "SSH=%SystemRoot%\Sysnative\OpenSSH\ssh.exe"
+    set "SCP=%SystemRoot%\Sysnative\OpenSSH\scp.exe"
 ) else if exist "%SystemRoot%\System32\OpenSSH\ssh.exe" (
     set "SSH=%SystemRoot%\System32\OpenSSH\ssh.exe"
+    set "SCP=%SystemRoot%\System32\OpenSSH\scp.exe"
 ) else (
     set "SSH=ssh"
+    set "SCP=scp"
 )
 
 set "REMOTE=iris@64.23.167.164"
@@ -139,7 +142,7 @@ REM don't run, and deploy.bat shows the failure clearly. This catches
 REM bad deploys that LOOK healthy (process up, registered) but crash
 REM the per-call entrypoint — the failure mode that hid for 4 days
 REM (2026-06-16 to 06-20) with the keywords/keyterm bug.
-"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && (test -f /tmp/iris_deploy_env_in.txt && bash tools/sync_deploy_env.sh /tmp/iris_deploy_env_in.txt /opt/iris-backend/backend/.env && rm /tmp/iris_deploy_env_in.txt || true) && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo cp -u deploy/iris-backend.service /etc/systemd/system/iris-backend.service && sudo cp -u deploy/iris-diarize-watcher.service /etc/systemd/system/iris-diarize-watcher.service && sudo cp -u deploy/iris-smoke-test.service /etc/systemd/system/iris-smoke-test.service && sudo cp -u deploy/iris-smoke-test.timer /etc/systemd/system/iris-smoke-test.timer && (sudo test -f /etc/cron.d/iris-diarize && sudo mv /etc/cron.d/iris-diarize /etc/cron.d/iris-diarize.disabled || true) && sudo systemctl daemon-reload && sudo systemctl enable iris-diarize-watcher.service && sudo systemctl enable iris-smoke-test.timer && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && sudo systemctl restart iris-diarize-watcher.service && sudo systemctl restart iris-smoke-test.timer && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12 && echo --- iris-diarize-watcher --- && sudo systemctl status iris-diarize-watcher.service --no-pager -l | head -12 && echo --- post-deploy smoke test (waiting 30s for agent prewarm + register) --- && sleep 30 && (sudo systemctl start --wait iris-smoke-test.service ; sudo journalctl -u iris-smoke-test.service --no-pager -n 40 ; sudo systemctl is-failed --quiet iris-smoke-test.service && exit 1 || true)"
+"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && (test -f /tmp/iris_deploy_env_in.txt && bash tools/sync_deploy_env.sh /tmp/iris_deploy_env_in.txt /opt/iris-backend/backend/.env && rm /tmp/iris_deploy_env_in.txt || true) && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo cp -u deploy/iris-backend.service /etc/systemd/system/iris-backend.service && sudo cp -u deploy/iris-diarize-watcher.service /etc/systemd/system/iris-diarize-watcher.service && sudo cp -u deploy/iris-smoke-test.service /etc/systemd/system/iris-smoke-test.service && sudo cp -u deploy/iris-smoke-test.timer /etc/systemd/system/iris-smoke-test.timer && (sudo test -f /etc/cron.d/iris-diarize && sudo mv /etc/cron.d/iris-diarize /etc/cron.d/iris-diarize.disabled || true) && sudo systemctl daemon-reload && sudo systemctl enable iris-diarize-watcher.service && sudo systemctl enable iris-smoke-test.timer && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && sudo systemctl restart iris-diarize-watcher.service && sudo systemctl restart iris-smoke-test.timer && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12 && echo --- iris-diarize-watcher --- && sudo systemctl status iris-diarize-watcher.service --no-pager -l | head -12 && echo --- post-deploy smoke test - waiting 30s for agent prewarm and register --- && sleep 30 && (sudo systemctl start --wait iris-smoke-test.service ; sudo journalctl -u iris-smoke-test.service --no-pager -n 40 ; sudo systemctl is-failed --quiet iris-smoke-test.service && exit 1 || true)"
 if errorlevel 1 (
     echo.
     echo *** DEPLOY ALERT: SSH chain returned non-zero. Likely the smoke test FAILED.
