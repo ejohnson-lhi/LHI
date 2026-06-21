@@ -25,6 +25,13 @@ SMS hasn't been approved by the user yet. When approved, uncomment the
 real send in `_alert()`. The log line is intentionally easy to grep
 (`journalctl -u iris-smoke-test.service | grep WOULD-SEND-SMS`).
 
+Implementation note: we talk to Twilio's REST API via httpx instead of
+the `twilio` Python SDK, because httpx is already a backend dependency
+(FastAPI uses it) and the SDK is not installed in the backend venv.
+The API surface we need is small — calls.create() + calls.fetch() +
+messages.create() — and the requests are simple form-encoded POSTs
+with HTTP Basic auth.
+
 Required env vars:
   TWILIO_ACCOUNT_SID     — Twilio account credentials (already in
   TWILIO_AUTH_TOKEN        iris-backend's .env if it sends Twilio
@@ -51,7 +58,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from twilio.rest import Client as TwilioClient
+import httpx
 
 log = logging.getLogger("iris_smoke_test")
 logging.basicConfig(
@@ -69,6 +76,37 @@ REQUIRED_ENV = (
 MIN_DURATION_S = int(os.environ.get("IRIS_SMOKE_TEST_MIN_DURATION_S", "5"))
 MAX_WAIT_S = int(os.environ.get("IRIS_SMOKE_TEST_MAX_WAIT_S", "30"))
 POLL_INTERVAL_S = 2
+TWILIO_API = "https://api.twilio.com/2010-04-01"
+
+
+def _twilio_auth() -> tuple[str, str]:
+    return (
+        os.environ["TWILIO_ACCOUNT_SID"],
+        os.environ["TWILIO_AUTH_TOKEN"],
+    )
+
+
+def _twilio_create_call(to: str, frm: str, twiml: str) -> str:
+    """POST Calls.json. Returns the call SID."""
+    sid = os.environ["TWILIO_ACCOUNT_SID"]
+    url = f"{TWILIO_API}/Accounts/{sid}/Calls.json"
+    data = {"To": to, "From": frm, "Twiml": twiml}
+    r = httpx.post(url, auth=_twilio_auth(), data=data, timeout=15.0)
+    r.raise_for_status()
+    payload = r.json()
+    call_sid = payload.get("sid")
+    if not call_sid:
+        raise RuntimeError(f"Twilio response missing sid: {payload!r}")
+    return call_sid
+
+
+def _twilio_fetch_call(call_sid: str) -> dict:
+    """GET Calls/<sid>.json. Returns the call resource as a dict."""
+    sid = os.environ["TWILIO_ACCOUNT_SID"]
+    url = f"{TWILIO_API}/Accounts/{sid}/Calls/{call_sid}.json"
+    r = httpx.get(url, auth=_twilio_auth(), timeout=10.0)
+    r.raise_for_status()
+    return r.json()
 
 
 def _alert(message: str, recipient: str) -> None:
@@ -80,7 +118,7 @@ def _alert(message: str, recipient: str) -> None:
          registered for A2P 10DLC if sending to US numbers).
       2. Confirm `IRIS_SMOKE_TEST_ALERT_TO` is your cell and you've
          consented to automated messages from this number.
-      3. Uncomment the `client.messages.create(...)` block below.
+      3. Uncomment the `_send_sms(...)` call below.
       4. Re-deploy; the WOULD-SEND-SMS log lines will be replaced with
          actual sends.
     """
@@ -89,19 +127,21 @@ def _alert(message: str, recipient: str) -> None:
         "to=%s message=%r",
         recipient, message,
     )
-    # client = TwilioClient(
-    #     os.environ["TWILIO_ACCOUNT_SID"],
-    #     os.environ["TWILIO_AUTH_TOKEN"],
-    # )
-    # try:
-    #     client.messages.create(
-    #         to=recipient,
-    #         from_=os.environ["IRIS_SMOKE_TEST_SMS_FROM"],
-    #         body=message,
-    #     )
-    #     log.info("Alert SMS sent to %s", recipient)
-    # except Exception:
-    #     log.exception("Could not send alert SMS to %s", recipient)
+    # _send_sms(recipient, message)
+
+
+def _send_sms(to: str, body: str) -> None:
+    """POST Messages.json. Only used once SMS sending is enabled."""
+    sid = os.environ["TWILIO_ACCOUNT_SID"]
+    sender = os.environ["IRIS_SMOKE_TEST_SMS_FROM"]
+    url = f"{TWILIO_API}/Accounts/{sid}/Messages.json"
+    data = {"To": to, "From": sender, "Body": body}
+    try:
+        r = httpx.post(url, auth=_twilio_auth(), data=data, timeout=15.0)
+        r.raise_for_status()
+        log.info("Alert SMS sent to %s", to)
+    except Exception:
+        log.exception("Could not send alert SMS to %s", to)
 
 
 def main() -> int:
@@ -120,11 +160,6 @@ def main() -> int:
         frm, to, MIN_DURATION_S, MAX_WAIT_S,
     )
 
-    client = TwilioClient(
-        os.environ["TWILIO_ACCOUNT_SID"],
-        os.environ["TWILIO_AUTH_TOKEN"],
-    )
-
     # TwiML: stay on the line for MIN_DURATION + a small buffer, then
     # hang up. Gives Iris time to answer + start her greeting; we hang
     # up before the conversation could go anywhere.
@@ -134,9 +169,9 @@ def main() -> int:
     started_at = datetime.now(timezone.utc)
     start_mono = time.monotonic()
     try:
-        call = client.calls.create(to=to, from_=frm, twiml=twiml)
+        call_sid = _twilio_create_call(to, frm, twiml)
     except Exception:
-        log.exception("Twilio calls.create() FAILED")
+        log.exception("Twilio Calls.create() FAILED")
         msg = (
             f"Iris smoke test FAILED {started_at.isoformat(timespec='seconds')}: "
             f"could not place call via Twilio API. Service may be down. "
@@ -145,23 +180,23 @@ def main() -> int:
         _alert(msg, alert_to)
         return 1
 
-    log.info("Call SID: %s — polling status...", call.sid)
+    log.info("Call SID: %s — polling status...", call_sid)
 
     final_status: str | None = None
     duration_s = 0
     while time.monotonic() - start_mono < MAX_WAIT_S:
         time.sleep(POLL_INTERVAL_S)
         try:
-            fetched = client.calls(call.sid).fetch()
+            fetched = _twilio_fetch_call(call_sid)
         except Exception:
-            log.exception("Twilio calls(...).fetch() failed; will retry")
+            log.exception("Twilio Calls.fetch() failed; will retry")
             continue
-        status = fetched.status
+        status = fetched.get("status") or ""
         log.info("  ...status=%s", status)
         if status in ("completed", "failed", "busy", "no-answer", "canceled"):
             final_status = status
             try:
-                duration_s = int(fetched.duration or 0)
+                duration_s = int(fetched.get("duration") or 0)
             except (TypeError, ValueError):
                 duration_s = 0
             break
@@ -173,7 +208,7 @@ def main() -> int:
         )
         msg = (
             f"Iris smoke test FAILED {started_at.isoformat(timespec='seconds')}: "
-            f"call {call.sid} did not complete within {MAX_WAIT_S}s. "
+            f"call {call_sid} did not complete within {MAX_WAIT_S}s. "
             f"Either the call hung, LiveKit is unreachable, or the "
             f"dev DID isn't routing. Check journalctl -u iris-agent.service."
         )
@@ -188,7 +223,7 @@ def main() -> int:
 
     msg = (
         f"Iris smoke test FAILED {started_at.isoformat(timespec='seconds')}: "
-        f"call {call.sid} status={final_status} duration={duration_s}s "
+        f"call {call_sid} status={final_status} duration={duration_s}s "
         f"(needed status=completed AND duration>={MIN_DURATION_S}s). "
         f"Check journalctl -u iris-agent.service for the per-call error."
     )
