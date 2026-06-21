@@ -1,0 +1,19 @@
+[Unit]
+Description=Iris smoke test every 3 hours
+# Run the oneshot service on this schedule.
+
+[Timer]
+# First run 5 min after boot — gives the agent service time to prewarm
+# + register with LiveKit before we poke it.
+OnBootSec=5min
+# Then every 3 hours. RandomizedDelaySec keeps multiple smoke-tests from
+# clustering at exactly :00 :03 :06 etc. across the fleet (which is a
+# fleet of one today, but cheap to set).
+OnUnitActiveSec=3h
+RandomizedDelaySec=2min
+# If the droplet was off when a run was due, fire it on next boot
+# rather than skipping to the next 3h window.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

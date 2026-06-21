@@ -5,6 +5,15 @@ Description=Iris LiveKit agent worker
 # avoids restart-loop noise on droplet reboot.
 After=network.target docker.service
 Wants=docker.service
+# Flip the unit to "failed" state after 3 quick restart attempts in 60s.
+# Combined with the prewarm-time _smoke_test_constructors() in iris_agent.py,
+# a bad deploy (e.g., the keywords/keyterm bug that hit 2026-06-16 to 06-20)
+# causes the worker to fail prewarm 3x and then systemctl status shows red.
+# deploy.bat's status-check step and any external uptime monitor can see it.
+# Without StartLimit, Restart=always would just retry the broken process
+# forever, hiding the failure from operational checks.
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple

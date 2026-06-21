@@ -1,0 +1,36 @@
+# Local-only env var values synced to /opt/iris-backend/backend/.env on
+# the droplet by deploy.bat. Same pattern as tools/.deploy_msg: this
+# template is in git, .deploy_env is gitignored.
+#
+# HOW TO USE
+#   1. Copy this file to .deploy_env next to it:
+#        copy tools\.deploy_env.template tools\.deploy_env
+#   2. Edit tools/.deploy_env and fill in real values.
+#   3. Run deploy.bat as usual; the file is SCP'd to the droplet and
+#      tools/sync_deploy_env.sh merges its KEY=VALUE lines into
+#      /opt/iris-backend/backend/.env before the services restart.
+#
+# Format
+#   Standard .env: one KEY=value per line. Blank lines and # comments
+#   ignored. Values should not be quoted unless you intend the quotes
+#   to be part of the value.
+#
+# Idempotency
+#   The sync removes any existing line with the same KEY before
+#   appending the new one — so editing a value here and re-deploying
+#   updates it cleanly on the droplet.
+
+# Iris smoke-test config (tools/iris_smoke_test.py).
+# IRIS_SMOKE_TEST_TO     — the dev DID Iris answers on (the chatty one,
+#                          not the silent-mode immediate-transfer DID).
+# IRIS_SMOKE_TEST_FROM   — a Twilio number you own to use as caller-ID
+#                          on the test call. Reuse TWILIO_TOLLFREE_NUMBER
+#                          if you don't have a dedicated test number;
+#                          test calls will then show up in the dashboard
+#                          with the toll-free as caller-ID.
+# IRIS_SMOKE_TEST_ALERT_TO — your cell, E.164 format. Logged only until
+#                          SMS sending is approved (see iris_smoke_test.py
+#                          _alert() comment for how to enable).
+IRIS_SMOKE_TEST_TO=+1XXXXXXXXXX
+IRIS_SMOKE_TEST_FROM=+1XXXXXXXXXX
+IRIS_SMOKE_TEST_ALERT_TO=+1XXXXXXXXXX

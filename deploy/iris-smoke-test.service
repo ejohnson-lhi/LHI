@@ -1,0 +1,35 @@
+[Unit]
+Description=Iris synthetic-call smoke test (oneshot)
+# Don't run if iris-agent is down — would always fail. Allow run-after
+# so a stuck timer firing while the agent is restarting still completes
+# meaningfully (it'll fail and log).
+After=network.target iris-agent.service
+
+[Service]
+Type=oneshot
+User=iris
+Group=iris
+WorkingDirectory=/opt/iris-backend
+
+# The script needs Twilio creds + the IRIS_SMOKE_TEST_* config. We load
+# backend's .env (which already holds TWILIO_ACCOUNT_SID/AUTH_TOKEN for
+# the SIP trunk) and rely on the operator to add the IRIS_SMOKE_TEST_*
+# vars there as well. Missing vars cause exit code 2 with a clear log.
+EnvironmentFile=/opt/iris-backend/backend/.env
+
+# Backend venv has the twilio SDK installed (used elsewhere for SMS).
+# Reusing it avoids a third venv just for this one script.
+ExecStart=/opt/iris-backend/backend/.venv/bin/python /opt/iris-backend/tools/iris_smoke_test.py
+
+# Hardening (matches the agent unit).
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/iris-backend/recordings
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iris-smoke-test
+
+[Install]
+WantedBy=multi-user.target

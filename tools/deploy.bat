@@ -91,6 +91,28 @@ if errorlevel 1 (
 )
 echo.
 
+REM If tools\.deploy_env exists locally (gitignored Windows-side file
+REM with KEY=VALUE lines), SCP it to the droplet so the SSH chain below
+REM can merge it into /opt/iris-backend/backend/.env via
+REM tools/sync_deploy_env.sh. Mirrors the .deploy_msg / commit-message
+REM pattern so the user's source of truth for env-var tweaks stays on
+REM this PC. If the file is absent, the sync step in the SSH chain
+REM short-circuits with no error.
+set "DEPLOY_ENV_FILE=%~dp0.deploy_env"
+if exist "%DEPLOY_ENV_FILE%" (
+    echo === Sending local .deploy_env to droplet ===
+    "%SCP%" -q "%DEPLOY_ENV_FILE%" "%REMOTE%:/tmp/iris_deploy_env_in.txt"
+    if errorlevel 1 (
+        echo.
+        echo .deploy_env SCP failed. Aborting deploy.
+        goto :end
+    )
+) else (
+    echo No tools\.deploy_env present; skipping env sync.
+    echo ^(Copy tools\.deploy_env.template to tools\.deploy_env to enable.^)
+)
+echo.
+
 echo === Pulling on droplet, syncing deps, restarting all services ===
 REM On the droplet: pull, run pip install (idempotent; picks up any new
 REM dependency from backend/pyproject.toml so we don't crash-loop the
@@ -106,9 +128,27 @@ REM Legacy cron disable: the watcher replaces /etc/cron.d/iris-diarize.
 REM First deploy renames the cron file to .disabled; subsequent deploys
 REM no-op via the test -f check.
 REM
-REM systemctl enable for the watcher is idempotent — first deploy
-REM enables for boot, subsequent deploys do nothing.
-"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo cp -u deploy/iris-backend.service /etc/systemd/system/iris-backend.service && sudo cp -u deploy/iris-diarize-watcher.service /etc/systemd/system/iris-diarize-watcher.service && (sudo test -f /etc/cron.d/iris-diarize && sudo mv /etc/cron.d/iris-diarize /etc/cron.d/iris-diarize.disabled || true) && sudo systemctl daemon-reload && sudo systemctl enable iris-diarize-watcher.service && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && sudo systemctl restart iris-diarize-watcher.service && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12 && echo --- iris-diarize-watcher --- && sudo systemctl status iris-diarize-watcher.service --no-pager -l | head -12"
+REM systemctl enable for the watcher / smoke-test is idempotent — first
+REM deploy enables for boot, subsequent deploys do nothing.
+REM
+REM Post-deploy smoke test: after restarting all three services, sleep
+REM 30s (lets iris-agent finish prewarm + register with LiveKit), then
+REM invoke iris_smoke_test.py once via SSH. Its exit code is propagated
+REM by &&: a failed smoke test breaks the chain, the next echo lines
+REM don't run, and deploy.bat shows the failure clearly. This catches
+REM bad deploys that LOOK healthy (process up, registered) but crash
+REM the per-call entrypoint — the failure mode that hid for 4 days
+REM (2026-06-16 to 06-20) with the keywords/keyterm bug.
+"%SSH%" %REMOTE% "cd /opt/iris-backend && git pull && (test -f /tmp/iris_deploy_env_in.txt && bash tools/sync_deploy_env.sh /tmp/iris_deploy_env_in.txt /opt/iris-backend/backend/.env && rm /tmp/iris_deploy_env_in.txt || true) && sudo -u iris /opt/iris-backend/backend/.venv/bin/pip install -e /opt/iris-backend/backend && sudo cp -u deploy/iris-agent.service /etc/systemd/system/iris-agent.service && sudo cp -u deploy/iris-backend.service /etc/systemd/system/iris-backend.service && sudo cp -u deploy/iris-diarize-watcher.service /etc/systemd/system/iris-diarize-watcher.service && sudo cp -u deploy/iris-smoke-test.service /etc/systemd/system/iris-smoke-test.service && sudo cp -u deploy/iris-smoke-test.timer /etc/systemd/system/iris-smoke-test.timer && (sudo test -f /etc/cron.d/iris-diarize && sudo mv /etc/cron.d/iris-diarize /etc/cron.d/iris-diarize.disabled || true) && sudo systemctl daemon-reload && sudo systemctl enable iris-diarize-watcher.service && sudo systemctl enable iris-smoke-test.timer && sudo systemctl restart iris-agent.service && sudo systemctl restart iris-backend.service && sudo systemctl restart iris-diarize-watcher.service && sudo systemctl restart iris-smoke-test.timer && echo --- iris-agent --- && sudo systemctl status iris-agent.service --no-pager -l | head -12 && echo --- iris-backend --- && sudo systemctl status iris-backend.service --no-pager -l | head -12 && echo --- iris-diarize-watcher --- && sudo systemctl status iris-diarize-watcher.service --no-pager -l | head -12 && echo --- post-deploy smoke test (waiting 30s for agent prewarm + register) --- && sleep 30 && (sudo systemctl start --wait iris-smoke-test.service ; sudo journalctl -u iris-smoke-test.service --no-pager -n 40 ; sudo systemctl is-failed --quiet iris-smoke-test.service && exit 1 || true)"
+if errorlevel 1 (
+    echo.
+    echo *** DEPLOY ALERT: SSH chain returned non-zero. Likely the smoke test FAILED.
+    echo *** Review the iris-smoke-test journal output above. If the failure says
+    echo *** "Missing required env vars", set IRIS_SMOKE_TEST_TO / IRIS_SMOKE_TEST_FROM
+    echo *** / IRIS_SMOKE_TEST_ALERT_TO / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN in
+    echo *** /opt/iris-backend/backend/.env and rerun this script.
+    echo.
+)
 
 REM Clear the message file so a stale message doesn't get reused on the next run.
 if exist "%MSG_FILE%" del "%MSG_FILE%"

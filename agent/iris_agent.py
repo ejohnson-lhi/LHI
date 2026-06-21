@@ -2212,7 +2212,88 @@ class IrisAgent(Agent):
 # =============================================================================
 
 
+def _smoke_test_constructors() -> None:
+    """Validate per-call object constructors at worker boot.
+
+    Catches the class of bug where a plugin's __init__ raises on config
+    it doesn't like — e.g. passing keywords=... to deepgram Nova-3,
+    which silently broke production for 4 days (2026-06-16 to 06-20).
+    The crash there happened INSIDE the per-call entrypoint() coroutine,
+    so the main worker process stayed alive, registered as healthy with
+    LiveKit, and accepted dispatch — every call landed in a forkserver
+    subprocess that died on STT construction. No alert, no service
+    failure, just dead air to the caller.
+
+    Running the same constructors here at prewarm time surfaces those
+    bugs as a worker-startup failure. Combined with StartLimitBurst on
+    the systemd unit, three rapid restart loops flip the service to
+    failed state and `systemctl status` shows red — visible to the
+    deploy script and an external uptime monitor.
+
+    Each constructor here MUST use the EXACT same kwargs that
+    entrypoint() will use. Keep this function and the entrypoint
+    AgentSession construction in sync.
+    """
+    log.info("Smoke-testing per-call object constructors...")
+
+    # Deepgram STT — same kwargs as entrypoint(). The keyterm vs
+    # keywords mismatch on Nova-3 is what bit us.
+    try:
+        deepgram.STT(model="nova-3", keyterm=HOTEL_KEYTERMS)
+        log.info("  Deepgram STT: OK")
+    except Exception:
+        log.exception("  Deepgram STT: FAILED — see traceback above")
+        raise
+
+    # Anthropic LLM — same kwargs as entrypoint(). Catches missing
+    # ANTHROPIC_API_KEY (KeyError) and any malformed client config.
+    # Does NOT exercise the API; that's Layer C's job.
+    try:
+        _client = anthropic_sdk.AsyncClient(
+            api_key=os.environ["ANTHROPIC_API_KEY"],
+            http_client=httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, read=60.0, write=10.0, pool=10.0),
+            ),
+        )
+        anthropic.LLM(
+            model="claude-sonnet-4-5",
+            client=_client,
+            _strict_tool_schema=False,
+            caching="ephemeral",
+        )
+        log.info("  Anthropic LLM: OK")
+    except KeyError as e:
+        log.error("  Anthropic LLM: FAILED — env var %s missing", e)
+        raise
+    except Exception:
+        log.exception("  Anthropic LLM: FAILED — see traceback above")
+        raise
+
+    # Silero VAD — actual model load happens at entrypoint. The
+    # constructor here is cheap and just registers the model class.
+    # Skip explicit test; if silero is broken, Kokoro prewarm below
+    # would also fail since both come from the same livekit install.
+
+    # Vocabulary sanity — empty or non-string entries would fail at
+    # the API call, not at construction, so check explicitly.
+    if not HOTEL_KEYTERMS:
+        raise RuntimeError("HOTEL_KEYTERMS is empty — STT vocab not wired")
+    if not all(isinstance(t, str) and t.strip() for t in HOTEL_KEYTERMS):
+        raise RuntimeError(
+            "HOTEL_KEYTERMS contains non-string or empty entries — "
+            "Nova-3 keyterm prompting expects a list of plain strings",
+        )
+    log.info("  HOTEL_KEYTERMS: %d entries, all strings", len(HOTEL_KEYTERMS))
+
+    log.info("Smoke-test passed.")
+
+
 def prewarm(proc: JobProcess) -> None:
+    # Fail-fast on bad config before doing the expensive Kokoro load.
+    # Any exception here propagates out of prewarm, the worker process
+    # exits with non-zero, and systemd's Restart=always + StartLimit*
+    # gates will mark the unit failed after 3 quick restarts.
+    _smoke_test_constructors()
     log.info("Prewarming Kokoro TTS model...")
     # Cache loads any previously-saved entries from disk on construction —
     # so the greeting (and accumulated LLM phrasings) survive worker

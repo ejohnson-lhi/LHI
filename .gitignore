@@ -79,3 +79,9 @@ tools/tts_ab/iris_snapshot.json
 # --- Deploy helper: next-commit message written by Claude, consumed by
 # deploy.bat. Local only - each commit's actual message lands in git history.
 tools/.deploy_msg
+
+# --- Deploy helper: local-only env var values (smoke test config etc.),
+# SCP'd by deploy.bat to the droplet and merged into backend/.env via
+# tools/sync_deploy_env.sh. Mirrors the .deploy_msg pattern. The
+# .template version is committed so the structure is discoverable.
+tools/.deploy_env
