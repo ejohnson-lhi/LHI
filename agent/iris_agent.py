@@ -65,6 +65,7 @@ from intent_cache import DEFAULT_CACHE as INTENT_CACHE, IntentCallState
 from iris_prompt import build_system_prompt
 from kokoro_tts import KokoroTTS
 from stt_vocabulary import HOTEL_KEYTERMS
+import sip_ping
 import aec  # WebRTC AEC wiring to suppress self-echo of Iris's TTS
 
 load_dotenv()
@@ -140,6 +141,17 @@ ADMIN_PHONE = os.environ.get("IRIS_ADMIN_PHONE", "")
 # Domain Voice URL).
 OUTBOUND_TRUNK_ID = os.environ.get("IRIS_OUTBOUND_TRUNK_ID", "")
 FRONTDESK_TRUNK_ID = os.environ.get("IRIS_FRONTDESK_TRUNK_ID", "")
+
+# SIP domain backing the FRONTDESK_TRUNK_ID — used for the SIP OPTIONS
+# pre-flight ping (see sip_ping.py + on_enter). This domain isn't
+# directly used by LiveKit's create_sip_participant (which uses the
+# trunk ID alone), but the OPTIONS ping bypasses LiveKit and talks to
+# Twilio's SIP edge directly to check reachability while Iris's
+# greeting plays. Default matches the production deployment as
+# observed in sip.hostname participant attrs from the agent journal.
+FRONTDESK_SIP_DOMAIN = os.environ.get(
+    "IRIS_FRONTDESK_SIP_DOMAIN", "lighthouseinn-frontdesk.sip.twilio.com",
+)
 
 # Warm-transfer destinations. Each entry is (call_to, label, trunk_id):
 #   - call_to: SIP user (for SIP-Domain trunk) or E.164 number (PSTN trunk)
@@ -764,6 +776,16 @@ class IrisAgent(Agent):
         # any await, so a parallel LLM call from gather() will see the
         # default while the internal path's value is in-flight.
         self._next_transfer_initiated_via: str | None = None
+        # SIP health probe results, keyed by user-part of the destination
+        # (e.g. "frontdesk", "frontdesk2"). Each entry: the dict returned
+        # by sip_ping.options_ping() plus a "completed_at" monotonic
+        # timestamp. Populated by _probe_sip_health() spawned at the top
+        # of on_enter so the OPTIONS ping runs in parallel with Iris's
+        # greeting and any later transfer_to() can consult fresh state.
+        # The ping itself is a fire-and-forget side-effect for the live
+        # call (Twilio sees activity, may nudge HT802 registration); the
+        # cached result is what informs subsequent decisions.
+        self._sip_health: dict[str, dict] = {}
         # Intent-cache state: per-call. The cache fires on common static-fact
         # questions (pet fee, check-in time, etc.) so the LLM is skipped on
         # the easy turns. State tracks which response variants we've already
@@ -790,7 +812,68 @@ class IrisAgent(Agent):
             caller_phone, called_number, persona, self._is_admin, self._silent,
         )
 
+    async def _probe_sip_health(self) -> None:
+        """Fire-and-forget SIP OPTIONS pings to the front desk endpoints.
+
+        Runs as a background task spawned at the top of on_enter so the
+        ping wall-clock (a few hundred ms) overlaps with Iris's greeting
+        and the caller perceives zero added latency.
+
+        Two purposes:
+          1. WAKE: pinging Twilio's SIP edge can nudge the trunk to
+             re-check the registered HT802. Per the 2026-06-23/24
+             intermittent HT802 outages, this may revive a stale
+             registration before the LLM actually tries to transfer.
+          2. OBSERVE: result lands in self._sip_health for any later
+             transfer_to() to consult. Currently informational only —
+             the action-on-result branch (skip-transfer-if-unreachable)
+             will land after we have a few days of real ping data to
+             confirm what Twilio actually returns under healthy vs
+             unhealthy HT802 states.
+        """
+        if not FRONTDESK_SIP_DOMAIN:
+            log.info("SIP probe: no FRONTDESK_SIP_DOMAIN configured; skipping")
+            return
+        # Both user-parts go through the same trunk + domain, so the two
+        # OPTIONS go to the same SIP server. Probing both lets us see if
+        # Twilio behaves differently per user-part (it shouldn't, but
+        # observability is cheap here).
+        targets = [
+            f"sip:frontdesk@{FRONTDESK_SIP_DOMAIN}",
+            f"sip:frontdesk2@{FRONTDESK_SIP_DOMAIN}",
+        ]
+        log.info("SIP probe: starting %d ping(s)", len(targets))
+        results = await asyncio.gather(
+            *[sip_ping.options_ping(t) for t in targets],
+            return_exceptions=True,
+        )
+        loop = asyncio.get_running_loop()
+        for target, result in zip(targets, results):
+            user = target.split(":")[1].split("@")[0]
+            if isinstance(result, Exception):
+                self._sip_health[user] = {
+                    "target": target, "reachable": False, "elapsed_s": 0.0,
+                    "response_code": None,
+                    "error": f"task_exception: {type(result).__name__}: {result}",
+                    "completed_at": loop.time(),
+                }
+            else:
+                result["completed_at"] = loop.time()
+                self._sip_health[user] = result
+            r = self._sip_health[user]
+            log.info(
+                "SIP probe result: user=%s reachable=%s code=%s elapsed=%.3fs error=%s",
+                user, r.get("reachable"), r.get("response_code"),
+                r.get("elapsed_s") or 0.0, r.get("error"),
+            )
+
     async def on_enter(self) -> None:
+        # Kick the SIP health probe FIRST so it overlaps with the brief
+        # SIP-bridge-settle sleep below and Iris's subsequent greeting.
+        # No await — fire and forget; result lands in self._sip_health
+        # if/when the ping completes within its ~1s timeout.
+        asyncio.create_task(self._probe_sip_health())
+
         # Brief wait for the SIP audio bridge to settle. Without it the
         # first audio plays into a void on some carriers.
         await asyncio.sleep(0.3)
@@ -1328,6 +1411,21 @@ class IrisAgent(Agent):
         # stuck True for the rest of the call.
         self._transfer_in_flight = True
 
+        # Silent mode WHILE THE TRANSFER IS RINGING. Production call
+        # 2026-06-24 (iris-call-_+14582577633_mXccmTqaJzSx) showed the
+        # race: LLM emitted transfer_to and started its ~15s ringback
+        # wait, caller said something to the answering front desk
+        # ("Queen sweet"), Iris's STT picked it up, on_user_turn_completed
+        # fired with self._silent still False (because the post-connect
+        # mute hadn't happened yet), and the LLM generated a parallel
+        # response ("I'd be happy to help with a Queen suite...") that
+        # the caller heard ON TOP of the front desk. Setting silent=True
+        # here closes the window. On no_answer we restore prev_silent
+        # so the Phase 2 fallback chain (LLM-driven escalation) keeps
+        # working.
+        prev_silent = self._silent
+        self._silent = True
+
         room_name = self._room.name
         try:
             _participants_before = sorted(
@@ -1503,6 +1601,16 @@ class IrisAgent(Agent):
                     participant_identity, {}
                 )["t_failed"] = loop.time()
                 await _stop_ringback()
+                # Restore the silent flag so the Phase 2 LLM fallback
+                # (the LLM digesting our no_answer return value and
+                # picking a next step) can speak. Without this, after a
+                # transfer fails the LLM would be silenced for the rest
+                # of the call and the caller would hear nothing.
+                self._silent = prev_silent
+                log.info(
+                    "%s no_answer: restored silent=%s for Phase 2 fallback",
+                    tag, prev_silent,
+                )
                 return json.dumps({
                     "status": "no_answer",
                     "destination": destination,
@@ -1534,23 +1642,33 @@ class IrisAgent(Agent):
                 tag, csp_elapsed, ring_cycles, _participants_after,
             )
 
-            # Auto-mute Iris's audio output and set _silent so subsequent STT
-            # turns short-circuit before the LLM. Without this, the LLM kept
-            # getting invoked on each STT event during the human-to-human
-            # conversation and, despite the [Transfer Scope Rules] prompt
-            # instructing it to stop responding, eventually broke in with
-            # phantom lines like "I'm sorry, I'm still on the line"
-            # (observed in production testing 2026-05-17). The LLM may still
-            # generate its prompt-mandated "You're connected — I'll step out"
-            # line via the tool-return path, but with output muted the caller
-            # never hears it — small UX loss for robust silencing. The egress
-            # recording captures all room audio regardless of Iris's mute
-            # state, so the human conversation is still preserved.
+            # Auto-mute Iris's audio output, disable STT input, and set
+            # _silent — three layers of defense so the LLM doesn't generate
+            # phantom responses during the human-to-human conversation.
+            # Belt + suspenders, same pattern capture_card_dtmf uses.
+            # Without all three:
+            #   - just mute output: LLM still gets invoked on STT events,
+            #     framework's tool-return digestion still synthesizes a
+            #     "You're connected" line (muted but tokens spent)
+            #   - just disable STT: no user turns surface, but on_enter's
+            #     greeting path could still queue replies
+            #   - just _silent flag: on_user_turn_completed catches normal
+            #     turns, but tool-return digestion + preemptive LLM calls
+            #     race past it (verified on 6/24 call mXccmTqaJzSx where
+            #     Iris answered "Queen sweet" during the ringback wait)
+            # The egress recording captures all room audio regardless of
+            # Iris's mute / input state, so the human conversation is
+            # still preserved for diarize.
             try:
                 self.session.output.set_audio_enabled(False)
                 log.info("%s muted Iris audio output", tag)
             except Exception:
                 log.exception("%s could not mute audio output after connect", tag)
+            try:
+                self.session.input.set_audio_enabled(False)
+                log.info("%s disabled Iris STT input", tag)
+            except Exception:
+                log.exception("%s could not disable STT input after connect", tag)
             self._silent = True
 
             return json.dumps({

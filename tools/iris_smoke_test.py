@@ -160,11 +160,26 @@ def main() -> int:
         frm, to, MIN_DURATION_S, MAX_WAIT_S,
     )
 
-    # TwiML: stay on the line for MIN_DURATION + a small buffer, then
-    # hang up. Gives Iris time to answer + start her greeting; we hang
-    # up before the conversation could go anywhere.
-    pause_s = MIN_DURATION_S + 3
-    twiml = f'<Response><Pause length="{pause_s}"/><Hangup/></Response>'
+    # TwiML for the test call. Three parts:
+    #   1. Short pause so Iris has time to start her greeting before we
+    #      play anything (otherwise her STT might miss it on the leading
+    #      edge of the audio bridge).
+    #   2. Say "Test call, ignore." -- this gets transcribed into the
+    #      call's chat history so test calls are visually distinct from
+    #      real customer calls in the dashboard. Iris's LLM may generate
+    #      a brief response to this; we don't care, the hangup below
+    #      cuts her off after the duration counter is satisfied.
+    #   3. Final pause + hangup. Total wall time around 10s, which
+    #      always exceeds the 5s MIN_DURATION_S pass threshold.
+    final_pause = max(1, MIN_DURATION_S + 1)
+    twiml = (
+        '<Response>'
+        '<Pause length="2"/>'
+        '<Say>Test call, ignore.</Say>'
+        f'<Pause length="{final_pause}"/>'
+        '<Hangup/>'
+        '</Response>'
+    )
 
     started_at = datetime.now(timezone.utc)
     start_mono = time.monotonic()
