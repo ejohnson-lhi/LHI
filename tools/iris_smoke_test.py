@@ -161,20 +161,26 @@ def main() -> int:
     )
 
     # TwiML for the test call. Three parts:
-    #   1. Short pause so Iris has time to start her greeting before we
-    #      play anything (otherwise her STT might miss it on the leading
-    #      edge of the audio bridge).
-    #   2. Say "Test call, ignore." -- this gets transcribed into the
-    #      call's chat history so test calls are visually distinct from
+    #   1. Initial pause long enough for Iris's full greeting (~3.5s)
+    #      to finish playing AND for her STT to enter listening mode.
+    #      Previously this was only 2s; the Say then ran from T+2 to
+    #      T+4 while Iris was still speaking T+0.5 to T+3.5, so her
+    #      STT only heard the tail "...nore." which fell below VAD
+    #      threshold and never registered as a user turn. Verified on
+    #      call rDmp9UocGjJa (2026-06-24): zero user_input_transcribed
+    #      events. 5s lead-in fixes this.
+    #   2. Say "Test call, ignore." -- gets transcribed into the call's
+    #      chat history so smoke-test calls are visually distinct from
     #      real customer calls in the dashboard. Iris's LLM may generate
-    #      a brief response to this; we don't care, the hangup below
-    #      cuts her off after the duration counter is satisfied.
-    #   3. Final pause + hangup. Total wall time around 10s, which
-    #      always exceeds the 5s MIN_DURATION_S pass threshold.
+    #      a brief response; we don't care, the hangup below cuts her
+    #      off after the duration counter is satisfied.
+    #   3. Final pause + hangup. Total wall time ~11s, comfortably
+    #      above the 5s MIN_DURATION_S pass threshold.
+    initial_pause = 5
     final_pause = max(1, MIN_DURATION_S + 1)
     twiml = (
         '<Response>'
-        '<Pause length="2"/>'
+        f'<Pause length="{initial_pause}"/>'
         '<Say>Test call, ignore.</Say>'
         f'<Pause length="{final_pause}"/>'
         '<Hangup/>'

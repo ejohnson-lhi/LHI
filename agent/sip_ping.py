@@ -172,11 +172,21 @@ async def options_ping(
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
     # local_addr=("", 0) lets the kernel pick an ephemeral port.
+    # family=AF_INET because asyncio's default behavior is to try
+    # BOTH AAAA (IPv6) and A (IPv4) records, and if AAAA returns
+    # NODATA (EAI_NODATA, errno -5) on a host with only A records
+    # (like Twilio's lighthouseinn-frontdesk.sip.twilio.com which
+    # has 4 A records 54.172.60.0-3 but no AAAA), the resolution
+    # surfaces that as a hard failure. Forcing AF_INET tells the
+    # resolver to look up A records only. Verified on the droplet
+    # 2026-06-24: direct socket.connect() works fine; asyncio's
+    # default did not. Same fix any time we hit a v4-only host.
     try:
         transport, _ = await loop.create_datagram_endpoint(
             lambda: _PingProtocol(future),
-            local_addr=("", 0),
+            local_addr=("0.0.0.0", 0),
             remote_addr=(host, port),
+            family=socket.AF_INET,
         )
     except Exception as e:
         return {
