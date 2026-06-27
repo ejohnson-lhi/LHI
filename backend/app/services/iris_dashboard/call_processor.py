@@ -57,6 +57,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +210,7 @@ def _format_note(transcript: dict, summary: dict, *, is_history: bool) -> str:
     # Format the date for humans, not ISO.
     try:
         dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        dt = dt.astimezone(ZoneInfo("America/Los_Angeles"))
         date_str = dt.strftime("%b %d, %Y at %-I:%M %p") if hasattr(dt, "strftime") else started_at
     except (ValueError, TypeError):
         date_str = started_at
